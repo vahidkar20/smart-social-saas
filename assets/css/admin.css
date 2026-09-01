@@ -1,0 +1,48 @@
+/* SSP Admin Panel Styles - Extracted from main.php */
+@font-face { font-family: 'IRANSansX'; src: url('/wp-content/themes/webyar-growth/assets/fonts/IRANSansXFaNum-Light.woff2') format('woff2'); font-weight: 300; font-style: normal; font-display: swap; }
+@font-face { font-family: 'IRANSansX'; src: url('/wp-content/themes/webyar-growth/assets/fonts/IRANSansXFaNum-Regular.woff2') format('woff2'); font-weight: 400; font-style: normal; font-display: swap; }
+@font-face { font-family: 'IRANSansX'; src: url('/wp-content/themes/webyar-growth/assets/fonts/IRANSansXFaNum-Bold.woff2') format('woff2'); font-weight: 700; font-style: normal; font-display: swap; }
+.ssp-admin-wrap { font-family: 'IRANSansX', Tahoma, sans-serif; direction: rtl; margin: 20px -20px 0 -20px; padding: 30px; background: #FFFFFF; color: #1E293B; min-height: 100vh; }
+.ssp-admin-wrap * { box-sizing: border-box; }
+.ssp-admin-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; flex-wrap: wrap; gap: 16px; }
+.ssp-admin-header h1 { font-size: 1.6rem; font-weight: 700; margin: 0; color: #1E293B; }
+.ssp-admin-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin-bottom: 30px; }
+.ssp-admin-stat { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 14px; padding: 20px; transition: border-color 0.2s; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+.ssp-admin-stat:hover { border-color: #4F46E5; }
+.ssp-admin-stat-label { font-size: 0.8rem; color: #64748B; margin-bottom: 8px; }
+.ssp-admin-stat-value { font-size: 1.8rem; font-weight: 700; color: #4F46E5; }
+.ssp-admin-stat-sub { font-size: 0.75rem; color: #94A3B8; margin-top: 4px; }
+.ssp-admin-section { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 16px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+.ssp-admin-section h2 { font-size: 1.1rem; font-weight: 700; margin: 0 0 20px; color: #1E293B; display: flex; align-items: center; gap: 10px; }
+.ssp-admin-form { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 20px; }
+.ssp-admin-form .field { display: flex; flex-direction: column; gap: 6px; }
+.ssp-admin-form label { font-size: 0.8rem; color: #64748B; }
+.ssp-admin-form input, .ssp-admin-form select { padding: 10px 14px; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; color: #1E293B; font-family: inherit; font-size: 0.85rem; transition: border-color 0.2s; }
+.ssp-admin-form input:focus, .ssp-admin-form select:focus { border-color: #4F46E5; outline: none; box-shadow: 0 0 0 3px rgba(79,70,229,0.1); }
+.ssp-admin-btn { padding: 10px 20px; background: #4F46E5; color: white; border: none; border-radius: 999px; font-weight: 700; font-size: 0.85rem; cursor: pointer; font-family: inherit; transition: all 0.2s; }
+.ssp-admin-btn:hover { background: #4338CA; box-shadow: 0 4px 12px rgba(79,70,229,0.3); transform: translateY(-1px); }
+.ssp-admin-btn-danger { background: #EF4444; color: white; }
+.ssp-admin-btn-danger:hover { background: #DC2626; box-shadow: 0 4px 12px rgba(239,68,68,0.3); }
+.ssp-admin-btn-secondary { background: transparent; color: #4F46E5; border: 1px solid #E2E8F0; }
+.ssp-admin-btn-secondary:hover { border-color: #4F46E5; background: rgba(79,70,229,0.05); }
+.ssp-admin-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.ssp-admin-table th { text-align: right; padding: 12px; background: #F8FAFC; color: #64748B; font-weight: 600; border-bottom: 2px solid #E2E8F0; }
+.ssp-admin-table td { padding: 12px; border-bottom: 1px solid #F1F5F9; color: #1E293B; }
+.ssp-admin-table tr:hover td { background: #F8FAFC; }
+.ssp-admin-badge { padding: 3px 10px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; display: inline-flex; }
+.ssp-admin-badge.ok { background: rgba(16,185,129,0.1); color: #059669; }
+.ssp-admin-badge.used { background: rgba(79,70,229,0.1); color: #4F46E5; }
+.ssp-admin-badge.error { background: rgba(239,68,68,0.1); color: #DC2626; }
+.ssp-admin-badge.warning { background: rgba(245,158,11,0.1); color: #D97706; }
+.ssp-admin-key { font-family: monospace; font-size: 0.8rem; background: #F1F5F9; padding: 4px 8px; border-radius: 4px; color: #4F46E5; direction: ltr; display: inline-block; border: 1px solid #E2E8F0; }
+.ssp-admin-tools { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+.ssp-admin-output { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 16px; margin-top: 16px; font-family: monospace; font-size: 0.8rem; color: #059669; max-height: 300px; overflow-y: auto; display: none; white-space: pre-wrap; word-break: break-all; direction: ltr; text-align: left; }
+.ssp-admin-output.show { display: block; }
+.ssp-admin-empty { text-align: center; padding: 40px; color: #94A3B8; }
+@media (max-width: 768px) {
+    .ssp-admin-wrap { padding: 16px; }
+    .ssp-admin-stats { grid-template-columns: 1fr 1fr; }
+    .ssp-admin-form { flex-direction: column; }
+    .ssp-admin-form .field { width: 100%; }
+    .ssp-admin-form input, .ssp-admin-form select { width: 100%; }
+}
