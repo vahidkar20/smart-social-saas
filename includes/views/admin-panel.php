@@ -15,9 +15,9 @@ if (isset($_GET['activate_cron']) && $_GET['activate_cron'] == '1') {
 
 $nonce = wp_create_nonce('ssp_secure_nonce');
 
-$logs = $this->get_global_items('logs');
+$logs = SSP_DB::get_all_logs(500);
 $licenses = $this->get_global_items('licenses');
-$queue = $this->get_global_items('queue');
+$queue = SSP_DB::get_queue_items(null, 500);
 
 $user_ids = array_unique(array_column($logs, 'user_id'));
 $total_users = count($user_ids);
@@ -265,7 +265,7 @@ foreach ($licenses as $lic) {
         </p>
 
         <?php
-        $relay_settings = get_option('ssp_telegram_relay', []);
+        $relay_settings = is_array($__tmp = get_option('ssp_telegram_relay', [])) ? $__tmp : [];
         ?>
 
         <div class="ssp-admin-form" style="flex-direction:column; align-items:flex-start;">
@@ -308,7 +308,7 @@ foreach ($licenses as $lic) {
         </p>
 
         <?php
-        $proxy_settings = get_option('ssp_proxy_settings', []);
+        $proxy_settings = is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : [];
         ?>
 
         <div class="ssp-admin-form" style="flex-direction:column; align-items:flex-start;">

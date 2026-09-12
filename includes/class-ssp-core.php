@@ -65,6 +65,7 @@ final class SmartAutomationPro {
         add_action('wp_ajax_ssp_delete_messenger', [$this, 'handle_delete_messenger']);
         add_action('wp_ajax_ssp_get_messengers', [$this, 'handle_get_messengers']);
         add_action('wp_ajax_ssp_update_messenger', [$this, 'handle_update_messenger']);
+        add_action('wp_ajax_ssp_test_messenger', [$this, 'handle_test_messenger']);
 
         // AJAX Handlers - WP Sites
         add_action('wp_ajax_ssp_add_wp_site', [$this, 'handle_add_wp_site']);
@@ -122,6 +123,7 @@ final class SmartAutomationPro {
 
         // AJAX Handlers - Calendar
         add_action('wp_ajax_ssp_get_calendar', [$this, 'handle_get_calendar']);
+        add_action('wp_ajax_ssp_update_schedule', [$this, 'handle_update_schedule']);
         add_action('wp_ajax_ssp_update_schedule_time', [$this, 'handle_update_schedule_time']);
 
         // AJAX Handlers - SEO
@@ -196,7 +198,8 @@ final class SmartAutomationPro {
         add_action('rest_api_init', function() {
             remove_filter('rest_pre_serve_request', 'rest_send_cors_headers');
             add_filter('rest_pre_serve_request', function($value) {
-                header('Access-Control-Allow-Origin: *');
+                $origin = $_SERVER['HTTP_ORIGIN'] ?? '*';
+    header('Access-Control-Allow-Origin: ' . $origin);
                 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
                 header('Access-Control-Allow-Headers: Content-Type, X-SSP-Bridge-Token');
                 header('Access-Control-Allow-Credentials: true');
@@ -313,6 +316,8 @@ final class SmartAutomationPro {
     }
 
     public static function activate() {
+        SSP_DB::create_tables();
+        
         if (!wp_next_scheduled('ssp_process_queue_hook')) {
             wp_schedule_event(time() + 60, 'ssp_two_minutes', 'ssp_process_queue_hook');
         }

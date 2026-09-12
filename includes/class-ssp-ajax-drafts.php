@@ -29,7 +29,7 @@ trait SSP_AjaxDrafts {
     public function handle_delete_draft() {
         $user_id = $this->ajax_require_auth();
         $drafts = $this->get_user_drafts($user_id);
-        $id = intval($_POST['draft_id']);
+        $id = intval($_POST['draft_id'] ?? $_POST['id'] ?? 0);
         $drafts = array_values(array_filter($drafts, function($d) use ($id) { return (int)$d['id'] !== $id; }));
         $this->set_user_drafts($user_id, $drafts);
         wp_send_json_success(['message' => 'پیش‌نویس حذف شد']);
@@ -38,7 +38,7 @@ trait SSP_AjaxDrafts {
     public function handle_update_draft() {
         $user_id = $this->ajax_require_auth();
         $drafts = $this->get_user_drafts($user_id);
-        $id = intval($_POST['draft_id']);
+        $id = intval($_POST['draft_id'] ?? $_POST['id'] ?? 0);
         foreach ($drafts as &$draft) {
             if ((int)$draft['id'] === $id) {
                 $draft['title'] = sanitize_text_field($_POST['title'] ?? $draft['title']);

@@ -23,7 +23,7 @@ trait SSP_Messenger {
     }
 
     private function send_to_messenger($platform, $token, $message, $channel_id = '', $image_url = '') {
-        // Handle JSON array (album) — extract first URL
+        // Handle JSON array (album) — extract first URL if single-item sending or fallback
         if (!empty($image_url) && $image_url[0] === '[') {
             $decoded = json_decode($image_url, true);
             if (is_array($decoded) && count($decoded) > 0) {
@@ -34,29 +34,55 @@ trait SSP_Messenger {
             }
         }
         $has_media = !empty($image_url);
-        $is_video = $has_media ? $this->is_video_url($image_url) : false;
+        $media_type = $has_media ? $this->get_media_type($image_url) : 'none';
+        $is_video = ($media_type === 'video');
 
-        if ($platform === 'whatsapp') return $this->send_whatsapp($token, $message, $channel_id, $image_url, $has_media, $is_video);
-        if ($platform === 'instagram') return $this->send_instagram($token, $message, $channel_id, $image_url, $has_media);
-        if ($platform === 'rubika') return $this->send_rubika($token, $message, $channel_id, $image_url, $has_media, $is_video);
+        if ($platform === 'whatsapp') return $this->send_whatsapp($token, $message, $channel_id, $image_url, $has_media, $media_type);
+        if ($platform === 'instagram') return $this->send_instagram($token, $message, $channel_id, $image_url, $has_media, $media_type);
+        if ($platform === 'rubika') return $this->send_rubika($token, $message, $channel_id, $image_url, $has_media, $media_type);
 
-        return $this->send_bot_platform($platform, $token, $message, $channel_id, $image_url, $has_media, $is_video);
+        return $this->send_bot_platform($platform, $token, $message, $channel_id, $image_url, $has_media, $media_type);
+    }
+
+    private function get_media_type($url) {
+        $clean_url = strtok($url, '?');
+        $ext = strtolower(pathinfo($clean_url, PATHINFO_EXTENSION));
+
+        $video_exts = ['mp4', 'mpeg', 'mpg', 'mov', 'avi', 'webm', 'mkv'];
+        $image_exts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'];
+        $audio_exts = ['mp3', 'ogg', 'wav', 'aac', 'm4a', 'flac', 'opus'];
+        $doc_exts   = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'zip', 'rar', 'tar', 'gz', '7z', 'apk'];
+
+        if (in_array($ext, $video_exts)) return 'video';
+        if (in_array($ext, $image_exts)) return 'image';
+        if (in_array($ext, $audio_exts)) return 'audio';
+        if (in_array($ext, $doc_exts))   return 'document';
+
+        // Fallback default: if there is an extension, treat as document; otherwise image
+        return !empty($ext) ? 'document' : 'image';
     }
 
     private function is_video_url($url) {
-        $ext = strtolower(pathinfo($url, PATHINFO_EXTENSION));
-        return in_array($ext, ['mp4', 'mpeg', 'mpg', 'mov', 'avi', 'webm']);
+        return $this->get_media_type($url) === 'video';
     }
 
-    private function send_whatsapp($token, $message, $channel_id, $image_url, $has_media, $is_video = false) {
+    private function send_whatsapp($token, $message, $channel_id, $image_url, $has_media, $media_type = 'image') {
         $phone_number_id = $channel_id;
         if (empty($phone_number_id)) return ['success' => false, 'response' => 'Phone Number ID الزامی است'];
 
         $endpoint = "https://graph.facebook.com/" . SSP_WHATSAPP_API_VERSION . "/$phone_number_id/messages";
-        if ($has_media && $is_video) {
-            $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'video', 'video' => ['link' => $image_url, 'caption' => $message]]);
-        } elseif ($has_media) {
-            $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'image', 'image' => ['link' => $image_url, 'caption' => $message]]);
+        
+        if ($has_media) {
+            $filename = basename(parse_url($image_url, PHP_URL_PATH) ?: 'file');
+            if ($media_type === 'video') {
+                $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'video', 'video' => ['link' => $image_url, 'caption' => $message]]);
+            } elseif ($media_type === 'audio') {
+                $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'audio', 'audio' => ['link' => $image_url]]);
+            } elseif ($media_type === 'document') {
+                $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'document', 'document' => ['link' => $image_url, 'caption' => $message, 'filename' => $filename]]);
+            } else {
+                $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'image', 'image' => ['link' => $image_url, 'caption' => $message]]);
+            }
         } else {
             $body = json_encode(['messaging_product' => 'whatsapp', 'to' => $phone_number_id, 'type' => 'text', 'text' => ['body' => $message]]);
         }
@@ -77,15 +103,25 @@ trait SSP_Messenger {
         ];
     }
 
-    private function send_instagram($token, $message, $channel_id, $image_url, $has_image) {
+    private function send_instagram($token, $message, $channel_id, $image_url, $has_image, $media_type = 'image') {
         $ig_user_id = $channel_id;
         if (empty($ig_user_id)) return ['success' => false, 'response' => 'Instagram User ID الزامی است'];
 
-        if (!$has_image) return ['success' => false, 'response' => 'اینستاگرام نیاز به تصویر برای ارسال پست دارد'];
+        if (!$has_image || ($media_type !== 'image' && $media_type !== 'video')) {
+            return ['success' => false, 'response' => 'اینستاگرام فقط از تصویر و ویدیو (Reel/Video) برای ارسال پست پشتیبانی می‌کند'];
+        }
 
         $proxy_args = $this->get_proxy_args();
         $create_url = "https://graph.facebook.com/" . SSP_WHATSAPP_API_VERSION . "/$ig_user_id/media";
-        $create_body = json_encode(['image_url' => $image_url, 'caption' => $message, 'access_token' => $token]);
+        
+        $params = ['caption' => $message, 'access_token' => $token];
+        if ($media_type === 'video') {
+            $params['media_type'] = 'REELS';
+            $params['video_url'] = $image_url;
+        } else {
+            $params['image_url'] = $image_url;
+        }
+        $create_body = json_encode($params);
 
         $create_response = wp_remote_post($create_url, array_merge([
             'timeout' => 30, 'headers' => ['Content-Type' => 'application/json'], 'body' => $create_body,
@@ -111,17 +147,26 @@ trait SSP_Messenger {
         ];
     }
 
-    private function send_rubika($token, $message, $channel_id, $image_url, $has_media, $is_video = false) {
+    private function send_rubika($token, $message, $channel_id, $image_url, $has_media, $media_type = 'image') {
         $base_url = "https://botapi.rubika.ir/v3/$token";
         $proxy_args = $this->get_proxy_args();
 
         // Rubika: 3-step file send: requestSendFile → upload → sendFile
         if ($has_media && !empty($image_url)) {
-            $file_type = $is_video ? 'Video' : 'Image';
-            error_log('[SSP Rubika] sendFile attempt: url=' . $image_url . ' type=' . $file_type . ' chat=' . $channel_id);
+            // Rubika supports: Image, Video, Voice, Music, File
+            if ($media_type === 'video') {
+                $rubika_file_type = 'Video';
+            } elseif ($media_type === 'audio') {
+                $rubika_file_type = 'Music';
+            } elseif ($media_type === 'document') {
+                $rubika_file_type = 'File';
+            } else {
+                $rubika_file_type = 'Image';
+            }
+            error_log('[SSP Rubika] sendFile attempt: url=' . $image_url . ' type=' . $rubika_file_type . ' chat=' . $channel_id);
 
             // Step 1: Request upload URL
-            $req_body = json_encode(['type' => $file_type]);
+            $req_body = json_encode(['type' => $rubika_file_type]);
             $req_response = wp_remote_post("$base_url/requestSendFile", array_merge([
                 'timeout' => 30,
                 'headers' => ['Content-Type' => 'application/json'],
@@ -138,7 +183,7 @@ trait SSP_Messenger {
                 if (($req_resp['status'] ?? '') === 'OK' && !empty($req_resp['data']['upload_url'])) {
                     $upload_url = $req_resp['data']['upload_url'];
 
-                    // Step 2: Download image and upload to Rubika (raw curl for multipart)
+                    // Step 2: Download file and upload to Rubika (raw curl for multipart)
                     $downloaded = $this->download_file_for_upload($image_url, $proxy_args);
                     if ($downloaded) {
                         error_log('[SSP Rubika] upload step: file=' . $downloaded['path'] . ' mime=' . $downloaded['mime'] . ' size=' . filesize($downloaded['path']));
@@ -238,7 +283,7 @@ trait SSP_Messenger {
         ];
     }
 
-    private function send_bot_platform($platform, $token, $message, $channel_id, $image_url, $has_media, $is_video = false) {
+    private function send_bot_platform($platform, $token, $message, $channel_id, $image_url, $has_media, $media_type = 'image') {
         $endpoints = [
             'telegram' => ['base' => 'https://api.telegram.org/bot' . $token, 'parse_mode' => true],
             'bale' => ['base' => 'https://tapi.bale.ai/bot' . $token, 'parse_mode' => true],
@@ -251,10 +296,10 @@ trait SSP_Messenger {
         $proxy_args = $this->get_proxy_args();
         $response = null;
 
-        // Eitaa: use sendFile with curl for media
+        // Eitaa: use sendFile with curl for all media/documents
         if ($platform === 'eitaa') {
             if ($has_media && !empty($image_url)) {
-                error_log('[SSP Eitaa] sendFile attempt: url=' . $image_url . ' chat=' . $channel_id);
+                error_log('[SSP Eitaa] sendFile attempt: url=' . $image_url . ' chat=' . $channel_id . ' type=' . $media_type);
                 $downloaded = $this->download_file_for_upload($image_url, $proxy_args);
                 if ($downloaded) {
                     $api_url = $config['base'] . '/sendFile';
@@ -267,7 +312,7 @@ trait SSP_Messenger {
                         'file' => new CURLFile($downloaded['path'], $downloaded['mime'], $downloaded['name']),
                         'chat_id' => $channel_id,
                         'caption' => $message,
-                        'title' => '',
+                        'title' => $downloaded['name'],
                     ]);
                     $raw_response = curl_exec($ch);
                     $curl_error = curl_error($ch);
@@ -288,7 +333,7 @@ trait SSP_Messenger {
                     // sendFile failed, fall through to text
                     error_log('[SSP Eitaa] sendFile failed, sending text only');
                 } else {
-                    error_log('[SSP Eitaa] Failed to download image, sending text only');
+                    error_log('[SSP Eitaa] Failed to download file, sending text only');
                 }
             }
             // Text-only fallback for Eitaa
@@ -308,11 +353,22 @@ trait SSP_Messenger {
             ];
         }
 
-        // Telegram and Bale: standard sendPhoto/sendVideo/sendMessage
-        // Bale cannot fetch external URLs — must download and upload like Eitaa
+        // Bale: cannot fetch external URLs — must download and upload multipart
         if ($platform === 'bale' && $has_media && !empty($image_url)) {
-            $endpoint = $is_video ? '/sendVideo' : '/sendPhoto';
-            $field_name = $is_video ? 'video' : 'photo';
+            if ($media_type === 'video') {
+                $endpoint = '/sendVideo';
+                $field_name = 'video';
+            } elseif ($media_type === 'audio') {
+                $endpoint = '/sendAudio';
+                $field_name = 'audio';
+            } elseif ($media_type === 'document') {
+                $endpoint = '/sendDocument';
+                $field_name = 'document';
+            } else {
+                $endpoint = '/sendPhoto';
+                $field_name = 'photo';
+            }
+
             $downloaded = $this->download_file_for_upload($image_url, $proxy_args);
             if ($downloaded) {
                 $api_url = $config['base'] . $endpoint;
@@ -344,12 +400,21 @@ trait SSP_Messenger {
             $has_media = false;
         }
 
-        if ($has_media && $is_video) {
-            $endpoint = '/sendVideo';
-            $body = ['video' => $image_url, 'caption' => $message];
-        } elseif ($has_media) {
-            $endpoint = '/sendPhoto';
-            $body = ['photo' => $image_url, 'caption' => $message];
+        // Telegram standard send endpoints (supports direct URL or relay)
+        if ($has_media) {
+            if ($media_type === 'video') {
+                $endpoint = '/sendVideo';
+                $body = ['video' => $image_url, 'caption' => $message];
+            } elseif ($media_type === 'audio') {
+                $endpoint = '/sendAudio';
+                $body = ['audio' => $image_url, 'caption' => $message];
+            } elseif ($media_type === 'document') {
+                $endpoint = '/sendDocument';
+                $body = ['document' => $image_url, 'caption' => $message];
+            } else {
+                $endpoint = '/sendPhoto';
+                $body = ['photo' => $image_url, 'caption' => $message];
+            }
         } else {
             $endpoint = '/sendMessage';
             $body = ['text' => $message];
@@ -400,6 +465,30 @@ trait SSP_Messenger {
     }
 
     private function download_file_for_upload($url, $proxy_args = []) {
+        // Direct local file check for files in WordPress uploads directory (prevents loopback HTTP failures)
+        $upload_dir = wp_upload_dir();
+        if (!empty($upload_dir['baseurl']) && strpos($url, $upload_dir['baseurl']) === 0) {
+            $local_path = str_replace($upload_dir['baseurl'], $upload_dir['basedir'], $url);
+            if (file_exists($local_path) && is_readable($local_path) && filesize($local_path) > 0) {
+                $ext = '.' . strtolower(pathinfo($local_path, PATHINFO_EXTENSION));
+                $tmp = sys_get_temp_dir() . '/ssp_' . wp_generate_password(8, false) . $ext;
+                if (copy($local_path, $tmp)) {
+                    $mime = function_exists('mime_content_type') ? mime_content_type($local_path) : '';
+                    if (empty($mime)) {
+                        $mime_map = [
+                            'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'png' => 'image/png',
+                            'gif' => 'image/gif', 'webp' => 'image/webp', 'mp4' => 'video/mp4',
+                            'mp3' => 'audio/mpeg', 'pdf' => 'application/pdf',
+                        ];
+                        $mime = $mime_map[ltrim($ext, '.')] ?? 'application/octet-stream';
+                    }
+                    $name = basename($local_path);
+                    error_log('[SSP Upload] Used direct local file: ' . filesize($tmp) . ' bytes | ' . $name);
+                    return ['path' => $tmp, 'mime' => $mime, 'name' => $name];
+                }
+            }
+        }
+
         $response = wp_remote_get($url, array_merge([
             'timeout' => 30,
         ], $proxy_args));

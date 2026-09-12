@@ -130,7 +130,7 @@ trait SSP_AjaxGeneral {
 
             if (is_wp_error($response)) {
                 error_log('[SSP ' . $platform . ' Test] WP Error: ' . $response->get_error_message());
-                $hint = !empty(get_option('ssp_proxy_settings', [])['enabled']) ? ' پروکسی فعال است ولی مشکلی دارد.' : '';
+                $hint = is_array(is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : []) && !empty(is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : []['enabled']) ? ' پروکسی فعال است ولی مشکلی دارد.' : '';
                 wp_send_json_error(['message' => $response->get_error_message() . $hint]);
             }
             $raw = wp_remote_retrieve_body($response);
@@ -156,7 +156,7 @@ trait SSP_AjaxGeneral {
                 'headers' => ['Content-Type' => 'application/json'],
             ], $this->get_proxy_args()));
             if (is_wp_error($response)) {
-                $hint = !empty(get_option('ssp_proxy_settings', [])['enabled']) ? ' پروکسی فعال است ولی مشکلی دارد.' : '';
+                $hint = is_array(is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : []) && !empty(is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : []['enabled']) ? ' پروکسی فعال است ولی مشکلی دارد.' : '';
                 wp_send_json_error(['message' => $response->get_error_message() . $hint]);
             }
             $raw = wp_remote_retrieve_body($response);
@@ -176,11 +176,24 @@ trait SSP_AjaxGeneral {
             wp_send_json_error(['message' => 'این قابلیت فقط در پلن Pro موجود است']);
         }
 
-        $provider = sanitize_text_field($_POST['provider']);
-        $api_key = sanitize_text_field($_POST['api_key']);
-        $model = sanitize_text_field($_POST['model']);
+        $provider = sanitize_text_field($_POST['provider'] ?? '');
+        if (empty($provider)) {
+            $provider = get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai';
+        }
+        $api_key = sanitize_text_field($_POST['api_key'] ?? '');
+        if (empty($api_key)) {
+            $api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
+        }
+        $model = sanitize_text_field($_POST['model'] ?? '');
+        if (empty($model)) {
+            $model = get_user_meta($user_id, 'ssp_ai_model', true) ?: ($provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini');
+        }
 
-        $proxy_settings = get_option('ssp_proxy_settings', []);
+        if (empty($api_key)) {
+            wp_send_json_error(['message' => 'کلید API وارد نشده است. لطفاً ابتدا کلید API را وارد یا ذخیره کنید.']);
+        }
+
+        $proxy_settings = is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : [];
         $use_proxy = !empty($proxy_settings['enabled']);
         $proxy_host = $proxy_settings['host'] ?? '';
         $proxy_port = $proxy_settings['port'] ?? '';
@@ -252,10 +265,19 @@ trait SSP_AjaxGeneral {
 
         $step = sanitize_text_field($_POST['step'] ?? '');
         $provider = sanitize_text_field($_POST['provider'] ?? '');
+        if (empty($provider)) {
+            $provider = get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai';
+        }
         $api_key = sanitize_text_field($_POST['api_key'] ?? '');
+        if (empty($api_key)) {
+            $api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
+        }
         $model = sanitize_text_field($_POST['model'] ?? '');
+        if (empty($model)) {
+            $model = get_user_meta($user_id, 'ssp_ai_model', true) ?: ($provider === 'deepseek' ? 'deepseek-chat' : 'gpt-4o-mini');
+        }
 
-        $proxy_settings = get_option('ssp_proxy_settings', []);
+        $proxy_settings = is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : [];
         $use_proxy = !empty($proxy_settings['enabled']);
         $proxy_host = $proxy_settings['host'] ?? '';
         $proxy_port = $proxy_settings['port'] ?? '';
@@ -506,10 +528,38 @@ trait SSP_AjaxGeneral {
             'skip_ai_rewrite' => !empty($_POST['skip_ai_rewrite']),
         ];
 
-        // Per-messenger selection
-        $messenger_ids = sanitize_text_field($_POST['messengers'] ?? '');
-        if (!empty($messenger_ids)) {
-            $payload['selected_messengers'] = array_map('intval', explode(',', $messenger_ids));
+        // Per-messenger selection (handles either comma-separated string or $_POST['messengers'] array)
+        if (isset($_POST['messengers'])) {
+            if (is_array($_POST['messengers'])) {
+                $payload['selected_messengers'] = array_map('intval', $_POST['messengers']);
+            } else {
+                $messenger_ids = sanitize_text_field($_POST['messengers']);
+                if (!empty($messenger_ids)) {
+                    $payload['selected_messengers'] = array_map('intval', explode(',', $messenger_ids));
+                }
+            }
+        }
+
+        // If scheduled_at is provided, save as schedule instead of immediate queue
+        $scheduled_at = sanitize_text_field($_POST['scheduled_at'] ?? '');
+        if (!empty($scheduled_at)) {
+            $schedules = $this->get_user_items($user_id, 'schedules');
+            $id = $this->next_id($schedules);
+            $schedules[] = [
+                'id' => $id,
+                'title' => sanitize_text_field($_POST['title'] ?? ''),
+                'message' => sanitize_textarea_field($_POST['message'] ?? ''),
+                'hashtags' => sanitize_text_field($_POST['hashtags'] ?? ''),
+                'image_url' => $image_url,
+                'selected_messengers' => $payload['selected_messengers'] ?? [],
+                'scheduled_at' => $scheduled_at,
+                'status' => 'pending',
+                'recurring' => sanitize_text_field($_POST['recurring'] ?? ''),
+                'created_at' => current_time('mysql'),
+            ];
+            $this->set_user_items($user_id, 'schedules', $schedules);
+            wp_send_json_success(['message' => 'پیام با موفقیت زمان‌بندی شد!']);
+            return;
         }
 
         $result = $this->add_to_queue($user_id, 'manual_send', $payload, 10);
@@ -525,22 +575,38 @@ trait SSP_AjaxGeneral {
         $file = $_FILES['media_file'];
         $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
 
-        $image_types = ['jpg', 'jpeg', 'png', 'gif', 'webp'];
-        $video_types = ['mp4', 'mpeg', 'mpg', 'mov', 'avi'];
+        $image_types = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'];
+        $video_types = ['mp4', 'mpeg', 'mpg', 'mov', 'avi', 'webm', 'mkv'];
+        $doc_types   = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'csv', 'zip', 'rar', 'tar', 'gz', '7z', 'apk'];
+        $audio_types = ['mp3', 'ogg', 'wav', 'aac', 'm4a', 'flac', 'opus'];
+
         $is_image = in_array($ext, $image_types);
         $is_video = in_array($ext, $video_types);
+        $is_doc   = in_array($ext, $doc_types);
+        $is_audio = in_array($ext, $audio_types);
 
-        if (!$is_image && !$is_video) {
-            wp_send_json_error(['message' => 'فرمت فایل پشتیبانی نمی‌شود']);
+        if (!$is_image && !$is_video && !$is_doc && !$is_audio) {
+            wp_send_json_error(['message' => 'فرمت فایل پشتیبانی نمی‌شود (' . esc_html($ext) . ')']);
         }
 
-        $max_size = $is_video ? 80 * 1024 * 1024 : 10 * 1024 * 1024;
+        // Size limits: Video up to 80MB, Documents/Audio up to 50MB, Images up to 15MB
+        if ($is_video) {
+            $max_size = 80 * 1024 * 1024;
+            $size_msg = 'حداکثر حجم ویدیو ۸۰ مگابایت است';
+        } elseif ($is_doc || $is_audio) {
+            $max_size = 50 * 1024 * 1024;
+            $size_msg = 'حداکثر حجم فایل/داکیومنت ۵۰ مگابایت است';
+        } else {
+            $max_size = 15 * 1024 * 1024;
+            $size_msg = 'حداکثر حجم تصویر ۱۵ مگابایت است';
+        }
+
         if ($file['size'] > $max_size) {
-            wp_send_json_error(['message' => $is_video ? 'حداکثر حجم ویدیو ۸۰ مگابایت است' : 'حداکثر حجم تصویر ۱۰ مگابایت است']);
+            wp_send_json_error(['message' => $size_msg]);
         }
 
         if ($file['error'] !== UPLOAD_ERR_OK) {
-            wp_send_json_error(['message' => 'خطا در آپلود فایل']);
+            wp_send_json_error(['message' => 'خطا در آپلود فایل (کد خطا: ' . $file['error'] . ')']);
         }
 
         $upload_dir = wp_upload_dir();
@@ -554,11 +620,20 @@ trait SSP_AjaxGeneral {
         $filepath = $media_dir . '/' . $filename;
 
         if (!move_uploaded_file($file['tmp_name'], $filepath)) {
-            wp_send_json_error(['message' => 'خطا در ذخیره فایل']);
+            wp_send_json_error(['message' => 'خطا در ذخیره فایل روی هاست']);
         }
 
         $url = $upload_dir['baseurl'] . '/ssp-media/' . $user_id . '/' . $filename;
-        wp_send_json_success(['url' => $url, 'filename' => $filename]);
+        $file_type = $is_image ? 'image' : ($is_video ? 'video' : ($is_audio ? 'audio' : 'document'));
+        wp_send_json_success([
+            'url' => $url,
+            'filename' => $filename,
+            'original_name' => sanitize_text_field($file['name']),
+            'type' => $file_type,
+            'extension' => $ext,
+            'size' => $file['size'],
+            'size_formatted' => size_format($file['size'])
+        ]);
     }
 
     private function cleanup_user_media($dir, $max_age) {
@@ -584,11 +659,12 @@ trait SSP_AjaxGeneral {
         $prompt = sanitize_textarea_field($_POST['prompt'] ?? '');
         if (empty($prompt)) wp_send_json_error(['message' => 'متن ورودی خالی است']);
 
+        $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
         $ai_provider = get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai';
         $ai_api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
         $ai_model = get_user_meta($user_id, 'ssp_ai_model', true) ?: 'gpt-4o-mini';
 
-        if (empty($ai_api_key)) wp_send_json_error(['message' => 'API Key تنظیم نشده. ابتدا تنظیمات AI را تکمیل کنید.']);
+        if ($ai_mode !== 'browser' && empty($ai_api_key)) wp_send_json_error(['message' => 'API Key تنظیم نشده. ابتدا تنظیمات AI را تکمیل کنید.']);
 
         $system_prompt = "تو یک نویسنده محتوای فارسی حرفه‌ای هستی. بر اساس موضوع زیر محتوا بنویس.\n\n" .
             "قوانین:\n" .
@@ -601,6 +677,18 @@ trait SSP_AjaxGeneral {
             "موضوع:\n" . $prompt;
 
         try {
+            if ($ai_mode === 'browser') {
+                if (!method_exists($this, 'create_bridge_task')) {
+                    wp_send_json_error(['message' => 'افزونه مرورگر در دسترس نیست']);
+                }
+                $task = $this->create_bridge_task($user_id, $system_prompt);
+                wp_send_json_success([
+                    'mode' => 'browser',
+                    'task_id' => $task['task_id']
+                ]);
+                return;
+            }
+
             $result = $this->call_ai_api($ai_provider, $ai_api_key, $ai_model, $system_prompt);
             $content = wp_strip_all_tags($result['content']);
             $content = preg_replace('/<[^>]+>/', '', $content);
@@ -627,7 +715,7 @@ trait SSP_AjaxGeneral {
 
     public function handle_test_telegram_relay() {
         $this->ajax_require_admin();
-        $settings = get_option('ssp_telegram_relay', []);
+        $settings = is_array($__tmp = get_option('ssp_telegram_relay', [])) ? $__tmp : [];
         if (empty($settings['worker_url']) || empty($settings['secret_key'])) {
             wp_send_json_error(['message' => 'آدرس Worker و Secret Key الزامی است']);
         }

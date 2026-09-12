@@ -28,10 +28,15 @@ trait SSP_Queue {
     }
 
     private function generate_ai_content($user_id, $topic) {
+        $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
         $ai_provider = get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai';
         $ai_api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
         $ai_model = get_user_meta($user_id, 'ssp_ai_model', true) ?: 'gpt-4o-mini';
         $ai_prompt_mode = get_user_meta($user_id, 'ssp_ai_prompt_mode', true) ?: 'simple';
+
+        if ($ai_mode === 'browser') {
+             throw new Exception('تولید خودکار در پس‌زمینه از طریق مرورگر امکان‌پذیر نیست. لطفا حالت API را فعال کنید.');
+        }
 
         if ($ai_prompt_mode === 'advanced') {
             $custom_prompt = get_user_meta($user_id, 'ssp_ai_custom_prompt', true);
@@ -75,18 +80,19 @@ trait SSP_Queue {
     }
 
     private function get_default_ai_prompt($topic) {
-        return "پست تلگرامی فارسی درباره «{$topic}» بنویس.\n" .
-            "مهم: این پست برای تلگرام است. فقط متن ساده بنویس.\n\n" .
-            "قوانین:\n" .
-            "- لحن طبیعی و مثل یک انسان واقعی بنویس\n" .
-            "- عنوان جذاب ≤80 کاراکتر\n" .
-            "- متن 150-250 کلمه، پاراگراف کوتاه\n" .
-            "- مطلقاً از هیچ کد HTML استفاده نکن\n" .
-            "- هیچ تگی مثل p br b strong h2 ul li ننویس\n" .
-            "- بولد فقط با **\n" .
-            "- لیست فقط با - یا شماره\n" .
-            "- هیچ هشتگی (#) در متن اضافه نکن\n\n" .
-            'خروجی: {"title":"","message":""}';
+        return "یک پست جذاب و تعاملی فارسی برای شبکه‌های اجتماعی درباره «{$topic}» بنویس.\n\n" .
+            "الزامات محتوا:\n" .
+            "- لحن طبیعی، زنده و پرکشش\n" .
+            "- عنوان جذاب و کنجکاوکننده (حداکثر ۸۰ کاراکتر)\n" .
+            "- متن خوانا در ۱۵۰ الی ۲۵۰ کلمه با رعایت فاصله‌گذاری خطوط و ایموجی‌های مناسب\n" .
+            "- دعوت به اقدام (CTA) در انتهای متن\n" .
+            "- بدون تگ HTML (فقط از ** برای بولد استفاده کن)\n\n" .
+            "دستور اکید: پاسخ شما ۱۰۰٪ منحصراً یک آبجکت معتبر JSON بدون هیچ کاراکتر اضافی قبل یا بعد از آن باشد با فیلدهای زیر:\n" .
+            "{\n" .
+            "  \"title\": \"عنوان جذاب پست\",\n" .
+            "  \"message\": \"متن کامل پست با ایموجی و پاراگراف‌بندی\",\n" .
+            "  \"hashtags\": \"#هشتگ۱ #هشتگ۲ #هشتگ۳\"\n" .
+            "}";
     }
 
     public function on_post_publish($new_status, $old_status, $post) {
@@ -124,10 +130,7 @@ trait SSP_Queue {
             return ['success' => false, 'message' => 'محدودیت روزانه پر شده'];
         }
 
-        $queue = $this->get_global_items('queue');
-        $id = $this->next_id($queue);
-        $queue[] = [
-            'id' => $id,
+        $id = SSP_DB::insert_queue([
             'user_id' => (int)$user_id,
             'action_type' => $action_type,
             'priority' => (int)$priority,
@@ -135,52 +138,45 @@ trait SSP_Queue {
             'status' => 'pending',
             'attempts' => 0,
             'max_attempts' => 3,
-            'error_message' => '',
             'created_at' => current_time('mysql'),
-            'processed_at' => '',
-        ];
-        $this->set_global_items('queue', $queue);
+        ]);
+
         return ['success' => true, 'queue_id' => $id];
     }
 
     public function process_queue() {
-        $queue = $this->get_global_items('queue');
-        if (empty($queue)) return;
-
-        $pending = [];
-        foreach ($queue as &$item) {
-            if ($item['status'] === 'pending' && $item['attempts'] < $item['max_attempts']) {
-                $pending[] = &$item;
-            }
-        }
-        unset($item);
-
-        usort($pending, function($a, $b) {
-            return $b['priority'] <=> $a['priority'];
-        });
-        $pending = array_slice($pending, 0, 5); // Reduced from 10 to 5 per cycle
+        $pending = SSP_DB::get_queue_items('pending', 5);
+        if (empty($pending)) return;
 
         $first = true;
-        foreach ($pending as &$item) {
-            if (!$first) usleep((int)(SSP_MSG_DELAY * 1000000)); // Delay between items to avoid rate limits
+        foreach ($pending as $item) {
+            if (!$first) usleep((int)(SSP_MSG_DELAY * 1000000));
             $first = false;
 
-            $item['status'] = 'processing';
-            $item['attempts']++;
+            $item['attempts'] = (int)$item['attempts'] + 1;
+            
+            // Mark as processing in DB just in case process crashes
+            SSP_DB::update_queue($item['id'], [
+                'status' => 'processing',
+                'attempts' => $item['attempts']
+            ]);
 
             try {
                 $payload = is_string($item['payload']) ? json_decode($item['payload'], true) : $item['payload'];
                 $this->execute_action($item['user_id'], $item['action_type'], $payload);
-                $item['status'] = 'completed';
-                $item['processed_at'] = current_time('mysql');
+                
+                SSP_DB::update_queue($item['id'], [
+                    'status' => 'success',
+                    'processed_at' => current_time('mysql')
+                ]);
             } catch (Exception $e) {
-                $item['status'] = $item['attempts'] >= $item['max_attempts'] ? 'failed' : 'pending';
-                $item['error_message'] = $e->getMessage();
+                $new_status = $item['attempts'] >= (int)$item['max_attempts'] ? 'failed' : 'pending';
+                SSP_DB::update_queue($item['id'], [
+                    'status' => $new_status,
+                    'error_message' => $e->getMessage()
+                ]);
             }
         }
-        unset($item);
-
-        $this->set_global_items('queue', $queue);
     }
 
     private function execute_action($user_id, $action_type, $payload) {
@@ -219,7 +215,7 @@ trait SSP_Queue {
 
         // Auto-generate image for AI content if enabled
         if (empty($image_url) && $action_type === 'ai_generated' && $this->get_user_plan($user_id) === 'pro') {
-            $image_settings = get_user_meta($user_id, 'ssp_image_settings', true) ?: [];
+            $image_settings = is_array($__tmp = get_user_meta($user_id, 'ssp_image_settings', true)) ? $__tmp : [];
             if (!empty($image_settings['auto_image']) && !empty($ai_api_key)) {
                 try {
                     $img_result = $this->generate_ai_image($user_id, $final_title . ' - ' . $final_message, $image_settings['default_size'] ?? '1024x1024', $image_settings['default_quality'] ?? 'standard');
@@ -246,12 +242,19 @@ trait SSP_Queue {
         $is_album = false;
         $media_urls = [];
 
-        // Detect album (JSON array of media URLs)
+        // Detect album (JSON array of media URLs or array of objects)
         if (!empty($image_url) && $image_url[0] === '[') {
             $decoded = json_decode($image_url, true);
             if (is_array($decoded) && count($decoded) > 0) {
                 $is_album = true;
-                $media_urls = array_column($decoded, 'url');
+                $media_urls = [];
+                foreach ($decoded as $item) {
+                    if (is_string($item)) {
+                        $media_urls[] = $item;
+                    } elseif (is_array($item) && !empty($item['url'])) {
+                        $media_urls[] = $item['url'];
+                    }
+                }
             }
         }
 
@@ -316,21 +319,28 @@ trait SSP_Queue {
         $tasks = [];
         if ($ai_rewrite) $tasks[] = 'بازنویسی منحصر به فرد با لحن طبیعی';
 
-        $prompt = "وظایف: " . implode('; ', $tasks) . "\n" .
-            "عنوان: {$title}\nمحتوا: {$message}\n\n" .
-            "قوانین:\n" .
-            "- محتوا را طوری بازنویسی کن که طبیعی و انسانی به نظر برسه\n" .
-            "- نکات عملی و واقعی حفظ بشه\n" .
-            "- ساختار و معنی حفظ بشه\n" .
-            "- متن باید کاملاً ساده باشه. هیچ تگ HTML مثل <p> <br> <b> <strong> استفاده نکن\n" .
-            "- بولد رو با ** بنویس\n" .
-            "- فقط اطلاعات محتوای اصلی رو حفظ کن. چیز نامطمئن اضافه نکن\n" .
-            "- هیچ هشتگی (#) در متن اضافه نکن. نه در انتها و نه در وسط متن\n" .
-            '{"title":"","message":""}';
+        $prompt = "بازنویسی حرفه‌ای و روان پست به زبان فارسی:\n\n" .
+            "عنوان اصلی: {$title}\n" .
+            "محتوای اصلی:\n{$message}\n\n" .
+            "الزامات بازنویسی:\n" .
+            "- بازنویسی کامل با لحن طبیعی، انسانی و پرکشش\n" .
+            "- حفظ تمامی نکات کلیدی و اطلاعات مفید محتوای اصلی\n" .
+            "- رعایت دقیق فاصله‌گذاری خطوط، پاراگراف‌های خوانا و ایموجی‌های متناسب\n" .
+            "- عدم استفاده از تگ‌های HTML (فقط از ** برای بولد استفاده کن)\n\n" .
+            "دستور اکید: پاسخ شما ۱۰۰٪ منحصراً یک آبجکت معتبر JSON بدون هیچ متن توضیحی اضافه باشد:\n" .
+            "{\n" .
+            "  \"title\": \"عنوان بازنویسی شده جذاب\",\n" .
+            "  \"message\": \"متن بازنویسی شده و به شدت خوانا با ایموجی\",\n" .
+            "  \"hashtags\": \"#هشتگ۱ #هشتگ۲ #هشتگ۳\"\n" .
+            "}";
 
         try {
             $response = $this->call_ai_api($ai_provider, $ai_api_key, $ai_model, $prompt, true);
             $decoded = $this->parse_ai_json($response['content']);
+            if ((!$decoded || !is_array($decoded)) && !empty($response['content'])) {
+                $raw = trim($response['content']);
+                $decoded = ['message' => $raw, 'title' => $title];
+            }
             return [
                 'title' => $this->clean_messenger_text($decoded['title'] ?? $title),
                 'message' => $this->clean_messenger_text($decoded['message'] ?? $message),
@@ -357,6 +367,9 @@ trait SSP_Queue {
                     $this->add_to_queue($user_id, 'manual_send', [
                         'title' => $sch['title'],
                         'message' => $sch['message'],
+                        'hashtags' => $sch['hashtags'] ?? '',
+                        'image_url' => $sch['image_url'] ?? '',
+                        'selected_messengers' => $sch['selected_messengers'] ?? [],
                     ], 8);
 
                     if (!empty($sch['recurring'])) {

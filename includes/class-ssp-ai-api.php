@@ -97,6 +97,7 @@ trait SSP_AiApi {
         $body = json_decode($raw_body, true);
 
         if ($code !== 200) {
+            $pname = ucfirst($provider);
             $error_msg = '';
             if (!empty($body['error']['message'])) {
                 $error_msg = $body['error']['message'];
@@ -108,37 +109,37 @@ trait SSP_AiApi {
                 $error_msg = !empty($body['message']) ? $body['message'] : mb_substr($raw_body, 0, 500);
             }
 
-            $debug_info = "\n\n--- اطلاعات عیب‌یابی ---\nکد HTTP: $code\n";
+            $debug_info = "\n\n--- اطلاعات عیب‌یابی ---\nسرویس: $pname\nکد HTTP: $code\n";
 
             if ($code === 402) {
-                throw new Exception("خطای 402 - اتمام اعتبار: موجودی حساب OpenRouter تمام شده.\n→ https://openrouter.ai/settings/credits");
+                throw new Exception("خطای 402 - اتمام اعتبار: موجودی حساب $pname تمام شده.");
             } elseif ($code === 429) {
                 $retry_after = $body['error']['metadata']['headers']['retry-after'] ?? '';
-                $msg = 'خطای 429 - محدودیت نرخ: درخواست‌ها بیش از حد مجاز است.';
+                $msg = "خطای 429 - محدودیت نرخ ($pname): درخواست‌ها بیش از حد مجاز است.";
                 if ($retry_after) $msg .= "\nزمان انتظار: " . $retry_after . " ثانیه";
                 throw new Exception($msg);
             } elseif ($code === 403) {
                 $hint = "\n\nعلت احتمالی:\n";
                 if (stripos($error_msg, 'security policy') !== false) {
-                    $hint .= "1. سیاست امنیتی OpenRouter درخواست را رد کرده\n";
+                    $hint .= "1. سیاست امنیتی $pname درخواست را رد کرده\n";
                     $hint .= "2. مدل انتخاب شده ممکن است مجاز نباشد\n";
                     $hint .= "3. حساب شما ممکن است نیاز به احراز هویت داشته باشد\n";
-                    $hint .= "\n→ https://openrouter.ai/keys را بررسی کنید";
                 } elseif (stripos($error_msg, 'invalid') !== false || stripos($error_msg, 'key') !== false) {
                     $hint .= "API Key نامعتبر است";
                 } else {
                     $hint .= "دلیل: " . $error_msg;
                 }
-                throw new Exception("خطای 403 - دسترسی غیرمجاز: $error_msg$hint$debug_info");
+                throw new Exception("خطای 403 - دسترسی غیرمجاز ($pname): $error_msg$hint$debug_info");
             } elseif ($code >= 500) {
-                throw new Exception("خطای سرور OpenRouter ($code): $error_msg\nلطفاً کمی بعد دوباره تلاش کنید.$debug_info");
+                throw new Exception("خطای سرور $pname ($code): $error_msg\nلطفاً کمی بعد دوباره تلاش کنید.$debug_info");
             } else {
-                throw new Exception("خطای OpenRouter ($code): $error_msg$debug_info");
+                throw new Exception("خطای $pname ($code): $error_msg$debug_info");
             }
         }
 
         if (!isset($body['choices'][0]['message']['content'])) {
-            throw new Exception('پاسخ معتبری از OpenRouter دریافت نشد');
+            $pname = ucfirst($provider);
+            throw new Exception("پاسخ معتبری از $pname دریافت نشد");
         }
 
         $tokens_used = $body['usage']['total_tokens'] ?? 0;

@@ -18,7 +18,7 @@ trait SSP_LinkShortener {
         }
 
         // Get proxy settings
-        $proxy_settings = get_option('ssp_proxy_settings', []);
+        $proxy_settings = is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : [];
         $use_proxy = !empty($proxy_settings['enabled']) && !empty($proxy_settings['host']) && !empty($proxy_settings['port']);
         $proxy_args = [];
         if ($use_proxy) {
@@ -53,7 +53,7 @@ trait SSP_LinkShortener {
     }
 
     private function create_short_link($long_url) {
-        $short_links = get_option('ssp_short_links', []);
+        $short_links = is_array($__tmp = get_option('ssp_short_links', [])) ? $__tmp : [];
 
         // Check if URL already has a short link
         foreach ($short_links as $code => $link) {
@@ -82,7 +82,7 @@ trait SSP_LinkShortener {
 
     private function generate_short_code($length = 6) {
         $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-        $short_links = get_option('ssp_short_links', []);
+        $short_links = is_array($__tmp = get_option('ssp_short_links', [])) ? $__tmp : [];
 
         do {
             $code = '';
@@ -100,7 +100,7 @@ trait SSP_LinkShortener {
         }
 
         $code = $m[1];
-        $short_links = get_option('ssp_short_links', []);
+        $short_links = is_array($__tmp = get_option('ssp_short_links', [])) ? $__tmp : [];
 
         if (!isset($short_links[$code])) {
             status_header(404);
@@ -120,7 +120,7 @@ trait SSP_LinkShortener {
     }
 
     public function get_short_link_stats($user_id = null) {
-        $short_links = get_option('ssp_short_links', []);
+        $short_links = is_array($__tmp = get_option('ssp_short_links', [])) ? $__tmp : [];
 
         if ($user_id) {
             $short_links = array_filter($short_links, function($link) use ($user_id) {

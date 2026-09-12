@@ -1,61 +1,81 @@
 <?php
 /**
- * Serves the AI Browser Bridge userscript with embedded token.
- * Called via: ai-bridge-serve.php?token=xxx&site=xxx
+ * AI Browser Bridge Standalone Endpoint
+ * Serves userscript with token injection on GET, handles responses on POST.
  */
-
-// Load WordPress (walk up from plugin dir to find wp-load.php)
-$wp_load = dirname(__FILE__);
-$found = false;
-for ($i = 0; $i < 10; $i++) {
-    if (file_exists($wp_load . '/wp-load.php')) {
-        require_once $wp_load . '/wp-load.php';
-        $found = true;
-        break;
+if (!defined('ABSPATH')) {
+    // Bootstrap WordPress if accessed standalone
+    $wp_load_path = dirname(__FILE__, 4) . '/wp-load.php';
+    if (file_exists($wp_load_path)) {
+        require_once $wp_load_path;
     }
-    $wp_load = dirname($wp_load);
 }
 
-if (!$found) {
-    status_header(500);
-    echo 'WordPress not found';
+// Handle GET: Serve the userscript with token & site injected
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    $token = sanitize_text_field($_GET['token'] ?? '');
+    $site  = esc_url_raw($_GET['site'] ?? '');
+
+    if (empty($site) && function_exists('home_url')) {
+        $site = home_url();
+    }
+
+    $script_path = __DIR__ . '/assets/js/ai-bridge.user.js';
+    if (!file_exists($script_path)) {
+        header('HTTP/1.1 404 Not Found');
+        echo '// Userscript file not found';
+        exit;
+    }
+
+    $script_content = file_get_contents($script_path);
+
+    // Inject token and site
+    if (!empty($token)) {
+        $script_content = str_replace('{{SSP_BRIDGE_TOKEN}}', $token, $script_content);
+    }
+    if (!empty($site)) {
+        $script_content = str_replace('{{SSP_WP_SITE_URL}}', rtrim($site, '/'), $script_content);
+    }
+
+    header('Content-Type: application/javascript; charset=utf-8');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('Pragma: no-cache');
+    header('Expires: 0');
+    header('Access-Control-Allow-Origin: *');
+    header('Content-Disposition: inline; filename="ai-bridge.user.js"');
+    echo $script_content;
     exit;
 }
 
-// Prevent direct access without parameters
-if (empty($_GET['token']) || empty($_GET['site'])) {
-    status_header(400);
-    echo 'Missing parameters';
-    exit;
+// Handle POST: Receive task response fallback
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $raw_input = file_get_contents('php://input');
+    $data = json_decode($raw_input, true) ?: $_POST;
+
+    $task_id = sanitize_text_field($data['task_id'] ?? '');
+    $content = wp_unslash($data['response_text'] ?? $data['response'] ?? $data['content'] ?? '');
+    $status  = sanitize_text_field($data['status'] ?? 'completed');
+
+    if ($task_id && $content && function_exists('set_transient')) {
+        set_transient("ssp_bridge_result_{$task_id}", [
+            'task_id'       => $task_id,
+            'response_text' => $content,
+            'status'        => $status,
+            'received_at'   => current_time('mysql'),
+        ], 600);
+
+        if (function_exists('update_option')) {
+            update_option('ssp_bridge_task_' . $task_id, $content, false);
+        }
+
+        header('Content-Type: application/json; charset=utf-8');
+        header('Access-Control-Allow-Origin: *');
+        echo json_encode(['success' => true, 'status' => 'ok']);
+        exit;
+    }
 }
 
-$token = sanitize_text_field($_GET['token']);
-$site = esc_url_raw($_GET['site']);
-
-// Read the base userscript
-$script_path = plugin_dir_path(__FILE__) . 'assets/js/ai-bridge.user.js';
-$script = @file_get_contents($script_path);
-
-if ($script === false) {
-    status_header(500);
-    echo 'Script file not found at: ' . $script_path;
-    exit;
-}
-
-// Inject token and site URL
-$injected = str_replace(
-    ["'{{SSP_BRIDGE_TOKEN}}'", "'{{SSP_WP_SITE_URL}}'"],
-    ["'" . addslashes($token) . "'", "'" . addslashes($site) . "'"],
-    $script
-);
-
-// Serve as JavaScript so userscript managers (SnapMonkey/Tampermonkey) can intercept it
-header('Content-Type: application/javascript; charset=utf-8');
-header('Cache-Control: no-cache, no-store, must-revalidate');
-header('Pragma: no-cache');
-header('Expires: 0');
-header('Referrer-Policy: no-referrer');
-header('X-Content-Type-Options: nosniff');
+header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
-echo $injected;
+echo json_encode(['success' => false, 'message' => 'Invalid request']);
 exit;

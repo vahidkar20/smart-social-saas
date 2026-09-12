@@ -5,7 +5,7 @@
 trait SSP_Email {
 
     private function send_email_notification($user_id, $type, $data = []) {
-        $settings = get_user_meta($user_id, 'ssp_email_settings', true) ?: [];
+        $settings = is_array($__tmp = get_user_meta($user_id, 'ssp_email_settings', true)) ? $__tmp : [];
         if (empty($settings['enabled'])) return false;
 
         $email = $settings['email'] ?? '';
@@ -54,7 +54,7 @@ trait SSP_Email {
                 break;
             case 'daily_summary':
                 if (empty($settings['daily_summary'])) return false;
-                $logs = $this->get_global_items('logs');
+                $logs = SSP_DB::get_logs($user_id, 200);
                 $today = current_time('Y-m-d');
                 $today_logs = array_filter($logs, function($l) use ($user_id, $today) {
                     return (int)$l['user_id'] === (int)$user_id && substr($l['created_at'], 0, 10) === $today;

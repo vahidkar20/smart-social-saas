@@ -4,7 +4,7 @@
  */
 if (!defined('ABSPATH')) exit;
 
-define('SSP_VERSION', '15.0.0');
+if (!defined('SSP_VERSION')) { define('SSP_VERSION', '15.0.0'); }
 define('SSP_CRON_INTERVAL', 5 * MINUTE_IN_SECONDS);
 define('SSP_MSG_DELAY', 1.5);
 define('SSP_WP_POST_DELAY', 3);

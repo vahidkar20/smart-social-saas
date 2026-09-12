@@ -85,7 +85,7 @@ trait SSP_Network {
     private function get_telegram_relay_settings() {
         static $settings = null;
         if ($settings === null) {
-            $settings = get_option('ssp_telegram_relay', []);
+            $settings = is_array($__tmp = get_option('ssp_telegram_relay', [])) ? $__tmp : [];
         }
         return $settings;
     }

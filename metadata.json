@@ -1,0 +1,6 @@
+{
+  "name": "Smart Social SaaS",
+  "description": "WordPress Social Media & WooCommerce Content Automation SaaS Plugin",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

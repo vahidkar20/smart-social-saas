@@ -23,7 +23,7 @@ trait SSP_AjaxAutomation {
     public function handle_delete_schedule() {
         $user_id = $this->ajax_require_auth();
         $schedules = $this->get_user_items($user_id, 'schedules');
-        $id = intval($_POST['schedule_id']);
+        $id = intval($_POST['schedule_id'] ?? $_POST['id'] ?? 0);
         $schedules = array_values(array_filter($schedules, function($s) use ($id) { return (int)$s['id'] !== $id; }));
         $this->set_user_items($user_id, 'schedules', $schedules);
         wp_send_json_success(['message' => 'زمان‌بندی حذف شد']);
@@ -185,9 +185,58 @@ trait SSP_AjaxAutomation {
             if (empty($sch['scheduled_at'])) continue;
             $date = date('Y-m-d', strtotime($sch['scheduled_at']));
             if (!isset($calendar_data[$date])) $calendar_data[$date] = [];
-            $calendar_data[$date][] = ['id' => $sch['id'], 'title' => $sch['title'], 'time' => date('H:i', strtotime($sch['scheduled_at'])), 'status' => $sch['status']];
+            $calendar_data[$date][] = [
+                'id' => $sch['id'],
+                'title' => $sch['title'] ?? '',
+                'message' => $sch['message'] ?? '',
+                'time' => date('H:i', strtotime($sch['scheduled_at'])),
+                'scheduled_at' => $sch['scheduled_at'],
+                'status' => $sch['status'] ?? 'pending',
+                'recurring' => $sch['recurring'] ?? '',
+                'target' => $sch['target'] ?? 'queue'
+            ];
         }
-        wp_send_json_success(['calendar' => $calendar_data, 'month' => $month, 'year' => $year]);
+        $logs = $this->get_user_items($user_id, 'logs');
+        wp_send_json_success([
+            'calendar' => $calendar_data,
+            'schedules' => $schedules,
+            'logs' => $logs,
+            'month' => $month,
+            'year' => $year
+        ]);
+    }
+
+    public function handle_update_schedule() {
+        $user_id = $this->ajax_require_auth();
+        $schedules = $this->get_user_items($user_id, 'schedules');
+        $id = intval($_POST['schedule_id'] ?? $_POST['id'] ?? 0);
+        if ($id <= 0) wp_send_json_error(['message' => 'شناسه نامعتبر است']);
+
+        $found = false;
+        $updated_item = null;
+        foreach ($schedules as &$sch) {
+            if ((int)$sch['id'] === $id) {
+                if (isset($_POST['title'])) $sch['title'] = sanitize_text_field($_POST['title']);
+                if (isset($_POST['message'])) $sch['message'] = sanitize_textarea_field($_POST['message']);
+                if (!empty($_POST['scheduled_at'])) $sch['scheduled_at'] = sanitize_text_field($_POST['scheduled_at']);
+                if (isset($_POST['recurring'])) $sch['recurring'] = sanitize_text_field($_POST['recurring']);
+                if (isset($_POST['status'])) {
+                    $sch['status'] = sanitize_text_field($_POST['status']);
+                } elseif (!empty($_POST['scheduled_at']) && strtotime($_POST['scheduled_at']) > time() && ($sch['status'] ?? '') === 'cancelled') {
+                    $sch['status'] = 'pending'; // Auto reactivate if given future date
+                }
+                $sch['updated_at'] = current_time('mysql');
+                $updated_item = $sch;
+                $found = true;
+                break;
+            }
+        }
+        unset($sch);
+
+        if (!$found) wp_send_json_error(['message' => 'زمان‌بندی یافت نشد']);
+
+        $this->set_user_items($user_id, 'schedules', $schedules);
+        wp_send_json_success(['message' => 'زمان‌بندی با موفقیت بروزرسانی شد', 'schedule' => $updated_item, 'schedules' => $schedules]);
     }
 
     public function handle_update_schedule_time() {

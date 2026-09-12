@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Social SaaS</title>
+    <meta name="description" content="WordPress Social Media & WooCommerce Content Automation SaaS Plugin">
+    <meta property="og:title" content="Smart Social SaaS">
+    <meta property="og:description" content="WordPress Social Media & WooCommerce Content Automation SaaS Plugin">
+    <style>
+        body {
+            font-family: Tahoma, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f3f4f6;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            color: #1f2937;
+        }
+        .container {
+            background-color: white;
+            padding: 3rem;
+            border-radius: 1rem;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            text-align: center;
+            max-width: 500px;
+            width: 100%;
+        }
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            color: #111827;
+        }
+        p {
+            margin-bottom: 2rem;
+            color: #4b5563;
+            line-height: 1.5;
+        }
+        .btn {
+            background-color: #2563eb;
+            color: white;
+            font-weight: 600;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            text-decoration: none;
+            display: inline-block;
+            transition: background-color 0.2s;
+            border: none;
+            cursor: pointer;
+            font-size: 1rem;
+        }
+        .btn:hover {
+            background-color: #1d4ed8;
+        }
+        .btn svg {
+            vertical-align: middle;
+            margin-left: 0.5rem;
+            width: 1.25rem;
+            height: 1.25rem;
+        }
+        .status {
+            margin-top: 1rem;
+            font-size: 0.875rem;
+            color: #059669;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>دانلود افزونه بازنویسی شده</h1>
+        <p>در حال حاضر افزونه <strong>Smart Social SaaS</strong> توسط هوش مصنوعی در حال بازبینی و بهینه‌سازی است. شما می‌توانید در هر لحظه آخرین نسخه فایل‌های افزونه (شامل تغییرات) را با کلیک روی دکمه زیر دانلود کنید.</p>
+        
+        <button id="downloadBtn" class="btn" onclick="downloadPlugin()">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>
+            دانلود افزونه (ZIP)
+        </button>
+        <div id="statusMessage" class="status">دانلود با موفقیت آغاز شد!</div>
+    </div>
+
+    <script>
+        function downloadPlugin() {
+            const btn = document.getElementById('downloadBtn');
+            const status = document.getElementById('statusMessage');
+            
+            btn.style.opacity = '0.7';
+            btn.innerText = 'در حال آماده‌سازی...';
+            
+            window.location.href = '/api/download';
+            
+            setTimeout(() => {
+                btn.style.opacity = '1';
+                btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg> دانلود مجدد افزونه`;
+                status.style.display = 'block';
+            }, 2000);
+        }
+    </script>
+</body>
+</html>

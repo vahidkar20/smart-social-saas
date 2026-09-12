@@ -62,18 +62,12 @@ $wp_sites = $this->get_profile_wp_sites($user_id, $active_profile_id);
 $rss_feeds = $this->get_profile_rss_feeds($user_id, $active_profile_id);
 $enabled_messengers = count(array_values(array_filter($messengers, function($m) { return !empty($m['is_active']); })));
 
-$queue = $this->get_global_items('queue');
-$pending_count = count(array_filter($queue, function($q) use ($user_id) {
-    return (int)$q['user_id'] === (int)$user_id && $q['status'] === 'pending';
-}));
+$pending_count = count(SSP_DB::get_queue_items('pending', 0, $user_id));
 
-$all_logs = $this->get_global_items('logs');
-$user_logs = array_values(array_filter($all_logs, function($l) use ($user_id) {
-    return (int)$l['user_id'] === (int)$user_id;
-}));
+$user_logs = SSP_DB::get_logs($user_id, 200);
 $total_count = count($user_logs);
 $total_tokens = 0;
-foreach ($user_logs as $l) { $total_tokens += (int)($l['ai_tokens_used'] ?? 0); }
+foreach ($user_logs as $l) { $total_tokens += (int)($l['ai_tokens'] ?? 0); }
 $logs = array_slice($user_logs, 0, 30);
 
 $today_count = $this->get_today_count($user_id, $user_logs);
@@ -106,6 +100,8 @@ $template_items = $this->get_user_template_items($user_id);
 $schedules = $this->get_user_items($user_id, 'schedules');
 usort($schedules, function($a, $b) { return strtotime($a['scheduled_at'] ?? '0') - strtotime($b['scheduled_at'] ?? '0'); });
 
+$distributions = method_exists($this, 'get_profile_items') ? $this->get_profile_items($user_id, 'distributions', $active_profile_id) : $this->get_user_items($user_id, 'distributions');
+
 $masked_key = !empty($ai_api_key) ? esc_attr(substr($ai_api_key, 0, 8) . '....' . substr($ai_api_key, -4)) : '';
 
 $messenger_json = json_encode(array_map(function($m) {
@@ -126,7 +122,11 @@ $wp_sites_json = json_encode(array_map(function($s) {
 
 $rss_feeds_json = json_encode(array_map(function($f) {
     return ['id' => (int)$f['id'], 'feed_name' => $f['feed_name'], 'feed_url' => $f['feed_url'],
-            'is_active' => (int)$f['is_active'], 'auto_fetch' => (int)$f['auto_fetch']];
+            'is_active' => (int)$f['is_active'], 'auto_fetch' => (int)$f['auto_fetch'],
+            'clean_ads' => (int)($f['clean_ads'] ?? 1), 'clean_urls' => (int)($f['clean_urls'] ?? 1),
+            'extract_content' => (int)($f['extract_content'] ?? 0), 'max_length' => (int)($f['max_length'] ?? 500),
+            'content_mode' => $f['content_mode'] ?? 'summary',
+            'message_template' => $f['message_template'] ?? ''];
 }, $rss_feeds));
 
 wp_enqueue_style('ssp-portal-css', plugins_url('assets/css/portal.css', dirname(__DIR__, 2) . '/main.php'), [], SSP_VERSION);
@@ -137,6 +137,80 @@ ob_start();
 <?php
         ?>
         <script>
+
+window.showToast = function(msg, type = 'info') {
+    let container = document.getElementById('ssp-toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'ssp-toast-container';
+        container.style.position = 'fixed';
+        container.style.bottom = '32px';
+        container.style.left = '32px';
+        container.style.zIndex = '9999';
+        container.style.display = 'flex';
+        container.style.flexDirection = 'column';
+        container.style.gap = '10px';
+        document.body.appendChild(container);
+    }
+    
+    let toast = document.createElement('div');
+    toast.className = 'ssp-toast toast-' + type;
+    toast.setAttribute('role', 'alert');
+    toast.setAttribute('aria-live', 'assertive');
+    toast.innerHTML = (type === 'success' ? '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><polyline points="20 6 9 17 4 12"/></svg>' : (type === 'error' ? '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' : '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>')) + msg;
+    
+    container.appendChild(toast);
+    
+    // Trigger animation
+    setTimeout(() => toast.classList.add('show'), 10);
+    
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+    }, 4000);
+};
+
+
+document.addEventListener("DOMContentLoaded", function() {
+    document.querySelectorAll('.ssp-logs-table').forEach(table => {
+        let headers = [];
+        table.querySelectorAll('th').forEach(th => headers.push(th.innerText.trim()));
+        if (headers.length > 0) {
+            table.querySelectorAll('tbody tr').forEach(row => {
+                row.querySelectorAll('td').forEach((td, index) => {
+                    if (headers[index]) {
+                        td.setAttribute('data-label', headers[index]);
+                    }
+                });
+            });
+        }
+    });
+});
+
+
+            window.setBtnLoading = function(btn, isLoading) {
+                if (!btn) return;
+                if (isLoading) {
+                    if (!btn.dataset.originalText) btn.dataset.originalText = btn.innerHTML;
+                    btn.disabled = true;
+                    btn.innerHTML = '<span class="ssp-spinner" style="display:inline-block;width:14px;height:14px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:spin 0.75s linear infinite;vertical-align:middle;margin-left:6px;"></span> ' + (btn.dataset.loadingText || 'در حال پردازش...');
+                    if (btn._sspLoadTimeout) clearTimeout(btn._sspLoadTimeout);
+                    btn._sspLoadTimeout = setTimeout(function() {
+                        if (btn && btn.disabled) {
+                            btn.disabled = false;
+                            if (btn.dataset.originalText) btn.innerHTML = btn.dataset.originalText;
+                        }
+                    }, 15000);
+                } else {
+                    if (btn._sspLoadTimeout) {
+                        clearTimeout(btn._sspLoadTimeout);
+                        btn._sspLoadTimeout = null;
+                    }
+                    btn.disabled = false;
+                    if (btn.dataset.originalText) btn.innerHTML = btn.dataset.originalText;
+                }
+            };
+
         (function(){
             var t = localStorage.getItem('ssp_theme');
             var theme = (t === 'dark') ? 'ssp-theme-dark' : 'ssp-theme-light';
@@ -331,11 +405,45 @@ ob_start();
         }
 
         .ssp-content { flex: 3 1 600px; background: var(--card); border-radius: 20px; padding: 32px; border: 1px solid var(--border); position: relative; min-height: 600px; }
-        .tab-content { display: none; animation: fadeIn 0.35s ease; }
+        .tab-content { display: none; animation: fadeIn 0.15s ease-out; }
         .tab-content.active { display: block; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-        .ssp-content h2 { font-size: 1.5rem; font-weight: 700; margin: 0 0 8px; color: var(--text); display: flex; align-items: center; gap: 10px; }
+        .ssp-content h2,
+        .tab-content h2,
+        body.ssp-page-active .ssp-content h2,
+        body.ssp-page-active .tab-content h2,
+        .ssp-tool-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 0 0 8px;
+            color: var(--text) !important;
+            background: none !important;
+            -webkit-background-clip: initial !important;
+            -webkit-text-fill-color: initial !important;
+            display: flex !important;
+            align-items: center !important;
+            flex-direction: row !important;
+            flex-wrap: nowrap !important;
+            gap: 10px !important;
+            line-height: 1.3 !important;
+        }
+        .ssp-content h2 svg,
+        .tab-content h2 svg,
+        body.ssp-page-active .ssp-content h2 svg,
+        .ssp-tool-title svg {
+            display: inline-block !important;
+            vertical-align: middle !important;
+            flex-shrink: 0 !important;
+            margin: 0 !important;
+        }
+        .ssp-content h2 span,
+        .tab-content h2 span,
+        body.ssp-page-active .ssp-content h2 span,
+        .ssp-tool-title span {
+            display: inline-block !important;
+            vertical-align: middle !important;
+        }
         .ssp-section-desc { color: var(--text-muted); margin-bottom: 28px; font-size: 0.95rem; line-height: 1.6; }
 
         .ssp-guide { background: var(--accent-soft); border: 2px solid var(--accent); border-radius: 16px; padding: 20px; margin-bottom: 24px; }
@@ -638,7 +746,7 @@ ob_start();
                 z-index: 100;
                 padding: 12px 16px;
                 gap: 8px;
-            }
+
             .ssp-header-left { gap: 10px; }
             .ssp-header-icon { width: 40px; height: 40px; }
             .ssp-header-icon svg { width: 18px; height: 18px; }
@@ -660,7 +768,7 @@ ob_start();
                 overflow: hidden !important;
                 height: 100vh !important;
                 height: 100dvh !important;
-            }
+
 
             body.ssp-shortcode-page .ssp-wrap {
                 padding: 0 !important;
@@ -671,7 +779,7 @@ ob_start();
                 display: flex !important;
                 flex-direction: column !important;
                 overflow: hidden !important;
-            }
+
 
             body.ssp-shortcode-page .ssp-header {
                 position: sticky !important;
@@ -682,7 +790,7 @@ ob_start();
                 flex-shrink: 0 !important;
                 border-left: none !important;
                 border-right: none !important;
-            }
+
 
             body.ssp-shortcode-page .ssp-main {
                 flex: 1 !important;
@@ -690,11 +798,11 @@ ob_start();
                 margin: 0 !important;
                 gap: 0 !important;
                 flex-direction: column !important;
-            }
+
 
             body.ssp-shortcode-page .ssp-sidebar {
                 display: none !important;
-            }
+
 
             body.ssp-shortcode-page .ssp-content {
                 border-radius: 0 !important;
@@ -708,16 +816,16 @@ ob_start();
                 padding-bottom: 80px !important;
                 flex: 1 !important;
                 min-height: 0 !important;
-            }
+
 
             body.ssp-shortcode-page .tab-content.active {
                 display: block !important;
                 min-height: 100% !important;
-            }
+
 
             body.ssp-shortcode-page .ssp-modal-overlay {
                 z-index: 10001 !important;
-            }
+
         }
 
         .ob-step { animation: fadeIn 0.3s ease; }
@@ -732,9 +840,10 @@ ob_start();
             .ssp-particles-canvas { display: none !important; }
             *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
         }
-        </style>
-
-        <canvas class="ssp-particles-canvas" id="sspParticles"></canvas>
+        
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+        .ssp-btn-primary:disabled, .ssp-btn-secondary:disabled, button:disabled { opacity: 0.7; cursor: not-allowed; }
+</style>
 
         <div class="ssp-wrap <?php echo $is_frontend ? 'ssp-frontend-view' : 'ssp-admin-view'; ?>">
             <?php if ($is_impersonating) : ?>
@@ -762,7 +871,7 @@ ob_start();
                                 <?php endforeach; ?>
                             </select>
                         </div>
-                        <button onclick="openProfileModal()" style="background:var(--bg-alt); border:1px solid var(--border); color:var(--text-muted); border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.75rem;" title="مدیریت پروفایل‌ها">⚙</button>
+                        <button onclick="openProfileModal()" style="background:var(--bg-alt); border:1px solid var(--border); color:var(--text-muted); border-radius:8px; padding:6px 10px; cursor:pointer; font-size:0.75rem;" title="مدیریت پروفایل‌ها"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
                         <?php endif; ?>
                         <span class="ssp-status-pill <?php echo $next_cron ? 'ok' : 'warn'; ?>">
                             <span class="ssp-status-dot"></span>
@@ -786,43 +895,84 @@ ob_start();
 
                 <div class="ssp-main">
                     <div class="ssp-sidebar" id="sspSidebar">
-                        <div class="ssp-sidebar-section">نمای کلی</div>
-                        <button class="ssp-tab-btn active" onclick="switchTab('dashboard', this)" data-tab="dashboard"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg> داشبورد</button>
+                        <div class="ssp-sidebar-section">داشبورد و گزارشات</div>
+                        <button class="ssp-tab-btn active" onclick="switchTab('dashboard', this)" data-tab="dashboard">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> داشبورد
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('calendar', this)" data-tab="calendar">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> تقویم محتوا
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('reports', this)" data-tab="reports">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> فعالیت‌ها و لاگ‌ها
+                        </button>
 
-                        <div class="ssp-sidebar-section">پیام‌رسان‌ها</div>
-                        <button class="ssp-tab-btn" onclick="switchTab('messengers', this)" data-tab="messengers"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg> مدیریت پیام‌رسان‌ها<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('botbuilder', this)" data-tab="botbuilder"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/><line x1="8" y1="16" x2="8" y2="16"/><line x1="16" y1="16" x2="16" y2="16"/></svg> ساخت بات<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('manual', this)" data-tab="manual"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> ارسال پیام<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('drafts', this)" data-tab="drafts"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> پیش‌نویس‌ها</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('template', this)" data-tab="template"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg> قالب‌ها</button>
+                        <div class="ssp-sidebar-section">استودیو هوش مصنوعی</div>
+                        <button class="ssp-tab-btn" onclick="switchTab('generate', this)" data-tab="generate">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> مرکز تولید سریع<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?>
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('contentgen', this)" data-tab="contentgen">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> تولید مقاله سئو شده<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?>
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('productgen', this)" data-tab="productgen">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg> تولید محصول فروشگاهی<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?>
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('postgen', this)" data-tab="postgen">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> پست شبکه‌های اجتماعی<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?>
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('brainstorm', this)" data-tab="brainstorm">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> ایده‌یابی هوشمند<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?>
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('promptbuilder', this)" data-tab="promptbuilder">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="10" y1="13" x2="8" y2="13"/></svg> قالب‌های پرامپت
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('template', this)" data-tab="template">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg> قالب‌های محتوا
+                        </button>
+                        
+                        <div class="ssp-sidebar-section">انتشار و اتوماسیون</div>
+                        <button class="ssp-tab-btn" onclick="switchTab('manual', this)" data-tab="manual">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> ارسال پیام سریع
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('drafts', this)" data-tab="drafts">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> پیش‌نویس‌ها
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('schedules', this)" data-tab="schedules">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> زمان‌بندی پیام
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('distribution', this)" data-tab="distribution">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg> توزیع خودکار (Automation)
+                        </button>
 
-                        <div class="ssp-sidebar-section">تولید محتوا</div>
-                        <button class="ssp-tab-btn" onclick="switchTab('generate', this)" data-tab="generate"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> مرکز تولید محتوا<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('brainstorm', this)" data-tab="brainstorm"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> ایده‌یابی<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('postgen', this)" data-tab="postgen"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> تولید پست<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('contentgen', this)" data-tab="contentgen"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> تولید مقاله<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('productgen', this)" data-tab="productgen"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg> تولید محصول<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
-                        <button class="ssp-tab-btn" onclick="switchTab('promptbuilder', this)" data-tab="promptbuilder"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><line x1="10" y1="9" x2="8" y2="9"/></svg> قالب پرامپت<?php if ($plan !== 'pro') : ?><span class="ssp-badge" style="background:#4f46e5;color:#fff;font-size:0.6rem;padding:2px 6px;border-radius:8px;margin-right:4px;font-weight:700;">Pro</span><?php endif; ?></button>
+                        <div class="ssp-sidebar-section">تلگرام و پیام‌رسان‌ها</div>
+                        <button class="ssp-tab-btn" onclick="switchTab('messengers', this)" data-tab="messengers">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> مدیریت کانال‌ها
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('botbuilder', this)" data-tab="botbuilder">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2 2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm0 6a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-2a2 2 0 0 1 2-2zm0 6a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-2a2 2 0 0 1 2-2z"/></svg> ربات‌ساز پیشرفته (Flows)
+                        </button>
+                        
+                        <div class="ssp-sidebar-section">ابزارهای عملیاتی (Ops)</div>
+                        <button class="ssp-tab-btn" onclick="switchTab('seo', this)" data-tab="seo">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> تحلیل و سئو سایت
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('links', this)" data-tab="links">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> کوتاه‌کننده لینک
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('sources', this)" data-tab="sources">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg> خوراک (RSS Feeds)
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('wpsources', this)" data-tab="wpsources">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg> منابع وردپرس (Sites)
+                        </button>
 
-                        <div class="ssp-sidebar-section">زمان‌بندی</div>
-                        <button class="ssp-tab-btn" onclick="switchTab('calendar', this)" data-tab="calendar"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> تقویم محتوا</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('schedules', this)" data-tab="schedules"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> زمان‌بندی ساده</button>
-
-                        <div class="ssp-sidebar-section">اتوماسیون و گزارش</div>
-                        <button class="ssp-tab-btn" onclick="switchTab('distribution', this)" data-tab="distribution"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg> توزیع خودکار</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('reports', this)" data-tab="reports"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg> گزارشات</button>
-
-                        <div class="ssp-sidebar-section">ابزارها</div>
-                        <button class="ssp-tab-btn" onclick="switchTab('seo', this)" data-tab="seo"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> ابزار SEO</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('links', this)" data-tab="links"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg> کوتاه‌کننده لینک</button>
-
-                        <div class="ssp-sidebar-section">تنظیمات</div>
-                        <button class="ssp-tab-btn" onclick="switchTab('sources', this)" data-tab="sources"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg> RSS Feeds</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('wpsources', this)" data-tab="wpsources"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg> منابع وردپرس</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('ai', this)" data-tab="ai"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> تنظیمات AI</button>
-                        <button class="ssp-tab-btn" onclick="switchTab('subscription', this)" data-tab="subscription"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> اشتراک</button>
+                        <div class="ssp-sidebar-section">پیکربندی</div>
+                        <button class="ssp-tab-btn" onclick="switchTab('ai', this)" data-tab="ai">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> اتصال‌های ابری (AI)
+                        </button>
+                        <button class="ssp-tab-btn" onclick="switchTab('subscription', this)" data-tab="subscription">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> حساب کاربری
+                        </button>
                     </div>
-
                     <div class="ssp-content">
                         <div id="ssp-loader" class="ssp-loader"><div class="ssp-spinner"></div><span>در حال پردازش...</span></div>
 
@@ -849,7 +999,7 @@ ob_start();
                                     <h3>امکانات حرفه‌ای را فعال کنید</h3>
                                     <p>AI، زمان‌بندی پیشرفته، تولید محتوا، و...</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
                             </div>
                             <?php endif; ?>
 
@@ -877,14 +1027,16 @@ ob_start();
                             </div>
 
                             <?php
-                            $user_queue = array_values(array_filter($queue, function($q) use ($user_id) {
-                                return (int)$q['user_id'] === (int)$user_id && $q['status'] === 'pending';
-                            }));
+                            $user_queue = SSP_DB::get_queue_items('pending', 50, $user_id);
+                            if (!is_array($user_queue)) $user_queue = [];
                             if (!empty($user_queue)) : ?>
                             <div style="margin:32px 0 16px;">
                                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
                                     <h3 style="margin:0; color:var(--text);">صف ارسال (<?php echo count($user_queue); ?> پیام)</h3>
-                                    <button class="ssp-btn-danger" onclick="cancelAllQueue()" style="font-size:0.8rem; padding:4px 12px;">لغو همه</button>
+                                    <div style="display:flex; gap:8px;">
+                                        <button type="button" class="ssp-btn-primary" onclick="forceProcessQueue()" style="font-size:0.8rem; padding:4px 12px;">ارسال سریع همه (حل مشکل)</button>
+                                        <button type="button" class="ssp-btn-danger" onclick="cancelAllQueue()" style="font-size:0.8rem; padding:4px 12px;">لغو همه</button>
+                                    </div>
                                 </div>
                                 <div style="display:flex; flex-direction:column; gap:8px;">
                                     <?php foreach (array_slice($user_queue, 0, 5) as $q) : ?>
@@ -898,7 +1050,7 @@ ob_start();
                                                 <?php endif; ?>
                                             </div>
                                         </div>
-                                        <button class="ssp-btn-danger" onclick="cancelQueueItem(<?php echo (int)$q['id']; ?>)" style="font-size:0.75rem; padding:3px 10px;">لغو</button>
+                                        <button type="button" class="ssp-btn-danger" onclick="cancelQueueItem(<?php echo (int)$q['id']; ?>)" style="font-size:0.75rem; padding:3px 10px;">لغو</button>
                                     </div>
                                     <?php endforeach; ?>
                                     <?php if (count($user_queue) > 5) : ?>
@@ -979,17 +1131,20 @@ ob_start();
                                 </div>
                                 <?php endforeach;
                                 else : ?>
-                                <div class="ssp-empty" style="padding:20px;">
-                                    <p style="color:var(--text-muted); font-size:0.85rem;">هنوز فعالیتی ثبت نشده است.</p>
+                                <div class="ssp-empty" style="padding:30px 20px;">
+                                    <div class="ssp-empty-icon" style="font-size:3rem; color:var(--text-subtle); margin-bottom:12px;"><svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg></div>
+                                    <h4 style="margin:0 0 8px; font-size:1.1rem; color:var(--text);">هیچ فعالیتی یافت نشد</h4>
+                                    <p style="color:var(--text-muted); font-size:0.9rem; max-width:350px; margin:0 auto 16px;">تا کنون هیچ پیام، تولید محتوا یا اتوماسیونی توسط سیستم اجرا نشده است.</p>
+                                    <button type="button" class="ssp-btn-secondary" onclick="switchTab('generate', document.querySelector('[data-tab=generate]'))">شروع تولید محتوا</button>
                                 </div>
                                 <?php endif; ?>
                             </div>
 
                             <h3 style="margin:24px 0 12px; color:var(--text);">دسترسی سریع</h3>
                             <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                                <button class="ssp-btn-primary" onclick="switchTab('manual', document.querySelector('[data-tab=manual]'))">ارسال پیام</button>
-                                <button class="ssp-btn-secondary" onclick="switchTab('generate', document.querySelector('[data-tab=generate]'))">تولید محتوا</button>
-                                <button class="ssp-btn-secondary" onclick="switchTab('reports', document.querySelector('[data-tab=reports]'))">مشاهده گزارشات</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('manual', document.querySelector('[data-tab=manual]'))">ارسال پیام</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="switchTab('generate', document.querySelector('[data-tab=generate]'))">تولید محتوا</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="switchTab('reports', document.querySelector('[data-tab=reports]'))">مشاهده گزارشات</button>
                             </div>
 
                             <?php if ($plan === 'pro' && !empty($total_tokens)) : ?>
@@ -1029,17 +1184,19 @@ ob_start();
                                     <h3 style="color:var(--warning);">ابتدا یک مقصد متصل کنید</h3>
                                     <p>به تب «پیام‌رسان‌ها» بروید و حداقل یک پیام‌رسان اضافه کنید.</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('messengers', document.querySelector('[data-tab=messengers]'))">رفتن به پیام‌رسان‌ها</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('messengers', document.querySelector('[data-tab=messengers]'))">رفتن به پیام‌رسان‌ها</button>
                             </div>
                             <?php else : ?>
 
-                            <form onsubmit="manualSend(event)">
+                            <form id="manual_form" onsubmit="manualSend(event)">
                                 <!-- Messenger Selection (Grid with Select All) -->
                                 <div class="ssp-form-group">
-                                    <label class="ssp-label">پیام‌رسان‌های مقصد</label>
-                                    <div style="display:flex; gap:8px; margin-bottom:8px;">
-                                        <button type="button" class="ssp-btn-secondary" onclick="toggleAllManualMessengers(true)" style="font-size:0.8rem; padding:6px 12px;">انتخاب همه</button>
-                                        <button type="button" class="ssp-btn-secondary" onclick="toggleAllManualMessengers(false)" style="font-size:0.8rem; padding:6px 12px;">حذف انتخاب</button>
+                                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                                        <label class="ssp-label" style="margin-bottom:0;">پیام‌رسان‌های مقصد</label>
+                                        <div style="display:flex; gap:8px; font-size:0.78rem;">
+                                            <button type="button" class="ssp-btn-secondary" onclick="document.querySelectorAll('.manual_messenger_cb').forEach(function(cb){ cb.checked = true; });" style="padding:3px 10px; font-size:0.75rem; border-radius:6px;">انتخاب همه</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="document.querySelectorAll('.manual_messenger_cb').forEach(function(cb){ cb.checked = false; });" style="padding:3px 10px; font-size:0.75rem; border-radius:6px;">لغو همه</button>
+                                        </div>
                                     </div>
                                     <div id="manual_messenger_list" style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:10px;">
                                         <?php
@@ -1052,7 +1209,7 @@ ob_start();
                                             $pcolor = $send_platform_colors[$plat] ?? '#666';
                                         ?>
                                         <label style="display:flex; align-items:center; gap:10px; padding:12px; background:var(--bg-alt); border-radius:10px; border:1px solid var(--border); cursor:pointer; transition:all 0.2s;" class="ssp-messenger-check">
-                                            <input type="checkbox" name="manual_messengers[]" value="<?php echo (int)$m['id']; ?>" <?php echo $m['is_active'] ? 'checked' : ''; ?> style="width:18px; height:18px; accent-color:var(--accent);">
+                                            <input type="checkbox" name="manual_messengers[]" class="manual_messenger_cb" value="<?php echo (int)$m['id']; ?>" <?php echo $m['is_active'] ? 'checked' : ''; ?> style="width:18px; height:18px; accent-color:var(--accent);">
                                             <span style="display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border-radius:8px; background:<?php echo esc_attr($pcolor); ?>15; font-size:14px; flex-shrink:0;"><?php echo $send_platform_icons[$plat] ?? '💬'; ?></span>
                                             <div style="min-width:0;">
                                                 <div style="font-weight:600; font-size:0.85rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"><?php echo esc_html($m['name']); ?></div>
@@ -1097,21 +1254,21 @@ ob_start();
                                         <input type="text" id="manual_hashtags" class="ssp-input" placeholder="#tag1 #tag2">
                                     </div>
                                     <div class="ssp-form-group">
-                                        <label class="ssp-label">تصویر یا ویدیو (اختیاری)</label>
+                                        <label class="ssp-label">تصویر، ویدیو یا فایل/داکیومنت (اختیاری)</label>
                                         <input type="hidden" id="manual_image_url" value="">
                                         <!-- Tab buttons -->
                                         <div style="display:flex; gap:0; margin-bottom:0;">
-                                            <button type="button" class="ssp-btn-secondary manual_media_tab active" onclick="switchManualMediaTab('upload')" style="border-radius:0 0 0 8px; flex:1; font-size:0.8rem; padding:6px;">آپلود فایل</button>
-                                            <button type="button" class="ssp-btn-secondary manual_media_tab" onclick="switchManualMediaTab('url')" style="border-radius:0 0 8px 0; flex:1; font-size:0.8rem; padding:6px;">از لینک URL</button>
+                                            <button type="button" class="ssp-btn-secondary manual_media_tab active" onclick="switchManualMediaTab('upload')" style="border-radius:0 0 0 8px; flex:1; font-size:0.8rem; padding:6px;">آپلود فایل / داکیومنت</button>
+                                            <button type="button" class="ssp-btn-secondary manual_media_tab" onclick="switchManualMediaTab('url')" style="border-radius:0 0 8px 0; flex:1; font-size:0.8rem; padding:6px;">از لینک مستقیم URL</button>
                                         </div>
                                         <!-- Upload tab -->
                                         <div id="manual_media_tab_upload">
                                             <div id="manual_media_upload" style="position:relative; border:2px dashed var(--border); border-top:none; border-radius:0 0 10px 10px; padding:16px; text-align:center; cursor:pointer; transition:all 0.2s;" onclick="document.getElementById('manual_media_file').click()">
-                                                <input type="file" id="manual_media_file" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/mpeg,video/quicktime" multiple style="display:none;" onchange="handleManualMediaUpload(this)">
+                                                <input type="file" id="manual_media_file" accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.tar,.gz,.7z,.apk" multiple style="display:none;" onchange="handleManualMediaUpload(this)">
                                                 <div id="manual_media_placeholder">
                                                     <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="var(--text-subtle)" stroke-width="2" style="margin-bottom:4px;"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                                                    <div style="font-size:0.8rem; color:var(--text-muted);">کلیک کنید یا فایل را بکشید</div>
-                                                    <div style="font-size:0.7rem; color:var(--text-subtle); margin-top:4px;">تصویر: حداکثر ۱۰ مگابایت | ویدیو: حداکثر ۸۰ مگابایت</div>
+                                                    <div style="font-size:0.8rem; color:var(--text-muted);">کلیک کنید یا فایل، تصویر، ویدیو یا سند را بکشید</div>
+                                                    <div style="font-size:0.7rem; color:var(--text-subtle); margin-top:4px;">تصویر: تا ۱۵MB | ویدیو: تا ۸۰MB | داکیومنت/فایل/صوت: تا ۵۰MB</div>
                                                 </div>
                                                 <div id="manual_media_preview" style="display:none;"></div>
                                                 <div id="manual_media_progress" style="display:none; margin-top:8px;">
@@ -1124,10 +1281,10 @@ ob_start();
                                         <div id="manual_media_tab_url" style="display:none;">
                                             <div style="border:2px dashed var(--border); border-top:none; border-radius:0 0 10px 10px; padding:12px;">
                                                 <div style="display:flex; gap:6px;">
-                                                    <input type="url" id="manual_media_url_input" class="ssp-input" dir="ltr" placeholder="https://example.com/image.jpg" style="flex:1;">
+                                                    <input type="url" id="manual_media_url_input" class="ssp-input" dir="ltr" placeholder="https://example.com/file.pdf" style="flex:1;">
                                                     <button type="button" class="ssp-btn-primary" onclick="addManualMediaUrl()" style="padding:6px 12px; font-size:0.8rem; white-space:nowrap;">افزودن</button>
                                                 </div>
-                                                <div class="ssp-hint" style="margin-top:6px;">لینک مستقیم تصویر یا ویدیو را وارد کنید. چند فایل = آلبوم</div>
+                                                <div class="ssp-hint" style="margin-top:6px;">لینک مستقیم تصویر، ویدیو یا فایل/داکیومنت را وارد کنید. چند فایل = آلبوم</div>
                                                 <div id="manual_media_url_list" style="margin-top:8px;"></div>
                                                 <div id="manual_media_url_preview" style="display:none; margin-top:8px;"></div>
                                             </div>
@@ -1171,13 +1328,13 @@ ob_start();
                                             <div class="ssp-form-group">
                                                 <label class="ssp-label">تاریخ و ساعت ارسال (شمسی)</label>
                                                 <input type="text" id="manual_schedule_display" class="ssp-input" readonly placeholder="تاریخ را انتخاب کنید" style="cursor:pointer;" onclick="manualOpenJalaliPicker()">
-                                                <input type="hidden" id="manual_schedule_datetime" value="">
+                                                <input type="hidden" id="manual_schedule_datetime" name="scheduled_at" value="">
                                                 <div class="ssp-hint" style="margin-top:4px;">حداقل ۱۰ دقیقه آینده</div>
                                                 <div id="manual_jalali_picker" style="display:none; margin-top:8px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px;"></div>
                                             </div>
                                             <div class="ssp-form-group">
                                                 <label class="ssp-label">تکرار</label>
-                                                <select id="manual_schedule_recurring" class="ssp-select">
+                                                <select id="manual_schedule_recurring" name="recurring" class="ssp-select">
                                                     <option value="">بدون تکرار</option>
                                                     <option value="daily">روزانه</option>
                                                     <option value="weekly">هفتگی</option>
@@ -1189,7 +1346,7 @@ ob_start();
                                         <div class="ssp-upgrade-banner" style="background:var(--accent-soft); border-color:var(--accent); margin-top:8px;">
                                             <div style="display:flex; align-items:center; gap:10px;">
                                                 <span>زمان‌بندی ارسال یک قابلیت Pro است.</span>
-                                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقاء به Pro</button>
+                                                <button type="button" class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقاء به Pro</button>
                                             </div>
                                         </div>
                                         <?php endif; ?>
@@ -1234,7 +1391,7 @@ ob_start();
                                     <input type="text" id="draft_hashtags" class="ssp-input" placeholder="#tag1 #tag2">
                                 </div>
                                 <div style="display:flex; gap:10px; align-items:center;">
-                                    <button class="ssp-btn-primary" onclick="saveDraft()" id="save_draft_btn"><span class="ssp-btn-text">ذخیره پیش‌نویس</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="saveDraft()" id="save_draft_btn"><span class="ssp-btn-text">ذخیره پیش‌نویس</span><span class="ssp-btn-spinner"></span></button>
                                     <span class="ssp-saved-indicator" id="draft_saved">ذخیره شد!</span>
                                 </div>
                             </div>
@@ -1245,155 +1402,71 @@ ob_start();
                             <?php if ($plan === 'free') : ?>
                             <div style="text-align:center; padding:60px 20px;">
                                 <div style="width:64px;height:64px;border-radius:50%;background:#eef2ff;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;">
-                                    <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="#4f46e5" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+                                    <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="#4f46e5" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
                                 </div>
                                 <h3 style="color:#1e293b; margin:0 0 8px;">قابلیت حرفه‌ای</h3>
                                 <p style="color:#64748b; margin:0 0 20px; font-size:0.9rem;">مرکز تولید محتوا ویژگی پلن Pro است. با ارتقا به پلن حرفه‌ای، به این ابزار دسترسی پیدا کنید.</p>
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2>مرکز تولید محتوا</h2>
-                            <p class="ssp-section-desc">ابزارهای هوش مصنوعی برای تولید پست، مقاله و ایده را در یک نگاه ببینید.</p>
-
-                            <?php if ($plan === 'free') : ?>
-                            <div class="ssp-upgrade-banner" style="background:var(--warning-soft); border-color:var(--warning);">
-                                <div>
-                                    <h3 style="color:var(--warning);">این قابلیت فقط در پلن Pro</h3>
-                                    <p>با ارتقا به Pro می‌توانید از AI برای تولید خودکار محتوا استفاده کنید.</p>
+                            <div style="text-align:center; margin-bottom:40px; margin-top:10px;">
+                                <div style="width:64px; height:64px; background:linear-gradient(135deg, #4f46e5, #ec4899); border-radius:20px; display:inline-flex; align-items:center; justify-content:center; color:#fff; margin-bottom:20px; box-shadow:0 10px 25px rgba(79, 70, 229, 0.25);">
+                                    <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
+                                <h2 style="margin:0 0 12px; font-weight:800; font-size:1.8rem; color:var(--text);">استودیو هوش مصنوعی</h2>
+                                <p style="color:var(--text-muted); font-size:1rem; max-width:550px; margin:0 auto; line-height:1.6;">مجموعه یکپارچه ابزارهای هوش مصنوعی برای تولید انواع محتوا. ابزار مورد نظر خود را برای شروع انتخاب کنید.</p>
                             </div>
-                            <?php elseif (!$ai_configured) : ?>
+
+                            <?php if (!$ai_configured) : ?>
                             <div class="ssp-upgrade-banner" style="background:var(--warning-soft); border-color:var(--warning);">
                                 <div>
                                     <h3 style="color:var(--warning);">هوش مصنوعی تنظیم نشده است</h3>
-                                    <p>برای استفاده از قابلیت‌های AI، ابتدا API Key را تنظیم کنید یا حالت مرورگر را فعال کنید.</p>
+                                    <p>برای استفاده از امکانات استودیو هوش مصنوعی، ابتدا API Key را تنظیم کنید یا حالت مرورگر را فعال نمایید.</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
                             </div>
                             <?php else : ?>
 
-                            <!-- Tool Cards -->
-                            <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(260px, 1fr)); gap:14px; margin-bottom:28px;">
-                                <!-- ایده‌یابی -->
-                                <div class="ssp-card" style="cursor:pointer;" onclick="switchTab('brainstorm', document.querySelector('[data-tab=brainstorm]'))">
-                                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
-                                        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="var(--info)" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-                                        <h3 style="margin:0; font-size:0.95rem; font-weight:600;">ایده‌یابی محتوا</h3>
-                                    </div>
-                                    <p style="font-size:0.82rem; color:var(--text-muted); margin:0; line-height:1.6;">ایده‌های متنوع برای پست و مقاله دریافت کنید</p>
+                            <div class="ssp-grid-2" style="gap:24px;">
+                                <!-- Article Gen -->
+                                <div class="ssp-card" style="cursor:pointer; transition:all 0.3s ease; border:1px solid var(--border); padding:24px;" onmouseover="this.style.borderColor='var(--accent)'; this.style.transform='translateY(-4px)'; this.style.boxShadow='0 12px 24px rgba(79,70,229,0.1)';" onmouseout="this.style.borderColor='var(--border)'; this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(0,0,0,0.04)';" onclick="switchTab('contentgen', document.querySelector('[data-tab=contentgen]'))">
+                                    <div style="font-size:2.5rem; margin-bottom:16px;">📝</div>
+                                    <h3 style="margin:0 0 8px; font-size:1.2rem; font-weight:800; color:var(--text);">تولید مقاله سئو شده</h3>
+                                    <p style="margin:0; font-size:0.9rem; color:var(--text-muted); line-height:1.6;">نگارش مقالات طولانی و ساختاریافته وردپرس با تگ‌ها و هدینگ‌های استاندارد و کاملاً سئو شده.</p>
                                 </div>
-                                <!-- تولید پست -->
-                                <div class="ssp-card" style="cursor:pointer;" onclick="switchTab('postgen', document.querySelector('[data-tab=postgen]'))">
-                                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
-                                        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="var(--accent)" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-                                        <h3 style="margin:0; font-size:0.95rem; font-weight:600;">تولید پست</h3>
-                                    </div>
-                                    <p style="font-size:0.82rem; color:var(--text-muted); margin:0; line-height:1.6;">محتوای پیام‌رسان‌ها را تولید و ارسال کنید</p>
+
+                                <!-- Post Gen -->
+                                <div class="ssp-card" style="cursor:pointer; transition:all 0.3s ease; border:1px solid var(--border); padding:24px;" onmouseover="this.style.borderColor='var(--accent)'; this.style.transform='translateY(-4px)'; this.style.boxShadow='0 12px 24px rgba(79,70,229,0.1)';" onmouseout="this.style.borderColor='var(--border)'; this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(0,0,0,0.04)';" onclick="switchTab('postgen', document.querySelector('[data-tab=postgen]'))">
+                                    <div style="font-size:2.5rem; margin-bottom:16px;">📱</div>
+                                    <h3 style="margin:0 0 8px; font-size:1.2rem; font-weight:800; color:var(--text);">تولید پست شبکه‌های اجتماعی</h3>
+                                    <p style="margin:0; font-size:0.9rem; color:var(--text-muted); line-height:1.6;">نگارش جذاب و خلاقانه کپشن و پست برای تلگرام، اینستاگرام، بله، ایتا و سایر پیام‌رسان‌ها.</p>
                                 </div>
-                                <!-- تولید مقاله -->
-                                <div class="ssp-card" style="cursor:pointer;" onclick="switchTab('contentgen', document.querySelector('[data-tab=contentgen]'))">
-                                    <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
-                                        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="var(--success)" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-                                        <h3 style="margin:0; font-size:0.95rem; font-weight:600;">تولید مقاله</h3>
-                                    </div>
-                                    <p style="font-size:0.82rem; color:var(--text-muted); margin:0; line-height:1.6;">نوشته یا برگه وردپرس با هوش مصنوعی بسازید</p>
+
+                                <!-- Product Gen -->
+                                <div class="ssp-card" style="cursor:pointer; transition:all 0.3s ease; border:1px solid var(--border); padding:24px;" onmouseover="this.style.borderColor='var(--accent)'; this.style.transform='translateY(-4px)'; this.style.boxShadow='0 12px 24px rgba(79,70,229,0.1)';" onmouseout="this.style.borderColor='var(--border)'; this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(0,0,0,0.04)';" onclick="switchTab('productgen', document.querySelector('[data-tab=productgen]'))">
+                                    <div style="font-size:2.5rem; margin-bottom:16px;">🛍️</div>
+                                    <h3 style="margin:0 0 8px; font-size:1.2rem; font-weight:800; color:var(--text);">تولید محصول فروشگاهی</h3>
+                                    <p style="margin:0; font-size:0.9rem; color:var(--text-muted); line-height:1.6;">معرفی جذاب و قانع‌کننده محصولات برای فروشگاه ووکامرس شما جهت افزایش نرخ تبدیل فروش.</p>
+                                </div>
+
+                                <!-- Brainstorm -->
+                                <div class="ssp-card" style="cursor:pointer; transition:all 0.3s ease; border:1px solid var(--border); padding:24px;" onmouseover="this.style.borderColor='var(--accent)'; this.style.transform='translateY(-4px)'; this.style.boxShadow='0 12px 24px rgba(79,70,229,0.1)';" onmouseout="this.style.borderColor='var(--border)'; this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(0,0,0,0.04)';" onclick="switchTab('brainstorm', document.querySelector('[data-tab=brainstorm]'))">
+                                    <div style="font-size:2.5rem; margin-bottom:16px;">💡</div>
+                                    <h3 style="margin:0 0 8px; font-size:1.2rem; font-weight:800; color:var(--text);">ایده‌یابی هوشمند</h3>
+                                    <p style="margin:0; font-size:0.9rem; color:var(--text-muted); line-height:1.6;">طوفان فکری و پیدا کردن سوژه‌ها و ایده‌های ناب برای تقویم محتوایی در روزها و هفته‌های آینده.</p>
                                 </div>
                             </div>
-
-                            <!-- Batch Generation -->
-                            <div class="ssp-card" style="margin-bottom:24px;">
-                                <h3 style="margin-bottom:8px; font-size:1rem;">تولید دسته‌ای محتوا</h3>
-                                <p style="font-size:0.85rem; color:var(--text-muted); margin-bottom:16px; line-height:1.6;">چند محتوا را همزمان تولید کنید و به پیش‌نویس ذخیره شود.</p>
-                                <div class="ssp-grid-3">
-                                    <div class="ssp-form-group">
-                                        <label class="ssp-label">تعداد (۱ تا ۱۰)</label>
-                                        <input type="range" id="batch_count" min="1" max="10" value="3" style="width:100%; accent-color:var(--accent);" oninput="document.getElementById('batch_count_val').textContent = this.value">
-                                        <div style="text-align:center; font-weight:700; color:var(--accent);" id="batch_count_val">۳</div>
-                                    </div>
-                                    <div class="ssp-form-group">
-                                        <label class="ssp-label">سبک محتوا</label>
-                                        <select id="batch_style" class="ssp-select">
-                                            <optgroup label="عمومی">
-                                                <option value="general">عمومی</option>
-                                            </optgroup>
-                                            <optgroup label="احساسی و لحنی">
-                                                <option value="casual">صمیمی و دوستانه</option>
-                                                <option value="motivational">انگیزشی و الهام‌بخش</option>
-                                                <option value="humorous">طنز و سرگرمی</option>
-                                                <option value="story">داستانی و روایتی</option>
-                                                <option value="emotional">احساسی و عاطفی</option>
-                                            </optgroup>
-                                            <optgroup label="حرفه‌ای و رسمی">
-                                                <option value="formal">رسمی و حرفه‌ای</option>
-                                                <option value="authoritative">موثق و مطمئن</option>
-                                                <option value="technical">فنی و تخصصی</option>
-                                            </optgroup>
-                                            <optgroup label="محتوایی">
-                                                <option value="educational">آموزشی</option>
-                                                <option value="promotional">تبلیغاتی</option>
-                                                <option value="news">خبری</option>
-                                                <option value="review">نقد و بررسی</option>
-                                                <option value="comparison">مقایسه‌ای</option>
-                                                <option value="list">لیستی و فهرستی</option>
-                                                <option value="question">سؤالی و تعاملی</option>
-                                            </optgroup>
-                                        </select>
-                                    </div>
-                                    <div class="ssp-form-group">
-                                        <label class="ssp-label">لحن محتوا</label>
-                                        <select id="batch_tone" class="ssp-select">
-                                            <optgroup label="طبیعی">
-                                                <option value="natural">طبیعی و روان</option>
-                                                <option value="friendly">صمیمانه و صمیمی</option>
-                                                <option value="calm">آرام و خونسرد</option>
-                                            </optgroup>
-                                            <optgroup label="پرانرژی">
-                                                <option value="enthusiastic">پرانرژی و هیجانی</option>
-                                                <option value="persuasive">قانع‌کننده</option>
-                                                <option value="emotional">احساسی و عاطفی</option>
-                                            </optgroup>
-                                            <optgroup label="تحلیلی">
-                                                <option value="authoritative">موثق و مطمئن</option>
-                                                <option value="analytical">تحلیلی و منطقی</option>
-                                            </optgroup>
-                                        </select>
-                                    </div>
-                                </div>
-                                <div class="ssp-grid-2">
-                                    <div class="ssp-form-group">
-                                        <label class="ssp-label">موضوع</label>
-                                        <input type="text" id="batch_topic" class="ssp-input" placeholder="مثلاً: فناوری، مد، ورزشی">
-                                    </div>
-                                    <div class="ssp-form-group">
-                                        <label class="ssp-label">طول محتوا</label>
-                                        <select id="batch_length" class="ssp-select">
-                                            <option value="200">کوتاه (~200 کاراکتر)</option>
-                                            <option value="400">متوسط (~400 کاراکتر)</option>
-                                            <option value="800" selected>عادی (~800 کاراکتر)</option>
-                                            <option value="1000">بلند (~1000 کاراکتر)</option>
-                                            <option value="1500">بلندتر (~1500 کاراکتر)</option>
-                                            <option value="2000">خیلی بلند (~2000 کاراکتر)</option>
-                                            <option value="3000">مقاله‌ای (~3000 کاراکتر)</option>
-                                            <option value="4000">خیلی خیلی بلند (~4000 کاراکتر)</option>
-                                        </select>
-                                    </div>
-                                </div>
-                                <button class="ssp-btn-primary" onclick="batchGenerate()" id="batch_gen_btn"><span class="ssp-btn-text">تولید دسته‌ای</span><span class="ssp-btn-spinner"></span></button>
-                                <div id="batch_results" style="margin-top:16px;"></div>
-                            </div>
-
-                            <!-- Quick Access -->
-                            <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                                <button class="ssp-btn-secondary" onclick="switchTab('drafts', document.querySelector('[data-tab=drafts]'))">پیش‌نویس‌ها</button>
-                                <button class="ssp-btn-secondary" onclick="switchTab('template', document.querySelector('[data-tab=template]'))">قالب‌ها</button>
-                                <button class="ssp-btn-secondary" onclick="switchTab('promptbuilder', document.querySelector('[data-tab=promptbuilder]'))">قالب پرامپت</button>
+                            
+                            <div style="margin-top:40px; padding-top:24px; border-top:1px solid var(--border); display:flex; gap:12px; flex-wrap:wrap; justify-content:center;">
+                                <button type="button" class="ssp-btn-secondary" onclick="switchTab('promptbuilder', document.querySelector('[data-tab=promptbuilder]'))" style="font-size:0.9rem; padding:8px 16px;">🛠️ پرامپت ساز پیشرفته</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="switchTab('drafts', document.querySelector('[data-tab=drafts]'))" style="font-size:0.9rem; padding:8px 16px;">📂 صندوق پیش‌نویس‌ها</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="switchTab('template', document.querySelector('[data-tab=template]'))" style="font-size:0.9rem; padding:8px 16px;">📋 قالب‌های پیام</button>
                             </div>
 
                             <?php endif; ?>
                             <?php endif; // end Pro guard for generate ?>
                         </div>
-
+                        
                         <!-- ============ MESSENGERS ============ -->
                         <div id="tab-messengers" class="tab-content">
                             <?php if ($plan === 'free') : ?>
@@ -1420,7 +1493,7 @@ ob_start();
                                     <h3>برای افزودن پیام‌رسان بیشتر</h3>
                                     <p>در پلن رایگان فقط 1 پیام‌رسان. با Pro تا 10 پیام‌رسان!</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا</button>
                             </div>
                             <?php endif; ?>
 
@@ -1493,7 +1566,7 @@ ob_start();
                                         <option value="bale">🟢 بله (Bale)</option>
                                         <option value="eitaa">🟠 ایتا (Eitaa)</option>
                                         <option value="rubika">🟣 روبیکا (Rubika)</option>
-                                        <option value="instagram">📷 اینستاگرام (Instagram)</option>
+                                        <option value="instagram">اینستاگرام (Instagram)</option>
                                         <option value="whatsapp">🟢 واتساپ Business (WhatsApp)</option>
                                     </select>
                                 </div>
@@ -1520,7 +1593,7 @@ ob_start();
                                     </label>
                                 </div>
                                 <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
-                                    <button class="ssp-btn-primary" onclick="addMessenger()" id="add_messenger_btn"><span class="ssp-btn-text">ذخیره پیام‌رسان</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="addMessenger()" id="add_messenger_btn"><span class="ssp-btn-text">ذخیره پیام‌رسان</span><span class="ssp-btn-spinner"></span></button>
                                     <span class="ssp-saved-indicator" id="messenger_saved">ذخیره شد!</span>
                                 </div>
                                 <div id="messenger_platform_hint" style="margin-top:12px; padding:10px; background:var(--info-soft); border-radius:8px; font-size:0.85rem; color:var(--info);">
@@ -1543,7 +1616,7 @@ ob_start();
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/></svg> سازنده بات</h2>
+                            <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0 0 8px;"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4"/></svg> <span>سازنده بات</span></h2>
                             <p class="ssp-section-desc">بات خود را برای تلگرام یا بله بسازید و مدیریت کنید. دکمه، دستور و پاسخ خودکار اضافه کنید.</p>
 
                             <?php
@@ -1557,7 +1630,7 @@ ob_start();
                                 <div class="ssp-card" style="margin-bottom:16px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
                                         <h3 style="margin:0;">لیست بات‌ها</h3>
-                                        <button class="ssp-btn-primary" onclick="showAddBotForm()">+ بات جدید</button>
+                                        <button type="button" class="ssp-btn-primary" onclick="showAddBotForm()">+ بات جدید</button>
                                     </div>
 
                                     <?php if (empty($user_bot_configs)) : ?>
@@ -1612,7 +1685,7 @@ ob_start();
                                         <h3 style="margin:0;">قالب‌های آماده</h3>
                                         <p class="ssp-hint" style="margin:4px 0 0 0;">یک قالب انتخاب کنید تا تنظیمات آن به صورت خودکار بارگذاری شود.</p>
                                     </div>
-                                    <button class="ssp-btn-secondary" onclick="toggleTemplatesSection()" id="toggle_templates_btn">پنهان کردن</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="toggleTemplatesSection()" id="toggle_templates_btn">پنهان کردن</button>
                                 </div>
 
                                 <div id="templates_grid" class="ssp-grid-2" style="margin-top:12px;">
@@ -1675,7 +1748,7 @@ ob_start();
                                                     مناسب کلینیک‌ها
                                                 </div>
                                             </div>
-                                            <div style="font-size:2.5rem; opacity:0.4;">☰</div>
+                                            <div style="font-size:2.5rem; opacity:0.4;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></div>
                                         </div>
                                     </div>
                                 </div>
@@ -1689,7 +1762,7 @@ ob_start();
                                 <div class="ssp-card" style="margin-bottom:16px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
                                         <h3 style="margin:0;" id="bot_editor_title">تنظیمات بات</h3>
-                                        <button class="ssp-btn-secondary" onclick="showBotList()">← بازگشت به لیست</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="showBotList()">← بازگشت به لیست</button>
                                     </div>
 
                                     <div class="ssp-grid-2">
@@ -1723,9 +1796,9 @@ ob_start();
                                     </div>
 
                                     <div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">
-                                        <button class="ssp-btn-primary" onclick="saveBotConfig()">ذخیره تنظیمات</button>
-                                        <button class="ssp-btn-secondary" onclick="testBotConnection()">تست اتصال</button>
-                                        <button class="ssp-btn-secondary" onclick="getBotStats()">آمار بات</button>
+                                        <button type="button" class="ssp-btn-primary" onclick="saveBotConfig()">ذخیره تنظیمات</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="testBotConnection()">تست اتصال</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="getBotStats()">آمار بات</button>
                                     </div>
 
                                     <div id="bot_connection_result" style="margin-top:12px; display:none;"></div>
@@ -1736,16 +1809,16 @@ ob_start();
                                     <h3>پیام خوش‌آمدگویی</h3>
                                     <p class="ssp-hint">متنی که هنگام شروع کاربر با بات (/start) ارسال می‌شود.</p>
                                     <div class="ssp-form-group">
-                                        <textarea id="bot_welcome" rows="4" class="ssp-textarea" placeholder="سلام! 👋&#10;به بات ما خوش آمدید.&#10;&#10;از منوی زیر گزینه مورد نظر خود را انتخاب کنید."></textarea>
+                                        <textarea id="bot_welcome" rows="4" class="ssp-textarea" placeholder="سلام!&#10;به بات ما خوش آمدید.&#10;&#10;از منوی زیر گزینه مورد نظر خود را انتخاب کنید."></textarea>
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="saveBotWelcome()">ذخیره پیام خوش‌آمدگویی</button>
+                                    <button type="button" class="ssp-btn-primary" onclick="saveBotWelcome()">ذخیره پیام خوش‌آمدگویی</button>
                                 </div>
 
                                 <!-- Commands -->
                                 <div class="ssp-card" style="margin-bottom:16px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
                                         <h3 style="margin:0;">دستورات (/commands)</h3>
-                                        <button class="ssp-btn-secondary" onclick="showAddCommandForm()">+ دستور جدید</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="showAddCommandForm()">+ دستور جدید</button>
                                     </div>
                                     <p class="ssp-hint">دستوراتی که کاربران می‌توانند با تایپ آن‌ها در بات استفاده کنند.</p>
 
@@ -1774,8 +1847,8 @@ ob_start();
                                             <textarea id="command_response" rows="4" class="ssp-textarea" placeholder="متنی که بات در پاسخ ارسال می‌کند..."></textarea>
                                         </div>
                                         <div style="display:flex; gap:10px;">
-                                            <button class="ssp-btn-primary" onclick="saveCommand()">ذخیره دستور</button>
-                                            <button class="ssp-btn-secondary" onclick="hideAddCommandForm()">انصراف</button>
+                                            <button type="button" class="ssp-btn-primary" onclick="saveCommand()">ذخیره دستور</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="hideAddCommandForm()">انصراف</button>
                                         </div>
                                     </div>
                                 </div>
@@ -1784,7 +1857,7 @@ ob_start();
                                 <div class="ssp-card" style="margin-bottom:16px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
                                         <h3 style="margin:0;">دکمه‌ها (Keyboard)</h3>
-                                        <button class="ssp-btn-secondary" onclick="showAddButtonForm()">+ دکمه جدید</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="showAddButtonForm()">+ دکمه جدید</button>
                                     </div>
                                     <p class="ssp-hint">دکمه‌هایی که زیر صفحه چت نمایش داده می‌شوند.</p>
 
@@ -1809,7 +1882,7 @@ ob_start();
                                         <div class="ssp-form-group">
                                             <label class="ssp-label">نوع کیبورد</label>
                                             <select id="button_keyboard_type" class="ssp-select" onchange="toggleButtonTypeFields()">
-                                                <option value="inline">🔘 Inline Keyboard (زیر پیام)</option>
+                                                <option value="inline">Inline Keyboard (زیر پیام)</option>
                                                 <option value="reply"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><rect x="2" y="4" width="20" height="16" rx="2" ry="2"/><line x1="6" y1="8" x2="6.01" y2="8"/><line x1="10" y1="8" x2="10.01" y2="8"/><line x1="14" y1="8" x2="14.01" y2="8"/><line x1="18" y1="8" x2="18.01" y2="8"/><line x1="8" y1="12" x2="8.01" y2="12"/><line x1="12" y1="12" x2="12.01" y2="12"/><line x1="16" y1="12" x2="16.01" y2="12"/><line x1="7" y1="16" x2="17" y2="16"/></svg> Reply Keyboard (زیر چت)</option>
                                             </select>
                                             <p class="ssp-hint">Inline: فقط دکمه‌های لینک، Callback، Web App و... | Reply: دکمه‌های ساده متنی</p>
@@ -1831,12 +1904,12 @@ ob_start();
                                                     <option value="callback"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Callback</option>
                                                     <option value="web_app">◎ Web App</option>
                                                     <option value="login_url">⊞ Login URL</option>
-                                                    <option value="switch_inline">🔄 Switch Inline</option>
-                                                    <option value="request_contact">📱 درخواست شماره</option>
-                                                    <option value="request_location">📍 درخواست موقعیت</option>
+                                                    <option value="switch_inline">Switch Inline</option>
+                                                    <option value="request_contact">درخواست شماره</option>
+                                                    <option value="request_location">درخواست موقعیت</option>
                                                     <option value="request_poll">▥ درخواست نظرسنجی</option>
-                                                    <option value="request_peer">👤 درخواست کاربر/گروه</option>
-                                                    <option value="pay">💳 پرداخت</option>
+                                                    <option value="request_peer">درخواست کاربر/گروه</option>
+                                                    <option value="pay">پرداخت</option>
                                                 </select>
                                             </div>
                                         </div>
@@ -1902,9 +1975,9 @@ ob_start();
                                                 <div class="ssp-form-group">
                                                     <label class="ssp-label">نوع درخواست</label>
                                                     <select id="button_peer_type" class="ssp-select">
-                                                        <option value="user">👤 کاربر</option>
-                                                        <option value="chat">👥 گروه</option>
-                                                        <option value="channel">📢 کانال</option>
+                                                        <option value="user">کاربر</option>
+                                                        <option value="chat">گروه</option>
+                                                        <option value="channel">کانال</option>
                                                     </select>
                                                 </div>
                                                 <div class="ssp-form-group">
@@ -1955,14 +2028,14 @@ ob_start();
                                         <!-- Style Options - DISABLED due to Bot API incompatibility -->
                                         <!--
                                         <div class="ssp-card" style="margin-top:12px; padding:12px; background:var(--surface);">
-                                            <h5 style="margin:0 0 8px 0; font-size:0.9rem;">🎨 استایل دکمه</h5>
+                                            <h5 style="margin:0 0 8px 0; font-size:0.9rem;">استایل دکمه</h5>
                                             <div class="ssp-grid-2">
                                                 <div class="ssp-form-group">
                                                     <label class="ssp-label">رنگ پس‌زمینه</label>
                                                     <select id="button_style_bg" class="ssp-select">
                                                         <option value="">پیش‌فرض</option>
                                                         <option value="primary">🔵 آبی (عمل اصلی)</option>
-                                                        <option value="danger">🔴 قرمز (عمل مخرب)</option>
+                                                        <option value="danger">قرمز (عمل مخرب)</option>
                                                         <option value="success">🟢 سبز (عمل مثبت)</option>
                                                     </select>
                                                 </div>
@@ -1998,8 +2071,8 @@ ob_start();
                                         </div>
 
                                         <div style="display:flex; gap:10px; margin-top:16px;">
-                                            <button class="ssp-btn-primary" onclick="saveButton()">ذخیره دکمه</button>
-                                            <button class="ssp-btn-secondary" onclick="hideAddButtonForm()">انصراف</button>
+                                            <button type="button" class="ssp-btn-primary" onclick="saveButton()">ذخیره دکمه</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="hideAddButtonForm()">انصراف</button>
                                         </div>
                                     </div>
                                 </div>
@@ -2008,7 +2081,7 @@ ob_start();
                                 <div class="ssp-card" style="margin-bottom:16px;">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
                                         <h3 style="margin:0;">پاسخ‌های خودکار</h3>
-                                        <button class="ssp-btn-secondary" onclick="showAddAutoReplyForm()">+ پاسخ جدید</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="showAddAutoReplyForm()">+ پاسخ جدید</button>
                                     </div>
                                     <p class="ssp-hint">پاسخ‌هایی که بر اساس کلمات کلیدی ارسال می‌شوند.</p>
 
@@ -2041,8 +2114,8 @@ ob_start();
                                             <textarea id="reply_response" rows="4" class="ssp-textarea" placeholder="متن پاسخ خودکار..."></textarea>
                                         </div>
                                         <div style="display:flex; gap:10px;">
-                                            <button class="ssp-btn-primary" onclick="saveAutoReply()">ذخیره پاسخ</button>
-                                            <button class="ssp-btn-secondary" onclick="hideAddAutoReplyForm()">انصراف</button>
+                                            <button type="button" class="ssp-btn-primary" onclick="saveAutoReply()">ذخیره پاسخ</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="hideAddAutoReplyForm()">انصراف</button>
                                         </div>
                                     </div>
                                 </div>
@@ -2054,7 +2127,7 @@ ob_start();
                                             <h3 style="margin:0;">سناریوها (گفتگوی چندمرحله‌ای)</h3>
                                             <p class="ssp-hint" style="margin:4px 0 0 0;">سناریوهای چندمرحله‌ای با دکمه‌ها بسازید. کاربر با کلیک روی دکمه‌ها مراحل را طی می‌کند.</p>
                                         </div>
-                                        <button class="ssp-btn-secondary" onclick="showAddScenarioForm()">+ سناریو جدید</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="showAddScenarioForm()">+ سناریو جدید</button>
                                     </div>
 
                                     <div id="bot_scenarios_list">
@@ -2090,12 +2163,12 @@ ob_start();
                                                 <!-- Steps will be added here dynamically -->
                                             </div>
 
-                                            <button class="ssp-btn-secondary" onclick="addScenarioStep()" style="margin-top:12px;">+ افزودن مرحله</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="addScenarioStep()" style="margin-top:12px;">+ افزودن مرحله</button>
                                         </div>
 
                                         <div style="display:flex; gap:10px; margin-top:16px;">
-                                            <button class="ssp-btn-primary" onclick="saveScenario()">ذخیره سناریو</button>
-                                            <button class="ssp-btn-secondary" onclick="hideAddScenarioForm()">انصراف</button>
+                                            <button type="button" class="ssp-btn-primary" onclick="saveScenario()">ذخیره سناریو</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="hideAddScenarioForm()">انصراف</button>
                                         </div>
                                     </div>
                                 </div>
@@ -2108,7 +2181,7 @@ ob_start();
                                         <label class="ssp-label">آدرس Webhook</label>
                                         <div style="display:flex; gap:8px; align-items:center;">
                                             <input type="text" id="bot_webhook_url_display" class="ssp-input" dir="ltr" readonly style="flex:1; background:var(--bg-alt); color:var(--text-muted); font-size:0.85rem;">
-                                            <button class="ssp-btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById('bot_webhook_url_display').value); showToast('کپی شد!', 'success');" style="white-space:nowrap;">کپی</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById('bot_webhook_url_display').value); showToast('کپی شد!', 'success');" style="white-space:nowrap;">کپی</button>
                                         </div>
                                         <p class="ssp-hint" style="margin-top:6px;">وبهوک هنگام ذخیره بات به صورت خودکار تنظیم می‌شود. در صورت عدم موفقیت، از دکمه زیر استفاده کنید.</p>
                                     </div>
@@ -2116,14 +2189,14 @@ ob_start();
                                     <div id="bot_webhook_status" style="display:none; padding:10px 14px; border-radius:8px; margin-bottom:12px; font-size:0.85rem;"></div>
 
                                     <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                                        <button class="ssp-btn-primary" onclick="setBotWebhookManual()" style="background:#8b5cf6;">
+                                        <button type="button" class="ssp-btn-primary" onclick="setBotWebhookManual()" style="background:#8b5cf6;">
                                             <span class="ssp-btn-text">تنظیم مجدد Webhook</span>
                                             <span class="ssp-btn-spinner"></span>
                                         </button>
-                                        <button class="ssp-btn-secondary" onclick="testBotWebhook()"><span class="ssp-btn-text">تست اتصال Webhook</span><span class="ssp-btn-spinner"></span></button>
-                                        <button class="ssp-btn-secondary" onclick="setBotMenu()">تنظیم منوی بات</button>
-                                        <button class="ssp-btn-secondary" onclick="debugBotList()" style="background:var(--warning-soft); color:var(--warning);">Debug: لیست بات‌ها</button>
-                                        <button class="ssp-btn-secondary" onclick="debugBotButtons()" style="background:var(--info-soft); color:var(--info);">Debug: دکمه‌ها</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="testBotWebhook()"><span class="ssp-btn-text">تست اتصال Webhook</span><span class="ssp-btn-spinner"></span></button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="setBotMenu()">تنظیم منوی بات</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="debugBotList()" style="background:var(--warning-soft); color:var(--warning);">Debug: لیست بات‌ها</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="debugBotButtons()" style="background:var(--info-soft); color:var(--info);">Debug: دکمه‌ها</button>
                                     </div>
 
                                     <div class="ssp-card" style="margin-top:12px; padding:12px; background:var(--bg-alt); font-size:0.85rem;">
@@ -2250,7 +2323,7 @@ ob_start();
                                     </div>
                                 </div>
                                 <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
-                                    <button class="ssp-btn-primary" onclick="addWpSite()" id="add_wpsite_btn"><span class="ssp-btn-text">ذخیره سایت</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="addWpSite()" id="add_wpsite_btn"><span class="ssp-btn-text">ذخیره سایت</span><span class="ssp-btn-spinner"></span></button>
                                     <button class="ssp-btn-test" onclick="testNewWpSite()" type="button">تست اتصال</button>
                                     <span class="ssp-saved-indicator" id="wp_site_saved">ذخیره شد!</span>
                                 </div>
@@ -2271,7 +2344,7 @@ ob_start();
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> تولید پست</h2>
+                            <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0 0 8px;"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> <span>تولید پست</span></h2>
                             <p class="ssp-section-desc">محتوای مناسب پیام‌رسان‌ها (تلگرام، اینستاگرام، واتساپ و...) را با کمک AI تولید کنید.</p>
 
                             <?php if (!$ai_configured) : ?>
@@ -2283,7 +2356,7 @@ ob_start();
                                     <li><strong>حالت API</strong>: کلید API یکی از ارائه‌دهندگان را وارد کنید</li>
                                     <li><strong>حالت مرورگر</strong>: از طریق مرورگر خود (DeepSeek یا ChatGPT) استفاده کنید</li>
                                 </ul>
-                                <button class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
                             </div>
                             <?php else : ?>
 
@@ -2294,7 +2367,7 @@ ob_start();
                                     <select id="pg_load_draft" class="ssp-select" style="max-width:300px;" onchange="pgLoadDraft(this.value)">
                                         <option value="">انتخاب پیش‌نویس...</option>
                                     </select>
-                                    <button class="ssp-btn-secondary" onclick="pgRefreshDrafts()" style="font-size:0.8rem; padding:4px 10px;">بازخوانی</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="pgRefreshDrafts()" style="font-size:0.8rem; padding:4px 10px;">بازخوانی</button>
                                 </div>
                             </div>
 
@@ -2340,13 +2413,13 @@ ob_start();
                                 <h3 style="margin-bottom:12px;">تولید با AI</h3>
                                 <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') !== 'browser') : ?>
-                                    <button class="ssp-btn-primary" onclick="pgGeneratePost()" id="pg_gen_btn">
+                                    <button type="button" class="ssp-btn-primary" onclick="pgGeneratePost()" id="pg_gen_btn">
                                         <span class="ssp-btn-text">تولید پست با API</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
                                     <?php endif; ?>
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'browser') : ?>
-                                    <button class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="pgGeneratePostViaBrowser()" id="pg_post_browser_btn">
+                                    <button type="button" class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="pgGeneratePostViaBrowser()" id="pg_post_browser_btn">
                                         <span class="ssp-btn-text">تولید پست با چت‌بات رایگان</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -2354,7 +2427,7 @@ ob_start();
                                     <button class="ssp-btn-secondary" onclick="pgResetPostForm()" type="button">پاک کردن</button>
                                     <span id="pg_gen_tokens" class="ssp-badge" style="display:none;"></span>
                                 </div>
-                                <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به SnapMonkey)</p>
+                                <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به افزونه مرورگر)</p>
                                 <div id="pg_gen_error" style="color:var(--error); font-size:0.85rem; margin-top:8px; display:none;"></div>
                             </div>
 
@@ -2369,8 +2442,8 @@ ob_start();
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">محتوا</label>
                                         <div style="display:flex; gap:6px; margin-bottom:6px;">
-                                            <button class="ssp-btn-secondary" onclick="pgToggleView('visual')" id="pg_view_visual_btn" style="font-size:0.8rem; padding:4px 10px; border-color:var(--accent); color:var(--accent);">نمایش بصری</button>
-                                            <button class="ssp-btn-secondary" onclick="pgToggleView('raw')" id="pg_view_raw_btn" style="font-size:0.8rem; padding:4px 10px;">متن خام</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="pgToggleView('visual')" id="pg_view_visual_btn" style="font-size:0.8rem; padding:4px 10px; border-color:var(--accent); color:var(--accent);">نمایش بصری</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="pgToggleView('raw')" id="pg_view_raw_btn" style="font-size:0.8rem; padding:4px 10px;">متن خام</button>
                                         </div>
                                         <textarea id="pg_result_content" class="ssp-textarea" rows="8" style="display:none;"></textarea>
                                         <div id="pg_result_preview" contenteditable="false" style="min-height:120px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px; white-space:pre-wrap; font-size:0.9rem; color:var(--text); line-height:1.7; outline:none; direction:rtl;"></div>
@@ -2380,19 +2453,19 @@ ob_start();
                                         <input type="text" id="pg_result_hashtags" class="ssp-input" placeholder="#tag1 #tag2">
                                     </div>
                                     <div class="ssp-form-group">
-                                        <label class="ssp-label">تصویر/ویدیو (اختیاری)</label>
+                                        <label class="ssp-label">تصویر، ویدیو، صوت یا فایل/داکیومنت (اختیاری)</label>
                                         <input type="hidden" id="pg_image_url" value="">
                                         <div style="display:flex; gap:0; margin-bottom:0;">
-                                            <button type="button" class="ssp-btn-secondary pg_media_tab active" onclick="switchPgMediaTab('upload')" style="border-radius:0 0 0 8px; flex:1; font-size:0.8rem; padding:6px;">آپلود فایل</button>
-                                            <button type="button" class="ssp-btn-secondary pg_media_tab" onclick="switchPgMediaTab('url')" style="border-radius:0 0 8px 0; flex:1; font-size:0.8rem; padding:6px;">از لینک URL</button>
+                                            <button type="button" class="ssp-btn-secondary pg_media_tab active" onclick="switchPgMediaTab('upload')" style="border-radius:0 0 0 8px; flex:1; font-size:0.8rem; padding:6px;">آپلود فایل / داکیومنت</button>
+                                            <button type="button" class="ssp-btn-secondary pg_media_tab" onclick="switchPgMediaTab('url')" style="border-radius:0 0 8px 0; flex:1; font-size:0.8rem; padding:6px;">از لینک مستقیم URL</button>
                                         </div>
                                         <div id="pg_media_tab_upload">
                                             <div id="pg_media_upload" style="position:relative; border:2px dashed var(--border); border-top:none; border-radius:0 0 10px 10px; padding:16px; text-align:center; cursor:pointer; transition:all 0.2s;" onclick="document.getElementById('pg_media_file').click()">
-                                                <input type="file" id="pg_media_file" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/mpeg,video/quicktime" multiple style="display:none;" onchange="handlePgMediaUpload(this)">
+                                                <input type="file" id="pg_media_file" accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip,.rar,.tar,.gz,.7z,.apk" multiple style="display:none;" onchange="handlePgMediaUpload(this)">
                                                 <div id="pg_media_placeholder">
                                                     <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--text-muted);"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                                                    <p style="color:var(--text-muted); margin:8px 0 0; font-size:0.85rem;">فایل‌ها را اینجا رها کنید یا کلیک کنید</p>
-                                                    <p style="color:var(--text-subtle); margin:4px 0 0; font-size:0.75rem;">تصاویر تا ۱۰MB، ویدیوها تا ۸۰MB</p>
+                                                    <p style="color:var(--text-muted); margin:8px 0 0; font-size:0.85rem;">فایل‌ها یا اسناد را اینجا رها کنید یا کلیک کنید</p>
+                                                    <p style="color:var(--text-subtle); margin:4px 0 0; font-size:0.75rem;">تصاویر تا ۱۵MB، ویدیوها تا ۸۰MB، داکیومنت‌ها و فایل‌ها تا ۵۰MB</p>
                                                 </div>
                                                 <div id="pg_media_preview" style="display:none;"></div>
                                                 <div id="pg_media_progress" style="display:none; margin-top:8px;">
@@ -2404,8 +2477,8 @@ ob_start();
                                         <div id="pg_media_tab_url" style="display:none;">
                                             <div style="border:2px dashed var(--border); border-top:none; border-radius:0 0 10px 10px; padding:12px;">
                                                 <div style="display:flex; gap:8px;">
-                                                    <input type="url" id="pg_media_url_input" class="ssp-input" dir="ltr" placeholder="https://example.com/image.jpg" style="flex:1;">
-                                                    <button class="ssp-btn-secondary" onclick="addPgMediaUrl()" style="white-space:nowrap;">افزودن</button>
+                                                    <input type="url" id="pg_media_url_input" class="ssp-input" dir="ltr" placeholder="https://example.com/file.pdf" style="flex:1;">
+                                                    <button type="button" class="ssp-btn-secondary" onclick="addPgMediaUrl()" style="white-space:nowrap;">افزودن</button>
                                                 </div>
                                                 <div id="pg_media_url_list" style="margin-top:8px;"></div>
                                             </div>
@@ -2415,10 +2488,10 @@ ob_start();
                                         </div>
                                     </div>
                                     <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                                        <button class="ssp-btn-primary" onclick="pgSendPost()">ارسال به پیام‌رسان‌ها</button>
-                                        <button class="ssp-btn-secondary" onclick="pgSchedulePost()">زمان‌بندی ارسال</button>
-                                        <button class="ssp-btn-secondary" onclick="pgSaveAsDraftPost()">ذخیره به عنوان پیش‌نویس</button>
-                                        <button class="ssp-btn-secondary" onclick="pgCopyPost()">کپی</button>
+                                        <button type="button" class="ssp-btn-primary" onclick="pgSendPost()">ارسال به پیام‌رسان‌ها</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgSchedulePost()">زمان‌بندی ارسال</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgSaveAsDraftPost()">ذخیره به عنوان پیش‌نویس</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgCopyPost()">کپی</button>
                                     </div>
                                     <!-- Schedule Mini-Form -->
                                     <div id="pg_schedule_form" style="display:none; margin-top:16px; padding:16px; background:var(--bg-alt); border-radius:12px; border:1px solid var(--border);">
@@ -2429,23 +2502,7 @@ ob_start();
                                                 <input type="text" id="pg_schedule_date_display" class="ssp-input" readonly placeholder="تاریخ را انتخاب کنید" style="cursor:pointer;" onclick="pgOpenJalaliPicker()">
                                                 <input type="hidden" id="pg_schedule_datetime">
                                                 <div class="ssp-hint" style="margin-top:4px;">حداقل ۱۰ دقیقه آینده</div>
-                                                <div id="pg_jalali_picker" style="display:none; margin-top:8px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px;">
-                                                    <div style="display:flex; gap:8px; margin-bottom:8px;">
-                                                        <select id="pg_jalali_year" class="ssp-select" style="width:100px;" onchange="pgUpdateJalaliDays()"></select>
-                                                        <select id="pg_jalali_month" class="ssp-select" style="width:120px;" onchange="pgUpdateJalaliDays()"></select>
-                                                        <select id="pg_jalali_day" class="ssp-select" style="width:80px;"></select>
-                                                    </div>
-                                                    <div style="display:flex; gap:8px; margin-bottom:8px; align-items:center;">
-                                                        <label class="ssp-label" style="margin:0; font-size:0.85rem;">ساعت:</label>
-                                                        <select id="pg_jalali_hour" class="ssp-select" style="width:70px;"></select>
-                                                        <label class="ssp-label" style="margin:0; font-size:0.85rem;">دقیقه:</label>
-                                                        <select id="pg_jalali_minute" class="ssp-select" style="width:70px;"></select>
-                                                    </div>
-                                                    <div style="display:flex; gap:8px;">
-                                                        <button class="ssp-btn-primary" onclick="pgConfirmJalaliDate()" style="font-size:0.85rem;">تایید</button>
-                                                        <button class="ssp-btn-secondary" onclick="document.getElementById('pg_jalali_picker').style.display='none'" style="font-size:0.85rem;">انصراف</button>
-                                                    </div>
-                                                </div>
+                                                <div id="pg_jalali_picker" style="display:none; margin-top:8px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px;"></div>
                                             </div>
                                             <div class="ssp-form-group">
                                                 <label class="ssp-label">تکرار</label>
@@ -2458,11 +2515,12 @@ ob_start();
                                             </div>
                                         </div>
                                         <div style="display:flex; gap:10px; margin-top:12px;">
-                                            <button class="ssp-btn-primary" onclick="pgConfirmSchedule()">تایید زمان‌بندی</button>
-                                            <button class="ssp-btn-secondary" onclick="document.getElementById('pg_schedule_form').style.display='none'">انصراف</button>
+                                            <button type="button" class="ssp-btn-primary" onclick="pgConfirmSchedule()">تایید زمان‌بندی</button>
+                                            <button type="button" class="ssp-btn-secondary" onclick="document.getElementById('pg_schedule_form').style.display='none'">انصراف</button>
                                         </div>
                                     </div>
                                 </div>
+                            </div>
 
                                 <!-- Per-Messenger Selection -->
                                 <div class="ssp-card">
@@ -2480,7 +2538,6 @@ ob_start();
                                         <?php endforeach; ?>
                                     </div>
                                 </div>
-                            </div>
 
                             <?php endif; ?>
                             <?php endif; // end Pro guard for postgen ?>
@@ -2498,7 +2555,7 @@ ob_start();
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg> ایده‌یابی محتوا</h2>
+                            <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0 0 8px;"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14c.18-.98.65-1.74 1.41-2.5A4.65 4.65 0 0 0 18 8 6 6 0 0 0 6 8c0 1 .23 2.23 1.5 3.5A4.61 4.61 0 0 1 8.91 14"/></svg> <span>ایده‌یابی محتوا</span></h2>
                             <p class="ssp-section-desc">با کمک هوش مصنوعی ایده‌های متنوع برای تولید محتوا پیدا کنید و مستقیماً از هر ایده تولید محتوا را شروع کنید.</p>
 
                             <?php if (!$ai_configured) : ?>
@@ -2510,7 +2567,7 @@ ob_start();
                                     <li><strong>حالت API</strong>: کلید API یکی از ارائه‌دهندگان را وارد کنید</li>
                                     <li><strong>حالت مرورگر</strong>: از طریق مرورگر خود (DeepSeek یا ChatGPT) استفاده کنید</li>
                                 </ul>
-                                <button class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
                             </div>
                             <?php else : ?>
 
@@ -2522,40 +2579,41 @@ ob_start();
                                 </div>
                                 <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px;">
                                     <span class="ssp-hint">موضوعات پیشنهادی:</span>
-                                    <button class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='موتورسواری و نگهداری موتور'" style="font-size:0.8rem; padding:3px 10px;">موتورسواری</button>
-                                    <button class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='تکنولوژی و هوش مصنوعی'" style="font-size:0.8rem; padding:3px 10px;">تکنولوژی</button>
-                                    <button class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='آشپزی و غذای ایرانی'" style="font-size:0.8rem; padding:3px 10px;">آشپزی</button>
-                                    <button class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='سلامت و تناسب اندام'" style="font-size:0.8rem; padding:3px 10px;">سلامت</button>
-                                    <button class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='گردشگری و سفر'" style="font-size:0.8rem; padding:3px 10px;">✈️ گردشگری</button>
-                                    <button class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='کسب و کار و بازاریابی'" style="font-size:0.8rem; padding:3px 10px;">کسب و کار</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='تکنولوژی و هوش مصنوعی'" style="font-size:0.8rem; padding:3px 10px;">تکنولوژی و AI</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='آموزش رشد فروش و بازاریابی دیجیتال'" style="font-size:0.8rem; padding:3px 10px;">بازاریابی و فروش</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='معرفی محصولات جدید و تخفیف ویژه'" style="font-size:0.8rem; padding:3px 10px;">فروشگاهی و تخفیف</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='ترفندها و راهنمای جامع خرید'" style="font-size:0.8rem; padding:3px 10px;">راهنمای خرید</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="document.getElementById('bs_topic').value='سلامت، سبک زندگی و تغذیه'" style="font-size:0.8rem; padding:3px 10px;">سبک زندگی</button>
                                 </div>
                                 <div class="ssp-grid-2">
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">تعداد ایده</label>
                                         <select id="bs_count" class="ssp-select">
-                                            <option value="5">&#10102; ۵ ایده</option>
-                                            <option value="10" selected>&#10103; ۱۰ ایده</option>
-                                            <option value="15">&#10104; ۱۵ ایده</option>
+                                            <option value="5">&#10102; ۵ ایده سریع</option>
+                                            <option value="10" selected>&#10103; ۱۰ ایده جامع</option>
+                                            <option value="15">&#10104; ۱۵ ایده متنوع</option>
                                         </select>
                                     </div>
                                     <div class="ssp-form-group">
-                                        <label class="ssp-label">نوع محتوا</label>
+                                        <label class="ssp-label">نوع محتوا و مقصد</label>
                                         <select id="bs_type" class="ssp-select">
-                                            <option value="all">همه (پست + مقاله)</option>
-                                            <option value="post">فقط پست (پیام‌رسان)</option>
-                                            <option value="article">فقط مقاله (سایت)</option>
+                                            <option value="all">همه فرمت‌ها (ترکیبی)</option>
+                                            <option value="post">📱 پست شبکه‌های اجتماعی (تلگرام، ایتا، بله)</option>
+                                            <option value="article">📝 مقاله وبسایت و وبلاگ (سئو وردپرس)</option>
+                                            <option value="product">🛍️ محصول ووکامرس (فروشگاهی / تجاری)</option>
+                                            <option value="promo">🎯 کمپین تبلیغاتی و تخفیف مناسبتی</option>
                                         </select>
                                     </div>
                                 </div>
                                 <div style="display:flex; gap:10px; flex-wrap:wrap;">
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') !== 'browser') : ?>
-                                    <button class="ssp-btn-primary" onclick="bsGenerate()" id="bs_gen_btn">
+                                    <button type="button" class="ssp-btn-primary" onclick="bsGenerate()" id="bs_gen_btn">
                                         <span class="ssp-btn-text">تولید ایده با AI</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
                                     <?php endif; ?>
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'browser') : ?>
-                                    <button class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="bsGenerateViaBrowser()" id="bs_browser_btn">
+                                    <button type="button" class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="bsGenerateViaBrowser()" id="bs_browser_btn">
                                         <span class="ssp-btn-text">تولید با چت‌بات رایگان</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -2588,14 +2646,14 @@ ob_start();
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg> تولید مقاله</h2>
+                            <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0 0 8px;"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg> <span>تولید مقاله</span></h2>
                             <p class="ssp-section-desc">نوشته یا برگه وردپرس روی سایت‌های متصل با کمک هوش مصنوعی یا به صورت دستی بسازید.</p>
 
                             <?php if (empty($wp_sites)) : ?>
                             <div class="ssp-empty">
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
                                 <p>ابتدا یک سایت وردپرسی اضافه کنید.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('wpsources', document.querySelector('[data-tab=wpsources]'))">رفتن به منابع وردپرس</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('wpsources', document.querySelector('[data-tab=wpsources]'))">رفتن به منابع وردپرس</button>
                             </div>
                             <?php else : ?>
 
@@ -2604,7 +2662,7 @@ ob_start();
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
                                 <h3 style="color:var(--warning);"> هوش مصنوعی تنظیم نشده است</h3>
                                 <p>برای تولید مقاله با AI، ابتدا تنظیمات هوش مصنوعی را تکمیل کنید.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
                             </div>
                             <?php else : ?>
 
@@ -2615,7 +2673,7 @@ ob_start();
                                     <select id="cg_load_draft" class="ssp-select" style="max-width:300px;" onchange="cgLoadDraft(this.value)">
                                         <option value="">انتخاب پیش‌نویس...</option>
                                     </select>
-                                    <button class="ssp-btn-secondary" onclick="cgRefreshDrafts()" style="font-size:0.8rem; padding:4px 10px;">بازخوانی</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="cgRefreshDrafts()" style="font-size:0.8rem; padding:4px 10px;">بازخوانی</button>
                                 </div>
                             </div>
 
@@ -2678,13 +2736,13 @@ ob_start();
                                 </div>
                                 <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') !== 'browser') : ?>
-                                    <button class="ssp-btn-primary" onclick="cgGenerateWithAI()" id="cg_ai_btn">
+                                    <button type="button" class="ssp-btn-primary" onclick="cgGenerateWithAI()" id="cg_ai_btn">
                                         <span class="ssp-btn-text">تولید با API</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
                                     <?php endif; ?>
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'browser') : ?>
-                                    <button class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="cgGenerateViaBrowser()" id="cg_browser_btn">
+                                    <button type="button" class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="cgGenerateViaBrowser()" id="cg_browser_btn">
                                         <span class="ssp-btn-text">تولید با چت‌بات رایگان</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -2692,7 +2750,7 @@ ob_start();
                                     <button class="ssp-btn-secondary" onclick="cgResetForm()" type="button">پاک کردن فرم</button>
                                     <span id="cg_ai_tokens" class="ssp-badge" style="display:none;"></span>
                                 </div>
-                                <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به SnapMonkey)</p>
+                                <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به افزونه مرورگر)</p>
                                 <div id="cg_ai_error" style="color:var(--error); font-size:0.85rem; margin-top:8px; display:none;"></div>
                             </div>
 
@@ -2767,7 +2825,7 @@ ob_start();
                             <div class="ssp-card">
                                 <h3 style="margin-bottom:12px;">انتشار</h3>
                                 <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                                    <button class="ssp-btn-primary" onclick="cgPublish()" id="cg_publish_btn" style="font-size:1rem; padding:14px 28px;">
+                                    <button type="button" class="ssp-btn-primary" onclick="cgPublish()" id="cg_publish_btn" style="font-size:1rem; padding:14px 28px;">
                                         <span class="ssp-btn-text">انتشار روی سایت مقصد</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -2804,7 +2862,7 @@ ob_start();
                                     <label class="ssp-label">موضوع</label>
                                     <input type="text" id="cg_batch_topic" class="ssp-input" placeholder="مثلاً: فناوری، مد، ورزشی">
                                 </div>
-                                <button class="ssp-btn-primary" onclick="cgBatchGenerate()" id="cg_batch_gen_btn">
+                                <button type="button" class="ssp-btn-primary" onclick="cgBatchGenerate()" id="cg_batch_gen_btn">
                                     <span class="ssp-btn-text">تولید دسته‌ای</span>
                                     <span class="ssp-btn-spinner"></span>
                                 </button>
@@ -2828,23 +2886,23 @@ ob_start();
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg> تولید محصول</h2>
+                            <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0 0 8px;"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg> <span>تولید محصول</span></h2>
                             <p class="ssp-section-desc">محصول ووکامرس روی سایت‌های متصل با کمک هوش مصنوعی یا به صورت دستی بسازید.</p>
 
                             <!-- Quick Actions Bar -->
                             <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
-                                <button class="ssp-btn-secondary" onclick="pgShowSection('single')" id="pg_mode_single" style="border-color:var(--accent);">تکی</button>
-                                <button class="ssp-btn-secondary" onclick="pgShowSection('bulk')" id="pg_mode_bulk">انبوه</button>
-                                <button class="ssp-btn-secondary" onclick="pgShowSection('clone')" id="pg_mode_clone">کلون</button>
-                                <button class="ssp-btn-secondary" onclick="pgShowSection('templates')" id="pg_mode_templates">قالب‌ها</button>
-                                <button class="ssp-btn-secondary" onclick="pgShowSection('history')" id="pg_mode_history">تاریخچه</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pgShowSection('single')" id="pg_mode_single" style="border-color:var(--accent);">تکی</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pgShowSection('bulk')" id="pg_mode_bulk">انبوه</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pgShowSection('clone')" id="pg_mode_clone">کلون</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pgShowSection('templates')" id="pg_mode_templates">قالب‌ها</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pgShowSection('history')" id="pg_mode_history">تاریخچه</button>
                             </div>
 
                             <?php if (empty($wp_sites)) : ?>
                             <div class="ssp-empty">
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
                                 <p>ابتدا یک سایت وردپرسی اضافه کنید.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('wpsources', document.querySelector('[data-tab=wpsources]'))">رفتن به منابع وردپرس</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('wpsources', document.querySelector('[data-tab=wpsources]'))">رفتن به منابع وردپرس</button>
                             </div>
                             <?php else : ?>
 
@@ -2853,7 +2911,7 @@ ob_start();
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
                                 <h3 style="color:var(--warning);"> هوش مصنوعی تنظیم نشده است</h3>
                                 <p>برای تولید محصول با AI، ابتدا تنظیمات هوش مصنوعی را تکمیل کنید.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
                             </div>
                             <?php else : ?>
 
@@ -2865,8 +2923,8 @@ ob_start();
                                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                                     <h3 style="margin:0;">انتخاب سایت مقصد</h3>
                                     <div style="display:flex; gap:6px;">
-                                        <button class="ssp-btn-secondary" onclick="pgCloneProduct()" style="font-size:0.8rem; padding:6px 12px;">کلون از سایت</button>
-                                        <button class="ssp-btn-secondary" onclick="pgSaveAsTemplate()" style="font-size:0.8rem; padding:6px 12px;">ذخیره قالب</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgCloneProduct()" style="font-size:0.8rem; padding:6px 12px;">کلون از سایت</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgSaveAsTemplate()" style="font-size:0.8rem; padding:6px 12px;">ذخیره قالب</button>
                                     </div>
                                 </div>
                                 <div class="ssp-form-group" style="margin-top:12px;">
@@ -2908,7 +2966,7 @@ ob_start();
                                             </select>
                                             <button type="button" class="ssp-btn-secondary" onclick="pgResetPromptMode()" title="بازگردانی به پیش‌فرض" style="padding:8px 12px; font-size:0.75rem;">↺</button>
                                         </div>
-                                        <button class="ssp-btn-secondary" style="margin-top:6px; font-size:0.75rem;" onclick="openPromptBuilderModal()">مدیریت قالب‌های پرامپت</button>
+                                        <button type="button" class="ssp-btn-secondary" style="margin-top:6px; font-size:0.75rem;" onclick="openPromptBuilderModal()">مدیریت قالب‌های پرامپت</button>
                                     </div>
                                 </div>
                                 <div class="ssp-form-group">
@@ -2921,13 +2979,13 @@ ob_start();
                                 </div>
                                 <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') !== 'browser') : ?>
-                                    <button class="ssp-btn-primary" onclick="pgGenerateWithAI()" id="pg_ai_btn">
+                                    <button type="button" class="ssp-btn-primary" onclick="pgGenerateWithAI()" id="pg_ai_btn">
                                         <span class="ssp-btn-text">تولید با API</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
                                     <?php endif; ?>
                                     <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'browser') : ?>
-                                    <button class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="pgGenerateViaBrowser()" id="pg_browser_btn">
+                                    <button type="button" class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="pgGenerateViaBrowser()" id="pg_browser_btn">
                                         <span class="ssp-btn-text">تولید با چت‌بات رایگان</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -2935,7 +2993,7 @@ ob_start();
                                     <button class="ssp-btn-secondary" onclick="pgResetForm()" type="button">پاک کردن فرم</button>
                                     <span id="pg_ai_tokens" class="ssp-badge" style="display:none;"></span>
                                 </div>
-                                <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به SnapMonkey)</p>
+                                <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به افزونه مرورگر)</p>
                                 <div id="pg_ai_error" style="color:var(--error); font-size:0.85rem; margin-top:8px; display:none;"></div>
                             </div>
 
@@ -3171,7 +3229,7 @@ ob_start();
                             <div class="ssp-card">
                                 <h3 style="margin-bottom:12px;">انتشار</h3>
                                 <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                                    <button class="ssp-btn-primary" onclick="pgPublish()" id="pg_publish_btn" style="font-size:1rem; padding:14px 28px;">
+                                    <button type="button" class="ssp-btn-primary" onclick="pgPublish()" id="pg_publish_btn" style="font-size:1rem; padding:14px 28px;">
                                         <span class="ssp-btn-text">انتشار روی سایت مقصد</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -3207,11 +3265,11 @@ ob_start();
                                     </div>
                                     <div id="pg_bulk_items"></div>
                                     <div style="display:flex; gap:10px; margin-top:12px;">
-                                        <button class="ssp-btn-secondary" onclick="pgBulkAddItem()">+ افزودن ردیف</button>
-                                        <button class="ssp-btn-secondary" onclick="pgBulkGenerateFromAI()">تولید همه با AI</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgBulkAddItem()">+ افزودن ردیف</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgBulkGenerateFromAI()">تولید همه با AI</button>
                                     </div>
                                     <div style="margin-top:16px; display:flex; gap:10px;">
-                                        <button class="ssp-btn-primary" onclick="pgBulkPublish()" id="pg_bulk_publish_btn">
+                                        <button type="button" class="ssp-btn-primary" onclick="pgBulkPublish()" id="pg_bulk_publish_btn">
                                             <span class="ssp-btn-text">انتشار همه</span>
                                             <span class="ssp-btn-spinner"></span>
                                         </button>
@@ -3239,7 +3297,7 @@ ob_start();
                                             <input type="url" id="pg_clone_url" class="ssp-input" dir="ltr" placeholder="https://example.com/product/sample-product/">
                                         </div>
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="pgCloneFetch()" id="pg_clone_btn">
+                                    <button type="button" class="ssp-btn-primary" onclick="pgCloneFetch()" id="pg_clone_btn">
                                         <span class="ssp-btn-text">دریافت اطلاعات</span>
                                         <span class="ssp-btn-spinner"></span>
                                     </button>
@@ -3265,7 +3323,7 @@ ob_start();
                                 <div class="ssp-card">
                                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
                                         <h3 style="margin:0;">تاریخچه انتشار</h3>
-                                        <button class="ssp-btn-secondary" onclick="pgClearHistory()" style="font-size:0.8rem;">پاک کردن</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="pgClearHistory()" style="font-size:0.8rem;">پاک کردن</button>
                                     </div>
                                     <div id="pg_history_list">
                                         <div class="ssp-empty">
@@ -3292,7 +3350,7 @@ ob_start();
                                 <a href="#" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]')); return false;" style="background:#4f46e5; color:#fff; padding:12px 28px; border-radius:10px; text-decoration:none; font-weight:700; display:inline-block;">ارتقا به Pro</a>
                             </div>
                             <?php else : ?>
-                            <h2><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> قالب پرامپت</h2>
+                            <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0 0 8px;"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> <span>قالب پرامپت</span></h2>
                             <p class="ssp-section-desc">قالب پرامپت سفارشی بسازید. با پر کردن فیلدهای زیر، پرامپت به صورت خودکار ساخته شده و خروجی JSON استاندارد برمی‌گرداند.</p>
 
                             <input type="hidden" id="pb_tab_edit_id" value="">
@@ -3360,9 +3418,9 @@ ob_start();
                                 </label>
                             </div>
                             <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:20px;">
-                                <button class="ssp-btn-primary" onclick="pbTabSave()">ذخیره قالب</button>
-                                <button class="ssp-btn-secondary" onclick="pbTabPreview()">پیش‌نمایش پرامپت</button>
-                                <button class="ssp-btn-secondary" onclick="pbTabReset()">پاک کردن فرم</button>
+                                <button type="button" class="ssp-btn-primary" onclick="pbTabSave()">ذخیره قالب</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pbTabPreview()">پیش‌نمایش پرامپت</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="pbTabReset()">پاک کردن فرم</button>
                                 <button type="button" class="ssp-btn-secondary" onclick="pbResetToDefault()" title="بازگردانی به پیش‌فرض" style="padding:8px 12px; font-size:0.75rem;">↺ پیش‌فرض سیستم</button>
                                 <button type="button" id="pb_tab_reset_builtin_btn" class="ssp-btn-warning" onclick="pbTabResetBuiltin()" title="بازگردانی قالب آماده به حالت اولیه" style="padding:8px 12px; font-size:0.75rem; display:none; background:#f59e0b; color:#fff; border:1px solid #d97706;">↺ بازگردانی قالب آماده</button>
                             </div>
@@ -3423,7 +3481,7 @@ ob_start();
                                             </div>
                                             <div style="display:flex; gap:6px; flex-wrap:wrap;">
                                                 <button class="ssp-btn-test btn-fetch-rss" data-id="<?php echo (int)$feed['id']; ?>">دریافت فوری</button>
-                                                <button class="ssp-btn-primary btn-fetch-extract" data-id="<?php echo (int)$feed['id']; ?>" style="font-size:0.75rem; padding:4px 10px;" title="دریافت و استخراج محتوای کامل">⬇ استخراج کامل</button>
+                                                <button class="ssp-btn-primary btn-fetch-extract" data-id="<?php echo (int)$feed['id']; ?>" style="font-size:0.75rem; padding:4px 10px;" title="دریافت و استخراج محتوای کامل">استخراج کامل</button>
                                                 <button class="ssp-btn-secondary btn-edit-rss" data-id="<?php echo (int)$feed['id']; ?>">ويرايش</button>
                                                 <button class="ssp-btn-danger btn-delete-rss" data-id="<?php echo (int)$feed['id']; ?>">حذف</button>
                                             </div>
@@ -3499,7 +3557,7 @@ ob_start();
                                             </select>
                                         </div>
                                         <div class="ssp-form-group" style="margin:0;">
-                                            <label class="ssp-label">حالت محتوا</label>
+                                            <label class="ssp-label">حالت محتوا (پیش‌فرض)</label>
                                             <select id="new_feed_content_mode" class="ssp-select">
                                                 <option value="summary" selected>خلاصه (عنوان + متن + لینک)</option>
                                                 <option value="title_only">فقط عنوان</option>
@@ -3534,7 +3592,7 @@ ob_start();
                                 </div>
 
                                 <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
-                                    <button class="ssp-btn-primary" onclick="addRssFeed()" id="add_rss_btn"><span class="ssp-btn-text">ذخیره فید</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="addRssFeed()" id="add_rss_btn"><span class="ssp-btn-text">ذخیره فید</span><span class="ssp-btn-spinner"></span></button>
                                     <span class="ssp-saved-indicator" id="rss_feed_saved">ذخیره شد!</span>
                                 </div>
                             </div>
@@ -3552,7 +3610,7 @@ ob_start();
                                     <h3 style="color:var(--warning);">AI فقط در پلن Pro</h3>
                                     <p>با ارتقا به Pro می‌توانید از قابلیت هوش مصنوعی استفاده کنید.</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
                             </div>
                             <?php else : ?>
 
@@ -3584,14 +3642,14 @@ ob_start();
                                         </div>
                                     </div>
                                 </div>
-                                <input type="hidden" id="ssp_ai_mode" value="<?php echo esc_attr(get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api'); ?>">
+                                <input type="hidden" id="ssp_ai_mode" name="ssp_ai_mode" value="<?php echo esc_attr(get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api'); ?>">
 
                                 <div id="api_mode_settings" style="display:<?php echo (get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'api' ? 'block' : 'none'; ?>;">
                                 <h3 style="margin:24px 0 12px;">1. سرویس‌دهنده AI را انتخاب کنید</h3>
                                 <div class="ssp-ai-providers">
                                     <?php foreach ([
                                         'groq' => ['<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>', 'Groq (رایگان)', 'https://console.groq.com/keys'],
-                                        'deepseek' => ['🐋', 'DeepSeek', 'https://platform.deepseek.com/api_keys'],
+                                        'deepseek' => ['<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><path d="M22 12c0 6-4.39 10-9.8 10C6.6 22 2 17.6 2 12 2 6.6 6.6 2 12 2c5.4 0 10 4.4 10 10z"/><path d="M16 12a4 4 0 0 0-8 0"/></svg>', 'DeepSeek', 'https://platform.deepseek.com/api_keys'],
                                         'openai' => ['🟢', 'OpenAI', 'https://platform.openai.com/api-keys'],
                                         'anthropic' => ['🟠', 'Claude', 'https://console.anthropic.com/'],
                                         'gemini' => ['🔵', 'Gemini', 'https://aistudio.google.com/app/apikey'],
@@ -3604,30 +3662,37 @@ ob_start();
                                     </div>
                                     <?php endforeach; ?>
                                 </div>
-                                <input type="hidden" id="ai_provider" value="<?php echo esc_attr($ai_provider); ?>">
+                                <input type="hidden" id="ai_provider" name="ai_provider" value="<?php echo esc_attr($ai_provider); ?>">
 
                                 <h3 style="margin:24px 0 12px;">2. API Key و مدل</h3>
                                 <div class="ssp-form-group">
                                     <label class="ssp-label">API Key</label>
                                     <div class="ssp-input-group">
-                                        <input type="password" id="ai_api_key" value="<?php echo esc_attr($ai_api_key); ?>" class="ssp-input" dir="ltr" placeholder="<?php echo $masked_key ?: 'sk-...'; ?>">
+                                        <input type="password" id="ai_api_key" name="ai_api_key" value="" class="ssp-input" dir="ltr" placeholder="<?php echo $masked_key ?: 'sk-...'; ?>">
                                         <button type="button" class="ssp-eye-btn" onclick="togglePass('ai_api_key')"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
                                     </div>
                                     <p class="ssp-hint">کلید شما فقط برای درخواست‌های شما استفاده می‌شود.</p>
                                 </div>
                                 <div class="ssp-form-group">
                                     <label class="ssp-label">مدل AI</label>
-                                    <input type="text" id="ai_model" value="<?php echo esc_attr($ai_model); ?>" class="ssp-input" dir="ltr" placeholder="gpt-4o-mini">
+                                    <input type="text" id="ai_model" name="ai_model" value="<?php echo esc_attr($ai_model); ?>" class="ssp-input" dir="ltr" placeholder="gpt-4o-mini">
                                     <p class="ssp-hint" id="model_hint">مدل‌های پیشنهادی: gpt-4o-mini, gpt-4o, claude-3-haiku, gemini-2.0-flash, llama-3.3-70b-versatile, deepseek-chat</p>
                                     <p class="ssp-hint">پیشنهاد: gpt-4o-mini (OpenAI)، claude-3-5-sonnet (Anthropic)، gemini-1.5-flash (Gemini)</p>
                                 </div>
 
                                 <button type="button" class="ssp-btn-test" onclick="testAiConnection()" id="test_ai_btn">تست اتصال AI</button>
-                                <button type="button" class="ssp-btn-test" style="background:#10B981; color:white;" onclick="testAiDns()">🔍 تست دسترسی DNS به سرورهای AI</button>
+                                <button type="button" class="ssp-btn-test" style="background:#10B981; color:white;" onclick="testAiDns()">تست دسترسی DNS به سرورهای AI</button>
                                 <div id="ai_test_result" class="ssp-ai-test-result"></div>
                                 <div id="ai_dns_test_result" class="ssp-ai-test-result" style="margin-top:10px;"></div>
 
-                                <h3 style="margin:32px 0 12px;">3. حالت پرامپت</h3>
+                                <div style="margin:40px 0 20px; padding:24px; background:rgba(79, 70, 229, 0.03); border:1px solid rgba(79, 70, 229, 0.15); border-radius:12px;">
+                                    <h3 style="margin:0 0 8px; color:var(--text); display:flex; align-items:center; gap:8px;">
+                                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--accent);"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                                        تنظیمات پردازش اتوماسیون هوش مصنوعی
+                                    </h3>
+                                    <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:24px; line-height:1.6;"><strong>توجه:</strong> قابلیت‌های زیر صرفاً برای پردازش محتواهای اتوماتیک (مثل فید RSS یا ربات‌های خودکار وردپرس) کاربرد دارند. این تنظیمات روی <strong>«استودیو هوش مصنوعی»</strong> یا تولید مقالات دستی تاثیری ندارند.</p>
+                                    
+                                    <h4 style="margin:0 0 12px; font-size:1rem;">نحوه پردازش و بازنویسی (Prompt Mode)</h4>
                                 <div class="ssp-grid-2">
                                     <div class="ssp-feature-card <?php echo $ai_prompt_mode !== 'advanced' ? 'active' : ''; ?>" onclick="togglePromptMode('simple')">
                                         <div class="ssp-feature-card-head">
@@ -3666,11 +3731,11 @@ ob_start();
                                     </div>
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">پرامپت سفارشی شما</label>
-                                        <textarea id="ai_custom_prompt" rows="10" class="ssp-textarea" dir="ltr" placeholder="You are a Persian content writer specializing in {topic}...&#10;&#10;Write an article about recent developments...&#10;&#10;Return JSON: {&quot;title&quot;:&quot;...&quot;, &quot;message&quot;:&quot;...&quot;}"><?php echo esc_textarea($ai_custom_prompt); ?></textarea>
+                                        <textarea id="ai_custom_prompt" name="ai_custom_prompt" rows="10" class="ssp-textarea" dir="ltr" placeholder="You are a Persian content writer specializing in {topic}...&#10;&#10;Write an article about recent developments...&#10;&#10;Return JSON: {&quot;title&quot;:&quot;...&quot;, &quot;message&quot;:&quot;...&quot;}"><?php echo esc_textarea($ai_custom_prompt); ?></textarea>
                                     </div>
                                 </div>
 
-                                <h3 style="margin:32px 0 12px;">4. قابلیت‌های پردازش</h3>
+                                <h4 style="margin:32px 0 12px; font-size:1rem;">عملیات پردازش روی محتواهای ورودی</h4>
                                 <div class="ssp-grid-2">
                                     <div class="ssp-feature-card <?php echo !empty($ai_rewrite) ? 'active' : ''; ?>">
                                         <div class="ssp-feature-card-head">
@@ -3679,7 +3744,7 @@ ob_start();
                                                 <p class="ssp-feature-card-desc">جلوگیری از Duplicate Content</p>
                                             </div>
                                             <label class="ssp-toggle" onclick="event.stopPropagation();">
-                                                <input type="checkbox" id="ai_rewrite" <?php checked($ai_rewrite); ?>>
+                                                <input type="checkbox" id="ai_rewrite" name="ai_rewrite" value="1" <?php checked($ai_rewrite); ?>>
                                                 <span class="ssp-toggle-slider"></span>
                                             </label>
                                         </div>
@@ -3691,11 +3756,12 @@ ob_start();
                                                 <p class="ssp-feature-card-desc">افزودن هشتگ به محتوای تولید شده</p>
                                             </div>
                                             <label class="ssp-toggle" onclick="event.stopPropagation();">
-                                                <input type="checkbox" id="ai_hashtags" <?php checked($ai_hashtags); ?>>
+                                                <input type="checkbox" id="ai_hashtags" name="ai_hashtags" value="1" <?php checked($ai_hashtags); ?>>
                                                 <span class="ssp-toggle-slider"></span>
                                             </label>
                                         </div>
                                     </div>
+                                </div>
                                 </div>
                                 </div><!-- end api_mode_settings -->
 
@@ -3720,21 +3786,24 @@ ob_start();
                                             </div>
                                         </div>
                                     </div>
-                                    <input type="hidden" id="ssp_ai_chatbot" value="<?php echo esc_attr(get_user_meta($user_id, 'ssp_ai_chatbot', true) ?: 'deepseek'); ?>">
+                                    <input type="hidden" id="ssp_ai_chatbot" name="ssp_ai_chatbot" value="<?php echo esc_attr(get_user_meta($user_id, 'ssp_ai_chatbot', true) ?: 'deepseek'); ?>">
 
                                     <div class="ssp-card" style="margin-top:16px; background:var(--accent-soft); border-color:var(--accent);">
-                                        <h3>تنظیم اولیه (یک بار انجام می‌شود)</h3>
+                                        <h3>تنظیم اولیه پل ارتباطی مرورگر (یک بار انجام می‌شود)</h3>
+                                        <p class="ssp-section-desc" style="margin-top:4px;">پل ارتباطی به شما اجازه می‌دهد بدون نیاز به خرید کلید API، مستقیماً از حساب رایگان خود در DeepSeek یا ChatGPT استفاده کنید.</p>
                                         <ol class="ssp-guide-steps" style="margin:12px 0;">
-                                            <li>افزونه <strong>SnapMonkey</strong> را روی مرورگر خود نصب کنید <a href="https://chromewebstore.google.com/detail/snapmonkey/ajpopphbpfgbaacomdckngkahibkkccj" target="_blank" style="display:inline-block; background:#4f46e5; color:white; padding:2px 10px; border-radius:12px; font-size:0.75rem; text-decoration:none; margin-right:6px; vertical-align:middle;">دانلود از Chrome Web Store</a></li>
-                                            <li>به صفحه افزونه‌ها (<code>chrome://extensions</code>) بروید، روی <strong>Details</strong> SnapMonkey کلیک کنید و گزینه <strong>User Scripts</strong> را فعال کنید</li>
-                                            <li>روی دکمه زیر کلیک کنید تا لینک اسکریپت دریافت شود</li>
-                                            <li>لینک را کپی کنید، سپس در SnapMonkey روی <strong>Install from URL</strong> کلیک کنید و لینک را بچسبانید</li>
-                                            <li>در صفحه تأیید، <strong>Install</strong> را بزنید</li>
-                                            <li>به سایت چت‌بات بروید و مطمئن شوید وارد حساب خود شده‌اید</li>
-                                            <li>ویجت سبز رنگ در گوشه صفحه = اتصال فعال</li>
+                                            <li>یکی از افزونه‌های <strong>ScriptCat</strong> یا <strong>Tampermonkey</strong> را روی مرورگر خود نصب کنید: 
+                                                <a href="https://chromewebstore.google.com/detail/scriptcat/ndcooeababalnlpkfedmmbbbgkljhpjf" target="_blank" style="display:inline-block; background:#4f46e5; color:white; padding:2px 10px; border-radius:12px; font-size:0.75rem; text-decoration:none; margin:0 4px; vertical-align:middle;">دانلود ScriptCat</a>
+                                                <a href="https://chromewebstore.google.com/detail/tampermonkey/dhdgffkkebhmkfjojejmpbldmpobfkfo" target="_blank" style="display:inline-block; background:#10b981; color:white; padding:2px 10px; border-radius:12px; font-size:0.75rem; text-decoration:none; margin:0 4px; vertical-align:middle;">دانلود Tampermonkey</a>
+                                            </li>
+                                            <li>اگر از ScriptCat استفاده می‌کنید، به صفحه افزونه‌ها (<code>chrome://extensions</code>) بروید، وارد <strong>Details</strong> (جزئیات) اکستنشن شوید و گزینه <strong>Developer mode</strong> را فعال کنید (<a href="https://docs.scriptcat.org/en/docs/use/open-dev/?userscript_enabled=false&userscript_permission=true&userscript_guard=allowScript&browser=chrome#allow-user-scripts" target="_blank">راهنمای فعال‌سازی</a>).</li>
+                                            <li>روی دکمه <strong>«دریافت کد و لینک اسکریپت»</strong> در زیر کلیک کنید.</li>
+                                            <li><strong>نصب دستی (سریع و مطمئن):</strong> در افزونه ScriptCat یا Tampermonkey روی دکمه <strong>افزودن اسکریپت جدید (+ New Script)</strong> کلیک کنید، کدهای قبلی را پاک کرده و کد اسکریپت کپی‌شده را Paste کنید، سپس ذخیره (Save) را بزنید.</li>
+                                            <li><strong>نصب با یک کلیک:</strong> لینک اسکریپت را در یک تب جدید مرورگر باز کنید تا دیالوگ نصب خودکار افزونه نمایان شود و دکمه <strong>Install</strong> را بزنید.</li>
+                                            <li>به سایت چت‌بات (<a href="https://chat.deepseek.com" target="_blank">DeepSeek</a> یا <a href="https://chatgpt.com" target="_blank">ChatGPT</a>) بروید؛ ویجت سبز رنگ در گوشه صفحه به معنای اتصال موفقیت‌آمیز است.</li>
                                         </ol>
                                         <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                                            <button type="button" class="ssp-btn-primary" onclick="setupBrowserBridge()" id="bridge_setup_btn"><span class="ssp-btn-text">دریافت لینک اسکریپت</span><span class="ssp-btn-spinner"></span></button>
+                                            <button type="button" class="ssp-btn-primary" onclick="setupBrowserBridge()" id="bridge_setup_btn"><span class="ssp-btn-text">دریافت کد و لینک اسکریپت</span><span class="ssp-btn-spinner"></span></button>
                                             <button type="button" class="ssp-btn-secondary" onclick="testBrowserBridge()" id="bridge_test_btn">تست اتصال</button>
                                         </div>
                                         <div id="bridge_setup_result" style="margin-top:12px;"></div>
@@ -3742,7 +3811,7 @@ ob_start();
 
                                     <div class="ssp-card" style="margin-top:12px;">
                                         <h3>جایگزین: بوکمارکلت (بدون افزونه)</h3>
-                                        <p class="ssp-section-desc">این روش نیازی به SnapMonkey ندارد. لینک زیر را به نوار بوکمارک اضافه کنید و پس از دریافت پاسخ از چت‌بات، آن را کلیک کنید.</p>
+                                        <p class="ssp-section-desc">این روش نیازی به افزونه مرورگر (مانند ScriptCat) ندارد. لینک زیر را به نوار بوکمارک اضافه کنید و پس از دریافت پاسخ از چت‌بات، آن را کلیک کنید.</p>
                                         <a id="bookmarklet_link" href="#" class="ssp-btn-primary" style="text-decoration:none; display:inline-block;" onclick="event.preventDefault();">کپی پاسخ از چت‌بات</a>
                                         <p class="ssp-hint" style="margin-top:8px;">این لینک را به نوار بوکمارک اضافه کنید (drag & drop یا راست کلیک → Bookmark This Link)</p>
                                     </div>
@@ -3806,7 +3875,7 @@ ob_start();
                                         <h3 style="margin:0;">کتابخانه قالب‌ها</h3>
                                         <p class="ssp-hint" style="margin:4px 0 0 0;">قالب‌های این پروفایل را مدیریت کنید. هر قالب عنوان، متن، هشتگ و امضای اختصاصی دارد.</p>
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="openTemplateCreateModal()" style="white-space:nowrap;">+ قالب جدید</button>
+                                    <button type="button" class="ssp-btn-primary" onclick="openTemplateCreateModal()" style="white-space:nowrap;">+ قالب جدید</button>
                                 </div>
 
                                 <!-- Category filter -->
@@ -3829,29 +3898,88 @@ ob_start();
 
                         <!-- ============ CONTENT CALENDAR ============ -->
                         <div id="tab-calendar" class="tab-content">
-                            <h2>تقویم محتوا</h2>
-                            <p class="ssp-section-desc">زمان‌بندی ارسال‌های خود را به صورت بصری مدیریت کنید.</p>
-
-                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px;">
-                                <div style="display:flex; gap:10px; align-items:center;">
-                                    <button class="ssp-btn-secondary" onclick="calendarPrevMonth()">&laquo; ماه قبل</button>
-                                    <span id="calendar_month_label" style="font-weight:700; font-size:1.1rem;"></span>
-                                    <button class="ssp-btn-secondary" onclick="calendarNextMonth()">ماه بعد &raquo;</button>
+                            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:8px;">
+                                <div>
+                                    <h2 class="ssp-tool-title" style="display:flex;align-items:center;gap:10px;margin:0;"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block;vertical-align:middle;flex-shrink:0;"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> <span>تقویم هوشمند محتوا</span></h2>
+                                    <p class="ssp-section-desc" style="margin:4px 0 0;">برنامه‌ریزی، زمان‌بندی، ویرایش و نظارت بصری بر ارسال‌های خودکار در تقویم جلالی (شمسی)</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('schedules', document.querySelector('[data-tab=schedules]'))">افزودن زمان‌بندی جدید</button>
+                                <div style="display:flex; gap:8px; align-items:center;">
+                                    <button type="button" class="ssp-btn-secondary" onclick="loadCalendar(true)" title="تازه‌سازی تقویم" style="font-size:0.85rem; padding:8px 12px;">
+                                        🔄 بروزرسانی
+                                    </button>
+                                    <button type="button" class="ssp-btn-primary" onclick="openNewScheduleForDate()" style="font-size:0.85rem; padding:8px 16px;">
+                                        + زمان‌بندی جدید
+                                    </button>
+                                </div>
                             </div>
 
-                            <div class="ssp-calendar" id="content_calendar" style="display:grid; grid-template-columns:repeat(7,1fr); gap:4px;">
-                                <!-- Calendar will be loaded via JS -->
+                            <!-- Calendar Navigation & Filter Controls -->
+                            <div class="ssp-card" style="margin-bottom:16px; padding:14px 18px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:14px;">
+                                    <!-- Month Switcher -->
+                                    <div style="display:flex; align-items:center; gap:10px;">
+                                        <button type="button" class="ssp-btn-secondary" onclick="calendarPrevMonth()" style="padding:6px 12px; font-weight:700;">&laquo; ماه قبل</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="calendarToday()" style="padding:6px 12px; font-size:0.8rem;">امروز</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="calendarNextMonth()" style="padding:6px 12px; font-weight:700;">ماه بعد &raquo;</button>
+                                        <div style="margin-right:10px;">
+                                            <span id="cal_month_label" style="font-weight:800; font-size:1.15rem; color:var(--text);"></span>
+                                            <span id="calendar_month_label" style="display:none;"></span>
+                                            <div id="cal_sub_label" style="font-size:0.75rem; color:var(--text-muted); direction:ltr; text-align:right;"></div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Status Filter Tabs -->
+                                    <div style="display:flex; gap:6px; background:var(--bg-alt); padding:4px; border-radius:8px; border:1px solid var(--border); flex-wrap:wrap;">
+                                        <button type="button" class="ssp-btn-secondary ssp-cal-filter-btn active" data-status="all" onclick="filterCalendarStatus('all')" style="font-size:0.78rem; padding:4px 10px; border-radius:6px;">همه</button>
+                                        <button type="button" class="ssp-btn-secondary ssp-cal-filter-btn" data-status="pending" onclick="filterCalendarStatus('pending')" style="font-size:0.78rem; padding:4px 10px; border-radius:6px; color:#d97706;">در انتظار</button>
+                                        <button type="button" class="ssp-btn-secondary ssp-cal-filter-btn" data-status="completed" onclick="filterCalendarStatus('completed')" style="font-size:0.78rem; padding:4px 10px; border-radius:6px; color:#059669;">ارسال شده</button>
+                                        <button type="button" class="ssp-btn-secondary ssp-cal-filter-btn" data-status="cancelled" onclick="filterCalendarStatus('cancelled')" style="font-size:0.78rem; padding:4px 10px; border-radius:6px; color:#dc2626;">لغو شده</button>
+                                    </div>
+                                </div>
                             </div>
 
-                            <div style="margin-top:20px; padding:16px; background:var(--bg-alt); border-radius:12px; border:1px solid var(--border);">
-                                <h3 style="margin:0 0 12px; font-size:1rem;">راهنمای تقویم</h3>
-                                <div style="display:flex; gap:16px; flex-wrap:wrap; font-size:0.85rem; color:var(--text-muted);">
-                                    <span><span style="display:inline-block; width:12px; height:12px; background:var(--accent-soft); border:1px solid var(--accent); border-radius:3px;"></span> امروز</span>
-                                    <span><span style="display:inline-block; width:12px; height:12px; background:rgba(79,70,229,0.05); border:1px solid var(--accent); border-radius:3px;"></span> دارای زمان‌بندی (<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>)</span>
-                                    <span><span style="display:inline-block; width:12px; height:12px; background:rgba(16,185,129,0.05); border:1px solid var(--success); border-radius:3px;"></span> ارسال شده (<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>)</span>
-                                    <span>روی هر روز کلیک کنید تا جزئیات را ببینید</span>
+                            <!-- Persian Week Days Header -->
+                            <div style="display:grid; grid-template-columns:repeat(7,1fr); gap:8px; margin-bottom:8px; text-align:center; font-weight:700; font-size:0.85rem; color:var(--text-muted);">
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px;">شنبه</div>
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px;">یکشنبه</div>
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px;">دوشنبه</div>
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px;">سه‌شنبه</div>
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px;">چهارشنبه</div>
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px;">پنجشنبه</div>
+                                <div style="padding:6px; background:var(--bg-alt); border-radius:6px; color:#ef4444;">جمعه</div>
+                            </div>
+
+                            <!-- Calendar Grid Container -->
+                            <div class="ssp-calendar" id="calendar_grid" style="display:grid; grid-template-columns:repeat(7,1fr); gap:8px;">
+                                <!-- Calendar loaded via JS -->
+                            </div>
+                            <div id="content_calendar" style="display:none;"></div>
+
+                            <!-- Calendar Legend & Help -->
+                            <div style="margin-top:20px; padding:16px 20px; background:var(--bg-alt); border-radius:12px; border:1px solid var(--border);">
+                                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+                                    <div style="display:flex; gap:16px; flex-wrap:wrap; font-size:0.82rem; color:var(--text-muted); align-items:center;">
+                                        <strong style="color:var(--text); font-size:0.85rem;">راهنمای وضعیت‌ها:</strong>
+                                        <span style="display:inline-flex; align-items:center; gap:5px;">
+                                            <span style="display:inline-block; width:10px; height:10px; background:rgba(79,70,229,0.2); border:2px solid var(--accent); border-radius:3px;"></span>
+                                            <span>امروز</span>
+                                        </span>
+                                        <span style="display:inline-flex; align-items:center; gap:5px;">
+                                            <span style="display:inline-block; width:8px; height:8px; background:#f59e0b; border-radius:50%;"></span>
+                                            <span style="color:#d97706; font-weight:600;">در انتظار ارسال</span>
+                                        </span>
+                                        <span style="display:inline-flex; align-items:center; gap:5px;">
+                                            <span style="display:inline-block; width:8px; height:8px; background:#10b981; border-radius:50%;"></span>
+                                            <span style="color:#059669; font-weight:600;">ارسال شده</span>
+                                        </span>
+                                        <span style="display:inline-flex; align-items:center; gap:5px;">
+                                            <span style="display:inline-block; width:8px; height:8px; background:#ef4444; border-radius:50%;"></span>
+                                            <span style="color:#dc2626; font-weight:600;">لغو شده</span>
+                                        </span>
+                                    </div>
+                                    <div style="font-size:0.8rem; color:var(--text-muted);">
+                                        💡 <em>برای مشاهده، ویرایش، لغو یا ایجاد زمان‌بندی، روی هر روز کلیک کنید.</em>
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -3867,7 +3995,7 @@ ob_start();
                                     <h3 style="color:var(--warning);">زمان‌بندی فقط در پلن Pro</h3>
                                     <p>با ارتقا به Pro می‌توانید ارسال‌های خود را زمان‌بندی کنید.</p>
                                 </div>
-                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
                             </div>
                             <?php else : ?>
 
@@ -3906,11 +4034,14 @@ ob_start();
                                                 </div>
                                                 <?php endif; ?>
                                             </div>
-                                            <div style="display:flex; gap:6px;">
+                                            <div style="display:flex; gap:6px; flex-wrap:wrap;">
+                                                <button type="button" class="ssp-btn-secondary" onclick="openEditScheduleModal(<?php echo (int)$sch['id']; ?>)" style="font-size:0.75rem; padding:4px 8px;">✏️ ویرایش</button>
                                                 <?php if ($sch['status'] === 'pending') : ?>
-                                                <button class="ssp-btn-secondary" onclick="cancelSchedule(<?php echo (int)$sch['id']; ?>)" style="font-size:0.75rem; padding:4px 10px;">لغو</button>
+                                                <button type="button" class="ssp-btn-secondary" onclick="cancelSchedule(<?php echo (int)$sch['id']; ?>)" style="font-size:0.75rem; padding:4px 8px; color:#d97706;">لغو</button>
+                                                <?php elseif ($sch['status'] === 'cancelled') : ?>
+                                                <button type="button" class="ssp-btn-secondary" onclick="reactivateSchedule(<?php echo (int)$sch['id']; ?>)" style="font-size:0.75rem; padding:4px 8px; color:#059669;">فعال‌سازی</button>
                                                 <?php endif; ?>
-                                                <button class="ssp-btn-danger btn-delete-schedule" data-id="<?php echo (int)$sch['id']; ?>">حذف</button>
+                                                <button type="button" class="ssp-btn-danger" onclick="deleteSchedule(<?php echo (int)$sch['id']; ?>)" style="font-size:0.75rem; padding:4px 8px;">حذف</button>
                                             </div>
                                         </div>
                                     </div>
@@ -3948,7 +4079,7 @@ ob_start();
                                     </div>
                                 </div>
                                 <div style="margin-top:16px; display:flex; gap:10px; align-items:center;">
-                                    <button class="ssp-btn-primary" onclick="addSchedule()" id="add_schedule_btn"><span class="ssp-btn-text">ایجاد زمان‌بندی</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="addSchedule()" id="add_schedule_btn"><span class="ssp-btn-text">ایجاد زمان‌بندی</span><span class="ssp-btn-spinner"></span></button>
                                     <span class="ssp-saved-indicator" id="schedule_saved">ایجاد شد!</span>
                                 </div>
                             </div>
@@ -3967,17 +4098,17 @@ ob_start();
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
                                 <h3 style="color:var(--warning);">قابلیت Pro</h3>
                                 <p>توزیع خودکار محتوا فقط در پلن Pro موجود است.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('subscription', document.querySelector('[data-tab=subscription]'))">ارتقا به Pro</button>
                             </div>
                             <?php elseif (empty($wp_sites)) : ?>
                             <div class="ssp-empty">
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
                                 <p>ابتدا یک سایت وردپرسی اضافه کنید.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('wpsources', document.querySelector('[data-tab=wpsources]'))">رفتن به منابع وردپرس</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('wpsources', document.querySelector('[data-tab=wpsources]'))">رفتن به منابع وردپرس</button>
                             </div>
                             <?php else : ?>
                             <div style="display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap;">
-                                <button class="ssp-btn-primary" onclick="openDistributionForm()">+ توزیع جدید</button>
+                                <button type="button" class="ssp-btn-primary" onclick="openDistributionForm()">+ توزیع جدید</button>
                             </div>
                             <div id="distributions_list"></div>
                             <div id="distribution_form_wrap" style="display:none;">
@@ -4141,9 +4272,9 @@ ob_start();
                                     </div>
 
                                     <div style="display:flex; gap:10px; margin-top:16px;">
-                                        <button class="ssp-btn-primary" onclick="saveDistribution()">ذخیره توزیع</button>
-                                        <button class="ssp-btn-secondary" onclick="closeDistributionForm()">انصراف</button>
-                                        <button class="ssp-btn-secondary" onclick="previewDistribution()">پیش‌نمایش</button>
+                                        <button type="button" class="ssp-btn-primary" onclick="saveDistribution()">ذخیره توزیع</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="closeDistributionForm()">انصراف</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="previewDistribution()">پیش‌نمایش</button>
                                     </div>
                                 </div>
                             </div>
@@ -4171,7 +4302,7 @@ ob_start();
                                 <div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
                                 <h3 style="color:var(--warning);"> هوش مصنوعی تنظیم نشده است</h3>
                                 <p>برای استفاده از ابزارهای SEO هوشمند، ابتدا تنظیمات هوش مصنوعی را تکمیل کنید.</p>
-                                <button class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
+                                <button type="button" class="ssp-btn-primary" onclick="switchTab('ai', document.querySelector('[data-tab=ai]'))">رفتن به تنظیمات AI</button>
                             </div>
                             <?php else : ?>
 
@@ -4214,38 +4345,38 @@ ob_start();
                                         <div style="display:flex; gap:8px; align-items:center;">
                                             <select id="seo_prompt_mode" class="ssp-select" onchange="updateSeoPromptMode()" style="flex:1;">
                                                 <option value="">پیش‌فرض (بدون حالت خاص)</option>
-                                                <option value="human">🧠 Human Writer - متن انسانی‌تر</option>
-                                                <option value="redteam">🔴 Red Team - تحلیل انتقادی</option>
-                                                <option value="x10think">🧠 x10 Think - تفکر عمیق</option>
-                                                <option value="socrates">🏛️ Socrates - پرسش‌گری هوشمند</option>
-                                                <option value="truth">⚖️ Truth - واقعیت‌محور</option>
-                                                <option value="meta">🔍 Meta - تحلیل فرآیند</option>
-                                                <option value="predict">🔮 Predict - پیش‌بینی آینده</option>
-                                                <option value="ooda">🔄 OODA Loop - چرخه تصمیم‌گیری</option>
-                                                <option value="eli10">👶 ELI10 - توضیح ساده</option>
-                                                <option value="alt3">🔀 Alt3 - ۳ دیدگاه مختلف</option>
+                                                <option value="human">Human Writer - متن انسانی‌تر</option>
+                                                <option value="redteam">Red Team - تحلیل انتقادی</option>
+                                                <option value="x10think">x10 Think - تفکر عمیق</option>
+                                                <option value="socrates">Socrates - پرسش‌گری هوشمند</option>
+                                                <option value="truth"> Truth - واقعیت‌محور</option>
+                                                <option value="meta">Meta - تحلیل فرآیند</option>
+                                                <option value="predict">Predict - پیش‌بینی آینده</option>
+                                                <option value="ooda">OODA Loop - چرخه تصمیم‌گیری</option>
+                                                <option value="eli10">ELI10 - توضیح ساده</option>
+                                                <option value="alt3">Alt3 - ۳ دیدگاه مختلف</option>
                                             </select>
                                             <button type="button" class="ssp-btn-secondary" onclick="seoResetPromptMode()" title="بازگردانی به پیش‌فرض" style="padding:8px 12px; font-size:0.75rem;">↺</button>
                                         </div>
                                         <p class="ssp-hint" id="seo_prompt_mode_hint" style="display:none;"></p>
                                     </div>
                                     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                                        <button class="ssp-btn-primary" onclick="analyzeSeo()" id="seo_analyze_btn"><span class="ssp-btn-text">تحلیل SEO</span><span class="ssp-btn-spinner"></span></button>
-                                        <button class="ssp-btn-secondary" onclick="suggestSeoTitle()">پیشنهاد عنوان</button>
-                                        <button class="ssp-btn-secondary" onclick="generateMetaDesc()">تولید متا دیسکریپشن</button>
+                                        <button type="button" class="ssp-btn-primary" onclick="analyzeSeo()" id="seo_analyze_btn"><span class="ssp-btn-text">تحلیل SEO</span><span class="ssp-btn-spinner"></span></button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="suggestSeoTitle()">پیشنهاد عنوان</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="generateMetaDesc()">تولید متا دیسکریپشن</button>
                                         <?php if ($plan === 'pro') : ?>
                                         <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') !== 'browser') : ?>
-                                        <button class="ssp-btn-secondary" onclick="analyzeSeoWithAi()" id="seo_ai_btn"><span class="ssp-btn-text">تحلیل با API</span><span class="ssp-btn-spinner"></span></button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="analyzeSeoWithAi()" id="seo_ai_btn"><span class="ssp-btn-text">تحلیل با API</span><span class="ssp-btn-spinner"></span></button>
                                         <?php endif; ?>
                                         <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'browser') : ?>
-                                        <button class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="seoAnalyzeViaBrowser()" id="seo_browser_btn">
+                                        <button type="button" class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="seoAnalyzeViaBrowser()" id="seo_browser_btn">
                                             <span class="ssp-btn-text">تحلیل با چت‌بات رایگان</span>
                                             <span class="ssp-btn-spinner"></span>
                                         </button>
                                         <?php endif; ?>
                                         <?php endif; ?>
                                     </div>
-                                    <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به SnapMonkey)</p>
+                                    <p class="ssp-hint" style="margin-top:8px;">با API: سریع‌تر و مستقیم (نیاز به کلید API) | با چت‌بات رایگان: از حساب رایگان DeepSeek/ChatGPT (نیاز به افزونه مرورگر)</p>
                                     <div id="seo_results" style="margin-top:20px;"></div>
                                     <div id="meta_desc_result" style="margin-top:16px;"></div>
                                 </div>
@@ -4258,7 +4389,7 @@ ob_start();
                                         <label class="ssp-label">کلمات کلیدی (با کاما جدا کنید)</label>
                                         <input type="text" id="gap_keywords" class="ssp-input" placeholder="سئو, بازاریابی محتوا, گوگل">
                                     </div>
-                                    <button class="ssp-btn-secondary" onclick="analyzeContentGap()">تحلیل شکاف محتوا</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="analyzeContentGap()">تحلیل شکاف محتوا</button>
                                     <div id="gap_results" style="margin-top:16px;"></div>
                                 </div>
 
@@ -4266,7 +4397,7 @@ ob_start();
                                 <div class="ssp-card" style="margin-top:16px;">
                                     <h3 style="margin:0 0 12px;">تحلیل خوشه موضوعی (Topic Cluster)</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">موضوعات اصلی و ارتباط بین کلمات محتوا را شناسایی کنید</p>
-                                    <button class="ssp-btn-secondary" onclick="analyzeTopicCluster()">تحلیل خوشه موضوعی</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="analyzeTopicCluster()">تحلیل خوشه موضوعی</button>
                                     <div id="cluster_results" style="margin-top:16px;"></div>
                                 </div>
 
@@ -4274,15 +4405,15 @@ ob_start();
                                 <div class="ssp-card" style="margin-top:16px;">
                                     <h3 style="margin:0 0 12px;">بهینه‌سازی Featured Snippet</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">فرمت محتوا را برای قرار گرفتن در Position Zero گوگل بهینه کنید</p>
-                                    <button class="ssp-btn-secondary" onclick="analyzeFeaturedSnippet()">تحلیل Featured Snippet</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="analyzeFeaturedSnippet()">تحلیل Featured Snippet</button>
                                     <div id="snippet_results" style="margin-top:16px;"></div>
                                 </div>
 
                                 <!-- Voice Search Optimizer -->
                                 <div class="ssp-card" style="margin-top:16px;">
-                                    <h3 style="margin:0 0 12px;">🎤 بهینه‌سازی جستجوی صوتی</h3>
+                                    <h3 style="margin:0 0 12px;">بهینه‌سازی جستجوی صوتی</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">محتوا را برای جستجوی صوتی (Google Assistant, Siri) بهینه کنید</p>
-                                    <button class="ssp-btn-secondary" onclick="analyzeVoiceSearch()">تحلیل جستجوی صوتی</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="analyzeVoiceSearch()">تحلیل جستجوی صوتی</button>
                                     <div id="voice_results" style="margin-top:16px;"></div>
                                 </div>
 
@@ -4290,7 +4421,7 @@ ob_start();
                                 <div class="ssp-card" style="margin-top:16px;">
                                     <h3 style="margin:0 0 12px;">چک‌لیست SEO</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">بررسی کامل تمام عناصر SEO محتوا</p>
-                                    <button class="ssp-btn-secondary" onclick="generateSeoChecklist()">تولید چک‌لیست</button>
+                                    <button type="button" class="ssp-btn-secondary" onclick="generateSeoChecklist()">تولید چک‌لیست</button>
                                     <div id="checklist_results" style="margin-top:16px;"></div>
                                 </div>
                             </div>
@@ -4301,7 +4432,7 @@ ob_start();
                                     <h3 style="margin:0 0 12px;">تحلیلگر کلمات کلیدی</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">تراکم، تکرار و عبارات کلیدی محتوا را تحلیل کنید</p>
                                     <div style="margin-bottom:12px;">
-                                        <button class="ssp-btn-secondary" onclick="importToKeywordAnalyzer()" style="font-size:0.8rem;">📥 دریافت از فرم تحلیل محتوا</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="importToKeywordAnalyzer()" style="font-size:0.8rem;">دریافت از فرم تحلیل محتوا</button>
                                     </div>
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">محتوا برای تحلیل</label>
@@ -4311,7 +4442,7 @@ ob_start();
                                         <label class="ssp-label">کلمه کلیدی اصلی (اختیاری)</label>
                                         <input type="text" id="kw_focus" class="ssp-input" placeholder="مثلاً: آموزش سئو">
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="analyzeKeywords()" id="kw_analyze_btn"><span class="ssp-btn-text">تحلیل کلمات کلیدی</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="analyzeKeywords()" id="kw_analyze_btn"><span class="ssp-btn-text">تحلیل کلمات کلیدی</span><span class="ssp-btn-spinner"></span></button>
                                     <div id="kw_results" style="margin-top:16px;"></div>
                                 </div>
                             </div>
@@ -4323,7 +4454,7 @@ ob_start();
                                     <h3 style="margin:0 0 12px;">پیش‌نمایش نتیجه جستجو (SERP)</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">ببینید صفحه شما در گوگل چطور نمایش داده می‌شود</p>
                                     <div style="margin-bottom:12px;">
-                                        <button class="ssp-btn-secondary" onclick="importToSerpPreview()" style="font-size:0.8rem;">📥 دریافت از فرم تحلیل محتوا</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="importToSerpPreview()" style="font-size:0.8rem;">دریافت از فرم تحلیل محتوا</button>
                                     </div>
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">عنوان صفحه</label>
@@ -4354,7 +4485,7 @@ ob_start();
                                         <label class="ssp-label">آدرس URL</label>
                                         <input type="text" id="audit_url" class="ssp-input" placeholder="https://example.com/page">
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="auditUrl()" id="audit_btn"><span class="ssp-btn-text">ممیزی صفحه</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="auditUrl()" id="audit_btn"><span class="ssp-btn-text">ممیزی صفحه</span><span class="ssp-btn-spinner"></span></button>
                                     <div id="audit_results" style="margin-top:16px;"></div>
                                 </div>
                             </div>
@@ -4365,7 +4496,7 @@ ob_start();
                                     <h3 style="margin:0 0 4px;">تحلیلگر GEO</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">بهینه‌سازی محتوا برای ChatGPT، Gemini، Perplexity و سایر موتورهای جستجوی هوش مصنوعی</p>
                                     <div style="margin-bottom:12px;">
-                                        <button class="ssp-btn-secondary" onclick="importToGeo()" style="font-size:0.8rem;">📥 دریافت از فرم تحلیل محتوا</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="importToGeo()" style="font-size:0.8rem;">دریافت از فرم تحلیل محتوا</button>
                                     </div>
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">عنوان محتوا</label>
@@ -4375,7 +4506,7 @@ ob_start();
                                         <label class="ssp-label">محتوا</label>
                                         <textarea id="geo_content" rows="5" class="ssp-textarea" placeholder="متن کامل محتوا را اینجا وارد کنید..."></textarea>
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="analyzeGeo()" id="geo_btn"><span class="ssp-btn-text">تحلیل GEO</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="analyzeGeo()" id="geo_btn"><span class="ssp-btn-text">تحلیل GEO</span><span class="ssp-btn-spinner"></span></button>
                                     <div id="geo_results" style="margin-top:16px;"></div>
                                 </div>
                             </div>
@@ -4386,7 +4517,7 @@ ob_start();
                                     <h3 style="margin:0 0 12px;">تحلیلگر E-E-A-T</h3>
                                     <p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">تجربه، تخصص، اعتبار و اعتماد محتوا را بررسی کنید (معیار کیفیت گوگل)</p>
                                     <div style="margin-bottom:12px;">
-                                        <button class="ssp-btn-secondary" onclick="importToEeat()" style="font-size:0.8rem;">📥 دریافت از فرم تحلیل محتوا</button>
+                                        <button type="button" class="ssp-btn-secondary" onclick="importToEeat()" style="font-size:0.8rem;">دریافت از فرم تحلیل محتوا</button>
                                     </div>
                                     <div class="ssp-form-group">
                                         <label class="ssp-label">عنوان</label>
@@ -4400,7 +4531,7 @@ ob_start();
                                         <label class="ssp-label">نام نویسنده (اختیاری)</label>
                                         <input type="text" id="eeat_author" class="ssp-input" placeholder="نام نویسنده">
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="analyzeEeat()" id="eeat_btn"><span class="ssp-btn-text">تحلیل E-E-A-T</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="analyzeEeat()" id="eeat_btn"><span class="ssp-btn-text">تحلیل E-E-A-T</span><span class="ssp-btn-spinner"></span></button>
                                     <div id="eeat_results" style="margin-top:16px;"></div>
                                 </div>
                             </div>
@@ -4437,7 +4568,7 @@ ob_start();
                                             <input type="text" id="schema_url" class="ssp-input" placeholder="https://example.com/page">
                                         </div>
                                     </div>
-                                    <button class="ssp-btn-primary" onclick="generateSchema()" id="schema_btn"><span class="ssp-btn-text">تولید Schema</span><span class="ssp-btn-spinner"></span></button>
+                                    <button type="button" class="ssp-btn-primary" onclick="generateSchema()" id="schema_btn"><span class="ssp-btn-text">تولید Schema</span><span class="ssp-btn-spinner"></span></button>
                                     <div id="schema_results" style="margin-top:16px;"></div>
                                 </div>
                             </div>
@@ -4456,16 +4587,16 @@ ob_start();
                                         <div style="display:flex; gap:8px; align-items:center;">
                                             <select id="site_audit_prompt_mode" class="ssp-select" onchange="updateSiteAuditPromptMode()" style="flex:1;">
                                                 <option value="">پیش‌فرض (بدون حالت خاص)</option>
-                                                <option value="human">🧠 Human Writer - متن انسانی‌تر</option>
-                                                <option value="redteam">🔴 Red Team - تحلیل انتقادی</option>
-                                                <option value="x10think">🧠 x10 Think - تفکر عمیق</option>
-                                                <option value="socrates">🏛️ Socrates - پرسش‌گری هوشمند</option>
-                                                <option value="truth">⚖️ Truth - واقعیت‌محور</option>
-                                                <option value="meta">🔍 Meta - تحلیل فرآیند</option>
-                                                <option value="predict">🔮 Predict - پیش‌بینی آینده</option>
-                                                <option value="ooda">🔄 OODA Loop - چرخه تصمیم‌گیری</option>
-                                                <option value="eli10">👶 ELI10 - توضیح ساده</option>
-                                                <option value="alt3">🔀 Alt3 - ۳ دیدگاه مختلف</option>
+                                                <option value="human">Human Writer - متن انسانی‌تر</option>
+                                                <option value="redteam">Red Team - تحلیل انتقادی</option>
+                                                <option value="x10think">x10 Think - تفکر عمیق</option>
+                                                <option value="socrates">Socrates - پرسش‌گری هوشمند</option>
+                                                <option value="truth"> Truth - واقعیت‌محور</option>
+                                                <option value="meta">Meta - تحلیل فرآیند</option>
+                                                <option value="predict">Predict - پیش‌بینی آینده</option>
+                                                <option value="ooda">OODA Loop - چرخه تصمیم‌گیری</option>
+                                                <option value="eli10">ELI10 - توضیح ساده</option>
+                                                <option value="alt3">Alt3 - ۳ دیدگاه مختلف</option>
                                             </select>
                                             <button type="button" class="ssp-btn-secondary" onclick="siteAuditResetPromptMode()" title="بازگردانی به پیش‌فرض" style="padding:8px 12px; font-size:0.75rem;">↺</button>
                                         </div>
@@ -4473,13 +4604,13 @@ ob_start();
                                     </div>
                                     <div style="display:flex; gap:10px; flex-wrap:wrap;">
                                         <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') !== 'browser') : ?>
-                                        <button class="ssp-btn-primary" onclick="runSiteAudit()" id="site_audit_btn">
-                                            <span class="ssp-btn-text">🔍 تحلیل کامل سایت</span>
+                                        <button type="button" class="ssp-btn-primary" onclick="runSiteAudit()" id="site_audit_btn">
+                                            <span class="ssp-btn-text">تحلیل کامل سایت</span>
                                             <span class="ssp-btn-spinner"></span>
                                         </button>
                                         <?php endif; ?>
                                         <?php if ((get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api') === 'browser') : ?>
-                                        <button class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="runSiteAuditViaBrowser()" id="site_audit_browser_btn">
+                                        <button type="button" class="ssp-btn-primary" style="background:#10B981; color:white;" onclick="runSiteAuditViaBrowser()" id="site_audit_browser_btn">
                                             <span class="ssp-btn-text">تحلیل با هوش مصنوعی مرورگر</span>
                                             <span class="ssp-btn-spinner"></span>
                                         </button>
@@ -4584,7 +4715,7 @@ ob_start();
                                     <label class="ssp-label">لینک اصلی</label>
                                     <input type="url" id="test_long_url" class="ssp-input" dir="ltr" placeholder="https://example.com/very-long-url">
                                 </div>
-                                <button class="ssp-btn-secondary" onclick="testShortenUrl()" id="test_shorten_btn">کوتاه کردن لینک</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="testShortenUrl()" id="test_shorten_btn">کوتاه کردن لینک</button>
                                 <div id="shorten_result" style="margin-top:12px;"></div>
                             </div>
 
@@ -4610,8 +4741,8 @@ ob_start();
                                                 <td><strong><?php echo $link['clicks'] ?? 0; ?></strong></td>
                                                 <td><?php echo $this->jalali_date_short($link['created_at']); ?></td>
                                                 <td>
-                                                    <button class="ssp-btn-secondary" onclick="copyShortLink('<?php echo esc_js(home_url('/go/' . $code)); ?>')" style="padding:4px 8px; font-size:0.75rem;">کپی</button>
-                                                    <button class="ssp-btn-danger" onclick="deleteShortLink('<?php echo esc_js($code); ?>')" style="padding:4px 8px; font-size:0.75rem;">حذف</button>
+                                                    <button type="button" class="ssp-btn-secondary" onclick="copyShortLink('<?php echo esc_js(home_url('/go/' . $code)); ?>')" style="padding:4px 8px; font-size:0.75rem;">کپی</button>
+                                                    <button type="button" class="ssp-btn-danger" onclick="deleteShortLink('<?php echo esc_js($code); ?>')" style="padding:4px 8px; font-size:0.75rem;">حذف</button>
                                                 </td>
                                             </tr>
                                             <?php endforeach; ?>
@@ -4626,7 +4757,7 @@ ob_start();
                                 <h3>پارامترهای UTM</h3>
                                 <p class="ssp-section-desc" style="margin-bottom:16px;">پارامترهای ردیابی به صورت خودکار به لینک‌ها اضافه شوند.</p>
 
-                                <?php $utm = get_user_meta($user_id, 'ssp_utm_settings', true) ?: []; ?>
+                                <?php $utm = is_array($__tmp = get_user_meta($user_id, 'ssp_utm_settings', true)) ? $__tmp : []; ?>
                                 <form onsubmit="saveUtmSettings(event)">
                                     <div class="ssp-toggle" style="margin-bottom:16px;">
                                         <label>
@@ -4702,11 +4833,11 @@ ob_start();
                                     <tbody>
                                         <?php foreach ($logs as $log) : ?>
                                         <tr class="ssp-log-row" style="cursor:<?php echo $log['status'] === 'error' ? 'pointer' : 'default'; ?>;" onclick="toggleLogDetail(<?php echo (int)$log['id']; ?>)">
-                                            <td><strong><?php echo esc_html($log['platform']); ?></strong></td>
-                                            <td><?php echo esc_html($log['title'] ? mb_substr($log['title'], 0, 40) : mb_substr($log['message'] ?? '', 0, 40)); ?></td>
-                                            <td><?php echo $log['ai_processed'] ? '<span class="ssp-badge info">' . esc_html($log['ai_provider']) . '</span>' : '-'; ?></td>
-                                            <td><?php echo $this->gregorian_to_jalali_str($log['created_at'] ?? 'now'); ?></td>
-                                            <td>
+                                            <td data-label="پلتفرم"><strong><?php echo esc_html($log['platform']); ?></strong></td>
+                                            <td data-label="عنوان"><?php echo esc_html($log['title'] ? mb_substr($log['title'], 0, 40) : mb_substr($log['message'] ?? '', 0, 40)); ?></td>
+                                            <td data-label="AI پردازش"><?php echo $log['ai_processed'] ? '<span class="ssp-badge info">' . esc_html($log['ai_provider']) . '</span>' : '-'; ?></td>
+                                            <td data-label="زمان ثبت"><?php echo $this->gregorian_to_jalali_str($log['created_at'] ?? 'now'); ?></td>
+                                            <td data-label="وضعیت">
                                                 <span class="ssp-badge <?php echo $log['status'] === 'success' ? 'success' : 'error'; ?>">
                                                     <?php echo $log['status'] === 'success' ? 'موفق' : 'خطا'; ?>
                                                 </span>
@@ -4722,8 +4853,33 @@ ob_start();
                                         <tr id="log-detail-<?php echo (int)$log['id']; ?>" style="display:none;">
                                             <td colspan="5" style="padding:0;">
                                                 <div style="padding:12px 16px; background:var(--error-soft); border-top:2px solid var(--error); font-size:0.85rem;">
+                                                    <?php
+                                                    $raw_error = strtolower($log['response']);
+                                                    $error_hint = '';
+                                                    if (strpos($raw_error, 'chat not found') !== false || strpos($raw_error, 'peer not found') !== false) {
+                                                        $error_hint = 'شناسه چت نامعتبر است. بررسی کنید که آیدی کانال/گروه صحیح باشد (و با @ شروع شود) و ربات شما عضو آن باشد.';
+                                                    } elseif (strpos($raw_error, 'kicked') !== false || strpos($raw_error, 'blocked') !== false || strpos($raw_error, 'banned') !== false) {
+                                                        $error_hint = 'ربات از گروه یا کانال اخراج شده است، یا کاربر ربات را بلاک کرده است.';
+                                                    } elseif (strpos($raw_error, 'not enough rights') !== false || strpos($raw_error, 'admin') !== false || strpos($raw_error, 'not admin') !== false) {
+                                                        $error_hint = 'ربات شما دسترسی لازم را ندارد. لطفاً مطمئن شوید ربات مدیر (Admin) کانال یا گروه است.';
+                                                    } elseif (strpos($raw_error, 'curl error 28') !== false || strpos($raw_error, 'timeout') !== false) {
+                                                        $error_hint = 'ارتباط سرور با پیام‌رسان قطع شد. (در هاست‌های ایرانی ممکن است نیاز به پراکسی یا افزونه‌های دور زدن تحریم داشته باشید).';
+                                                    } elseif (strpos($raw_error, 'unauthorized') !== false || strpos($raw_error, 'invalid token') !== false) {
+                                                        $error_hint = 'توکن (Token) ربات شما نامعتبر است. لطفاً توکن را در بخش پیام‌رسان‌ها به‌روزرسانی کنید.';
+                                                    } elseif (strpos($raw_error, 'too long') !== false || strpos($raw_error, 'max length') !== false) {
+                                                        $error_hint = 'متن پیام شما طولانی‌تر از حد مجاز این پیام‌رسان است. لطفاً متن را خلاصه‌تر کنید.';
+                                                    } elseif (strpos($raw_error, 'file identifier') !== false || strpos($raw_error, 'wrong file') !== false || strpos($raw_error, 'media') !== false) {
+                                                        $error_hint = 'فایل رسانه (عکس/ویدیو) پذیرفته نشد. ممکن است حجم آن زیاد باشد یا پیام‌رسان فرمت آن را پشتیبانی نکند.';
+                                                    }
+                                                    ?>
                                                     <div style="font-weight:700; color:var(--error); margin-bottom:6px;">علت خطا:</div>
-                                                    <pre style="white-space:pre-wrap; word-break:break-all; margin:0; font-size:0.8rem; color:var(--text); direction:ltr;"><?php echo esc_html($log['response']); ?></pre>
+                                                    <pre style="white-space:pre-wrap; word-break:break-all; margin:0 0 12px 0; font-size:0.8rem; color:var(--text); direction:ltr; background:var(--bg-main); padding:8px; border-radius:6px;"><?php echo esc_html($log['response']); ?></pre>
+                                                    <?php if ($error_hint) : ?>
+                                                    <div style="margin-bottom:12px; padding:10px 14px; background:var(--warning-soft); border-right:4px solid var(--warning); border-radius:4px; font-size:0.85rem; color:var(--text); line-height:1.6;">
+                                                        <strong>💡 راهنمای عیب‌یابی:</strong><br>
+                                                        <?php echo $error_hint; ?>
+                                                    </div>
+                                                    <?php endif; ?>
                                                     <?php if (!empty($log['message'])) : ?>
                                                     <div style="margin-top:8px; font-weight:600;">متن پیام:</div>
                                                     <pre style="white-space:pre-wrap; word-break:break-all; margin:4px 0 0; font-size:0.8rem; color:var(--text);"><?php echo esc_html(mb_substr($log['message'], 0, 300)); ?></pre>
@@ -4736,9 +4892,9 @@ ob_start();
                                                     <?php endif; ?>
                                                     <div style="margin-top:12px; display:flex; gap:8px; align-items:center;">
                                                         <?php if ($is_old) : ?>
-                                                        <button class="ssp-btn-primary" onclick="retryMessageOld(<?php echo (int)$log['id']; ?>, '<?php echo esc_js($tool_type); ?>', '<?php echo esc_js($log['title'] ?? ''); ?>', '<?php echo esc_js($log['message'] ?? ''); ?>')" style="font-size:0.8rem; padding:6px 16px;">ویرایش و ارسال مجدد</button>
+                                                        <button type="button" class="ssp-btn-primary" onclick="retryMessageOld(<?php echo (int)$log['id']; ?>, '<?php echo esc_js($tool_type); ?>', '<?php echo esc_js($log['title'] ?? ''); ?>', '<?php echo esc_js($log['message'] ?? ''); ?>')" style="font-size:0.8rem; padding:6px 16px;">ویرایش و ارسال مجدد</button>
                                                         <?php else : ?>
-                                                        <button class="ssp-btn-primary" onclick="retryMessage(<?php echo (int)$log['id']; ?>)" style="font-size:0.8rem; padding:6px 16px;">ارسال مجدد</button>
+                                                        <button type="button" class="ssp-btn-primary" onclick="retryMessage(<?php echo (int)$log['id']; ?>)" style="font-size:0.8rem; padding:6px 16px;">ارسال مجدد</button>
                                                         <?php endif; ?>
                                                     </div>
                                                 </div>
@@ -4850,7 +5006,7 @@ ob_start();
                                 <h3>اعلام‌های ایمیلی</h3>
                                 <p class="ssp-section-desc" style="margin-bottom:16px;">از وضعیت ارسال‌ها و اشتراک خود باخبر شوید.</p>
 
-                                <?php $email_settings = get_user_meta($user_id, 'ssp_email_settings', true) ?: []; ?>
+                                <?php $email_settings = is_array($__tmp = get_user_meta($user_id, 'ssp_email_settings', true)) ? $__tmp : []; ?>
                                 <div id="email-settings-msg" style="display:none;margin-bottom:12px;padding:12px 16px;border-radius:10px;font-weight:600;"></div>
                                 <form id="email-settings-form" onsubmit="submitEmailSettings(event)">
                                     <div class="ssp-toggle" style="margin-bottom:16px;">
@@ -4984,7 +5140,7 @@ ob_start();
                 <div class="ssp-modal">
                     <div class="ssp-modal-header">
                         <h3>ويرايش پیام‌رسان</h3>
-                        <button class="ssp-modal-close" onclick="closeModal('modal_edit_messenger')">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_edit_messenger')">&times;</button>
                     </div>
                     <div class="ssp-modal-body">
                         <input type="hidden" id="edit_messenger_id">
@@ -5023,8 +5179,8 @@ ob_start();
                         </div>
                     </div>
                     <div class="ssp-modal-actions">
-                        <button class="ssp-btn-primary" onclick="saveEditMessenger()"><span class="ssp-btn-text">ذخیره تغییرات</span><span class="ssp-btn-spinner"></span></button>
-                        <button class="ssp-btn-secondary" onclick="closeModal('modal_edit_messenger')">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" onclick="saveEditMessenger()"><span class="ssp-btn-text">ذخیره تغییرات</span><span class="ssp-btn-spinner"></span></button>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeModal('modal_edit_messenger')">انصراف</button>
                     </div>
                 </div>
             </div>
@@ -5033,7 +5189,7 @@ ob_start();
                 <div class="ssp-modal">
                     <div class="ssp-modal-header">
                         <h3>ويرايش سایت وردپرسی</h3>
-                        <button class="ssp-modal-close" onclick="closeModal('modal_edit_wpsite')">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_edit_wpsite')">&times;</button>
                     </div>
                     <div class="ssp-modal-body">
                         <input type="hidden" id="edit_wpsite_id">
@@ -5089,8 +5245,72 @@ ob_start();
                         </div>
                     </div>
                     <div class="ssp-modal-actions">
-                        <button class="ssp-btn-primary" onclick="saveEditWpSite()"><span class="ssp-btn-text">ذخیره تغییرات</span><span class="ssp-btn-spinner"></span></button>
-                        <button class="ssp-btn-secondary" onclick="closeModal('modal_edit_wpsite')">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" onclick="saveEditWpSite()"><span class="ssp-btn-text">ذخیره تغییرات</span><span class="ssp-btn-spinner"></span></button>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeModal('modal_edit_wpsite')">انصراف</button>
+                    </div>
+                </div>
+            </div>
+
+            
+            <!-- Bridge AI Modal -->
+            <div class="ssp-modal-overlay" id="modal_ai_bridge">
+                <div class="ssp-modal" style="max-width: 480px;">
+                    <div class="ssp-modal-header" style="border-bottom:none; padding-bottom:0;">
+                        <h3 style="display:flex; align-items:center; justify-content:space-between; width:100%;">
+                            <span style="display:flex; align-items:center; gap:8px;">
+                                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--primary)" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10H12V2Z"/><path d="M12 12 21.1 2.9"/></svg>
+                                ارتباط زنده با چت‌بات (افزونه مرورگر)
+                            </span>
+                            <span id="bridge_timer_badge" style="font-size:0.75rem; font-weight:normal; background:var(--bg-alt); padding:3px 10px; border-radius:12px; border:1px solid var(--border); color:var(--text-muted);">زمان: ۰ ثانیه</span>
+                        </h3>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_ai_bridge'); window._bridgeActive = false;">&times;</button>
+                    </div>
+                    <div class="ssp-modal-body" style="padding-top:10px;">
+                        <div style="background:var(--bg-alt); padding:16px; border-radius:12px; border:1px solid var(--border); margin-bottom:14px;">
+                            <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;" id="bridge_step_1">
+                                <div class="bridge-step-icon" style="width:24px; height:24px; border-radius:50%; background:var(--accent); color:#fff; display:flex; align-items:center; justify-content:center; font-size:12px;">1</div>
+                                <div style="font-weight:600; color:var(--text);" id="bridge_step_1_text">مرحله ۱: ارسال پرامپت هوشمند به تب چت‌بات</div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;" id="bridge_step_2">
+                                <div class="bridge-step-icon" style="width:24px; height:24px; border-radius:50%; border:2px solid var(--border); color:var(--text-muted); display:flex; align-items:center; justify-content:center; font-size:12px;">2</div>
+                                <div style="font-weight:600; color:var(--text-muted);" id="bridge_step_2_text">مرحله ۲: در حال پردازش و استخراج پاسخ توسط هوش مصنوعی</div>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:12px;" id="bridge_step_3">
+                                <div class="bridge-step-icon" style="width:24px; height:24px; border-radius:50%; border:2px solid var(--border); color:var(--text-muted); display:flex; align-items:center; justify-content:center; font-size:12px;">3</div>
+                                <div style="font-weight:600; color:var(--text-muted);" id="bridge_step_3_text">مرحله ۳: تجزیه JSON و پر کردن خودکار فرم ابزار</div>
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom:14px;">
+                            <div style="height:6px; background:var(--bg-alt); border-radius:3px; overflow:hidden;">
+                                <div id="bridge_progress_bar" style="height:100%; width:20%; background:var(--accent); transition:width 0.3s ease;"></div>
+                            </div>
+                        </div>
+
+                        <div id="bridge_error_box" style="display:none; background:var(--error-soft); color:var(--error); padding:12px; border-radius:8px; font-size:0.85rem; margin-bottom:14px; border:1px solid var(--error);">
+                            <!-- Error message here -->
+                        </div>
+
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                            <button type="button" class="ssp-btn-secondary" style="font-size:0.75rem; padding:4px 10px;" onclick="let lw = document.getElementById('bridge_log_wrap'); lw.style.display = (lw.style.display === 'none' ? 'block' : 'none');">
+                                📊 کنسول عیب‌یابی و لاگ زنده
+                            </button>
+                            <button type="button" class="ssp-btn-secondary" style="font-size:0.75rem; padding:4px 10px;" onclick="if(window.openChatbotTab) window.openChatbotTab();">
+                                🔗 باز کردن تب چت‌بات
+                            </button>
+                        </div>
+
+                        <div id="bridge_log_wrap" style="display:none; background:#0f172a; color:#38bdf8; font-family:monospace; font-size:0.72rem; padding:10px; border-radius:8px; max-height:130px; overflow-y:auto; border:1px solid #334155; margin-bottom:12px;" dir="ltr">
+                            <div id="bridge_log_content">Waiting for bridge activity...</div>
+                        </div>
+
+                        <div style="font-size:0.78rem; color:var(--text-muted); line-height:1.6; background:rgba(0,0,0,0.02); padding:8px 12px; border-radius:8px;">
+                            💡 <strong>راهنما:</strong> مطمئن شوید افزونه <strong>ScriptCat</strong> یا <strong>Tampermonkey</strong> در مرورگر فعال است و آخرین نسخه اسکریپت (نسخه ۴.۵.۰) نصب شده باشد.
+                        </div>
+                    </div>
+                    <div class="ssp-modal-actions" style="border-top:1px solid var(--border); padding-top:14px; margin-top:14px; display:flex; justify-content:flex-end; gap:8px;">
+                        <button type="button" class="ssp-btn-secondary" onclick="closeModal('modal_ai_bridge'); window._bridgeActive = false;">بستن پنجره</button>
+                        <button type="button" class="ssp-btn-primary" id="bridge_retry_btn" onclick="retryBridgeTask()" style="display:none;">تلاش مجدد و ارسال دوباره</button>
                     </div>
                 </div>
             </div>
@@ -5100,17 +5320,17 @@ ob_start();
                 <div class="ssp-modal" style="max-width:700px; max-height:80vh;">
                     <div class="ssp-modal-header">
                         <h3>پیش‌نمایش محتوای دریافتی</h3>
-                        <button class="ssp-modal-close" onclick="closeModal('modal_rss_preview')">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_rss_preview')">&times;</button>
                     </div>
                     <div class="ssp-modal-body" style="overflow-y:auto; max-height:60vh;">
                         <div id="rss_preview_items"></div>
                     </div>
                     <div class="ssp-modal-actions" style="display:flex; gap:8px; flex-wrap:wrap;">
-                        <button class="ssp-btn-primary" onclick="rssSendSelected()">ارسال انتخاب شده‌ها</button>
-                        <button class="ssp-btn-secondary" onclick="rssSaveDrafts()">ذخیره به عنوان پیش‌نویس</button>
-                        <button class="ssp-btn-secondary" onclick="rssScheduleItems()">زمان‌بندی ارسال</button>
-                        <button class="ssp-btn-test" onclick="rssAiProcessSelected()">✨ AI</button>
-                        <button class="ssp-btn-secondary" onclick="closeModal('modal_rss_preview')">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" onclick="rssSendSelected()">ارسال انتخاب شده‌ها</button>
+                        <button type="button" class="ssp-btn-secondary" onclick="rssSaveDrafts()">ذخیره به عنوان پیش‌نویس</button>
+                        <button type="button" class="ssp-btn-secondary" onclick="rssScheduleItems()">زمان‌بندی ارسال</button>
+                        <button type="button" class="ssp-btn-test" onclick="rssAiProcessSelected()">AI</button>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeModal('modal_rss_preview')">انصراف</button>
                     </div>
                 </div>
             </div>
@@ -5119,7 +5339,7 @@ ob_start();
                 <div class="ssp-modal">
                     <div class="ssp-modal-header">
                         <h3>ويرايش RSS Feed</h3>
-                        <button class="ssp-modal-close" onclick="closeModal('modal_edit_rss')">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_edit_rss')">&times;</button>
                     </div>
                     <div class="ssp-modal-body">
                         <input type="hidden" id="edit_rss_id">
@@ -5185,11 +5405,20 @@ ob_start();
                                     </select>
                                 </div>
                             </div>
+                            <div class="ssp-form-group" style="margin-top:12px;">
+                                <label class="ssp-label">قالب پیام سفارشی (اختیاری)</label>
+                                <textarea id="edit_rss_message_template" class="ssp-textarea" rows="3" placeholder="{title}
+
+{content}
+
+منبع: {url}"></textarea>
+                                <small class="ssp-hint">متغیرها: {title}, {content}, {url}, {excerpt}</small>
+                            </div>
                         </div>
                     </div>
                     <div class="ssp-modal-actions">
-                        <button class="ssp-btn-primary" onclick="saveEditRssFeed()"><span class="ssp-btn-text">ذخیره تغییرات</span><span class="ssp-btn-spinner"></span></button>
-                        <button class="ssp-btn-secondary" onclick="closeModal('modal_edit_rss')">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" onclick="saveEditRssFeed()"><span class="ssp-btn-text">ذخیره تغییرات</span><span class="ssp-btn-spinner"></span></button>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeModal('modal_edit_rss')">انصراف</button>
                     </div>
                 </div>
             </div>
@@ -5199,18 +5428,18 @@ ob_start();
                 <div class="ssp-modal" style="max-width:600px;">
                     <div class="ssp-modal-header">
                         <h3>خوش آمدید! راهنمای شروع سریع</h3>
-                        <button class="ssp-modal-close" onclick="skipOnboarding()">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="skipOnboarding()">&times;</button>
                     </div>
                     <div class="ssp-modal-body">
                         <div class="ob-step active" id="ob-step-1">
                             <div style="text-align:center; margin-bottom:20px;">
-                                <div style="font-size:3rem;">💬</div>
+                                <div style="font-size:3rem;"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
                                 <h3 style="color:var(--text);">مرحله ۱: اتصال پیام‌رسان</h3>
                                 <p style="color:var(--text-muted);">یک پیام‌رسان (تلگرام، بله و...) متصل کنید تا محتوا ارسال شود.</p>
                             </div>
                             <div style="text-align:center;">
-                                <button class="ssp-btn-primary" onclick="skipOnboardingStep(1)">اتصال پیام‌رسان</button>
-                                <button class="ssp-btn-secondary" onclick="skipOnboardingStep(1, true)" style="margin-top:8px;">رد شدن</button>
+                                <button type="button" class="ssp-btn-primary" onclick="skipOnboardingStep(1)">اتصال پیام‌رسان</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="skipOnboardingStep(1, true)" style="margin-top:8px;">رد شدن</button>
                             </div>
                         </div>
                         <div class="ob-step" id="ob-step-2" style="display:none;">
@@ -5220,19 +5449,19 @@ ob_start();
                                 <p style="color:var(--text-muted);">API Key هوش مصنوعی را وارد کنید یا حالت مرورگر را فعال کنید تا محتوا به صورت خودکار تولید شود.</p>
                             </div>
                             <div style="text-align:center;">
-                                <button class="ssp-btn-primary" onclick="skipOnboardingStep(2)">تنظیم AI</button>
-                                <button class="ssp-btn-secondary" onclick="skipOnboardingStep(2, true)" style="margin-top:8px;">رد شدن</button>
+                                <button type="button" class="ssp-btn-primary" onclick="skipOnboardingStep(2)">تنظیم AI</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="skipOnboardingStep(2, true)" style="margin-top:8px;">رد شدن</button>
                             </div>
                         </div>
                         <div class="ob-step" id="ob-step-3" style="display:none;">
                             <div style="text-align:center; margin-bottom:20px;">
-                                <div style="font-size:3rem;">🚀</div>
+                                <div style="font-size:3rem;"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2l.5-.5c2.14-2.14 2.14-5.61 0-7.75l-1.5-1.5c-2.14-2.14-5.61-2.14-7.75 0l-.5.5z"/><path d="M12 15l2 2"/><path d="M15 12l2 2"/></svg></div>
                                 <h3 style="color:var(--text);">مرحله ۳: اولین ارسال</h3>
                                 <p style="color:var(--text-muted);">اولین پیام خود را ارسال کنید!</p>
                             </div>
                             <div style="text-align:center;">
-                                <button class="ssp-btn-primary" onclick="skipOnboardingStep(3)">ارسال دستی</button>
-                                <button class="ssp-btn-secondary" onclick="skipOnboarding()" style="margin-top:8px;">رد شدن</button>
+                                <button type="button" class="ssp-btn-primary" onclick="skipOnboardingStep(3)">ارسال دستی</button>
+                                <button type="button" class="ssp-btn-secondary" onclick="skipOnboarding()" style="margin-top:8px;">رد شدن</button>
                             </div>
                         </div>
                         <div class="ssp-step-indicator" style="margin-top:20px;">
@@ -5251,7 +5480,7 @@ ob_start();
                 <div class="ssp-modal" style="max-width:500px;">
                     <div class="ssp-modal-header">
                         <h3>مدیریت پروفایل‌ها</h3>
-                        <button class="ssp-modal-close" onclick="closeModal('modal_profiles')">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_profiles')">&times;</button>
                     </div>
                     <div class="ssp-modal-body">
                         <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:16px;">هر پروفایل یک کسب و کار مستقل است. پیام‌رسان‌ها، سایت‌ها و زمان‌بندی‌ها بر اساس پروفایل فیلتر می‌شوند.</p>
@@ -5263,9 +5492,9 @@ ob_start();
                                     <strong style="font-size:0.9rem; color:var(--text);"><?php echo esc_html($p['name']); ?></strong>
                                     <?php if (!empty($p['is_active'])) : ?><span class="ssp-badge success" style="font-size:0.7rem; margin-right:6px;">فعال</span><?php endif; ?>
                                 </div>
-                                <button class="ssp-btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="document.getElementById('profile_name').value='<?php echo esc_attr($p['name']); ?>';document.getElementById('profile_color').value='<?php echo esc_attr($p['color'] ?? '#4F46E5'); ?>';document.getElementById('profile_edit_id').value='<?php echo (int)$p['id']; ?>';">ویرایش</button>
+                                <button type="button" class="ssp-btn-secondary" style="padding:4px 10px; font-size:0.75rem;" onclick="document.getElementById('profile_name').value='<?php echo esc_attr($p['name']); ?>';document.getElementById('profile_color').value='<?php echo esc_attr($p['color'] ?? '#4F46E5'); ?>';document.getElementById('profile_edit_id').value='<?php echo (int)$p['id']; ?>';">ویرایش</button>
                                 <?php if ((int)$p['id'] !== 1) : ?>
-                                <button class="ssp-btn-danger" style="padding:4px 10px; font-size:0.75rem;" onclick="deleteProfile(<?php echo (int)$p['id']; ?>)">حذف</button>
+                                <button type="button" class="ssp-btn-danger" style="padding:4px 10px; font-size:0.75rem;" onclick="deleteProfile(<?php echo (int)$p['id']; ?>)">حذف</button>
                                 <?php endif; ?>
                             </div>
                             <?php endforeach; ?>
@@ -5276,7 +5505,7 @@ ob_start();
                             <div style="display:flex; gap:8px; align-items:center;">
                                 <input type="text" id="profile_name" class="ssp-input" placeholder="نام کسب و کار" style="flex:1;">
                                 <input type="color" id="profile_color" value="#4F46E5" style="width:40px; height:38px; border:none; border-radius:8px; cursor:pointer;">
-                                <button class="ssp-btn-primary" onclick="saveProfile()">ذخیره</button>
+                                <button type="button" class="ssp-btn-primary" onclick="saveProfile()">ذخیره</button>
                             </div>
                         </div>
                     </div>
@@ -5288,7 +5517,7 @@ ob_start();
                 <div class="ssp-modal" style="max-width:700px;">
                     <div class="ssp-modal-header">
                         <h3>پرامپت‌ساز هوشمند</h3>
-                        <button class="ssp-modal-close" onclick="closeModal('modal_prompt_builder')">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeModal('modal_prompt_builder')">&times;</button>
                     </div>
                     <div class="ssp-modal-body" style="max-height:70vh; overflow-y:auto;">
                         <p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:16px;">قالب پرامپت سفارشی بسازید. با پر کردن فیلدهای زیر، پرامپت به صورت خودکار ساخته شده و خروجی JSON استاندارد برمی‌گرداند.</p>
@@ -5357,9 +5586,9 @@ ob_start();
                             </label>
                         </div>
                         <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                            <button class="ssp-btn-primary" onclick="savePromptTemplate()">ذخیره قالب</button>
-                            <button class="ssp-btn-secondary" onclick="previewPromptTemplate()">پیش‌نمایش پرامپت</button>
-                            <button class="ssp-btn-secondary" onclick="closeModal('modal_prompt_builder')">بستن</button>
+                            <button type="button" class="ssp-btn-primary" onclick="savePromptTemplate()">ذخیره قالب</button>
+                            <button type="button" class="ssp-btn-secondary" onclick="previewPromptTemplate()">پیش‌نمایش پرامپت</button>
+                            <button type="button" class="ssp-btn-secondary" onclick="closeModal('modal_prompt_builder')">بستن</button>
                         </div>
                         <div id="pb_preview" style="display:none; margin-top:16px; padding:12px; background:var(--bg-alt); border:1px solid var(--border); border-radius:8px; white-space:pre-wrap; font-size:0.8rem; max-height:300px; overflow-y:auto;"></div>
                         <div style="margin-top:20px; border-top:1px solid var(--border); padding-top:16px;">
@@ -5375,7 +5604,7 @@ ob_start();
                 <div class="ssp-modal" style="max-width:560px;">
                     <div class="ssp-modal-header">
                         <h3 id="tpl_modal_title">قالب جدید</h3>
-                        <button class="ssp-modal-close" onclick="closeTemplateModal()">&times;</button>
+                        <button type="button" class="ssp-modal-close" onclick="closeTemplateModal()">&times;</button>
                     </div>
                     <div class="ssp-modal-body">
                         <input type="hidden" id="tpl_edit_id" value="">
@@ -5396,7 +5625,7 @@ ob_start();
                         </div>
                         <div class="ssp-form-group">
                             <label class="ssp-label">محتوای قالب *</label>
-                            <textarea id="tpl_edit_content" rows="5" class="ssp-textarea" placeholder="متن قالب را اینجا بنویسید...&#10;&#10;مثال:&#10;[آیکون] {title}&#10;&#10;{message}&#10;&#10;🔗 {link}&#10;&#10;{hashtags}&#10;&#10;{signature}"></textarea>
+                            <textarea id="tpl_edit_content" rows="5" class="ssp-textarea" placeholder="متن قالب را اینجا بنویسید...&#10;&#10;مثال:&#10; {title}&#10;&#10;{message}&#10;&#10;{link}&#10;&#10;{hashtags}&#10;&#10;{signature}"></textarea>
                             <p class="ssp-hint">متغیرها: <code>{title}</code> <code>{message}</code> <code>{link}</code> <code>{hashtags}</code> <code>{signature}</code></p>
                         </div>
                         <div class="ssp-grid-2">
@@ -5412,12 +5641,162 @@ ob_start();
                             </div>
                         </div>
                         <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:20px; padding-top:16px; border-top:1px solid var(--border);">
-                            <button class="ssp-btn-secondary" onclick="closeTemplateModal()">انصراف</button>
-                            <button class="ssp-btn-primary" onclick="saveTemplateFromModal()" id="tpl_modal_save_btn">
+                            <button type="button" class="ssp-btn-secondary" onclick="closeTemplateModal()">انصراف</button>
+                            <button type="button" class="ssp-btn-primary" onclick="saveTemplateFromModal()" id="tpl_modal_save_btn">
                                 <span class="ssp-btn-text">ذخیره قالب</span>
                                 <span class="ssp-btn-spinner"></span>
                             </button>
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============ CALENDAR DAY DETAIL MODAL ============ -->
+            <div class="ssp-modal-overlay" id="modal_calendar_day" style="display:none;" onclick="if(event.target===this)closeCalendarDayModal();">
+                <div class="ssp-modal-box" style="max-width:600px; width:95%; max-height:85vh; display:flex; flex-direction:column; overflow:hidden;">
+                    <div class="ssp-modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border);">
+                        <h3 id="cal_day_modal_title" style="margin:0; font-size:1.05rem; font-weight:700; color:var(--text);">برنامه‌های روز</h3>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeCalendarDayModal()" style="padding:4px 8px; font-size:1.1rem; line-height:1; border-radius:6px;">&times;</button>
+                    </div>
+                    <div class="ssp-modal-body" style="padding:20px; overflow-y:auto; flex:1;">
+                        <div id="cal_day_modal_list">
+                            <!-- Populated via JS -->
+                        </div>
+                    </div>
+                    <div class="ssp-modal-footer" style="padding:14px 20px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; background:var(--bg-alt);">
+                        <button type="button" class="ssp-btn-secondary" onclick="closeCalendarDayModal()">بستن</button>
+                        <button type="button" class="ssp-btn-primary" id="cal_day_add_btn">
+                            <span>+ افزودن زمان‌بندی جدید برای این روز</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============ EDIT SCHEDULE MODAL ============ -->
+            <div class="ssp-modal-overlay" id="modal_edit_schedule" style="display:none;" onclick="if(event.target===this)closeEditScheduleModal();">
+                <div class="ssp-modal-box" style="max-width:540px; width:95%; max-height:90vh; overflow-y:auto;">
+                    <div class="ssp-modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border);">
+                        <h3 style="margin:0; font-size:1.05rem; font-weight:700; color:var(--text);">✏️ ویرایش زمان‌بندی ارسال</h3>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeEditScheduleModal()" style="padding:4px 8px; font-size:1.1rem; line-height:1; border-radius:6px;">&times;</button>
+                    </div>
+                    <div class="ssp-modal-body" style="padding:20px;">
+                        <input type="hidden" id="editsch_id">
+                        
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">عنوان زمان‌بندی *</label>
+                            <input type="text" id="editsch_title" class="ssp-input" placeholder="عنوان پیام یا پست">
+                        </div>
+
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">متن محتوا</label>
+                            <textarea id="editsch_message" rows="5" class="ssp-textarea" placeholder="متن پیام زمان‌بندی شده..."></textarea>
+                        </div>
+
+                        <div class="ssp-grid-2" style="margin-bottom:16px;">
+                            <div class="ssp-form-group">
+                                <label class="ssp-label">تاریخ و ساعت ارسال (شمسی) *</label>
+                                <input type="text" id="editsch_datetime_display" class="ssp-input" readonly placeholder="انتخاب تاریخ و ساعت" style="cursor:pointer;" onclick="editschOpenJalaliPicker()">
+                                <input type="hidden" id="editsch_datetime">
+                                <div id="editsch_jalali_picker" style="display:none; margin-top:8px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px;"></div>
+                            </div>
+                            <div class="ssp-form-group">
+                                <label class="ssp-label">تکرار خودکار</label>
+                                <select id="editsch_recurring" class="ssp-select">
+                                    <option value="">بدون تکرار (یکباره)</option>
+                                    <option value="daily">روزانه</option>
+                                    <option value="weekly">هفتگی</option>
+                                    <option value="monthly">ماهانه</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">وضعیت زمان‌بندی</label>
+                            <select id="editsch_status" class="ssp-select">
+                                <option value="pending">در انتظار ارسال (فعال)</option>
+                                <option value="completed">انجام شده (ارسال موفق)</option>
+                                <option value="cancelled">لغو شده</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="ssp-modal-footer" style="padding:14px 20px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:10px; background:var(--bg-alt);">
+                        <button type="button" class="ssp-btn-secondary" onclick="closeEditScheduleModal()">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" id="editsch_save_btn" onclick="saveScheduleEdit()">
+                            <span class="ssp-btn-text">ذخیره تغییرات</span>
+                            <span class="ssp-btn-spinner"></span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============ EDIT DRAFT MODAL ============ -->
+            <div class="ssp-modal-overlay" id="modal_edit_draft" style="display:none;" onclick="if(event.target===this)closeEditDraftModal();">
+                <div class="ssp-modal-box" style="max-width:540px; width:95%; max-height:90vh; overflow-y:auto;">
+                    <div class="ssp-modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border);">
+                        <h3 style="margin:0; font-size:1.05rem; font-weight:700; color:var(--text);">✏️ ویرایش پیش‌نویس</h3>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeEditDraftModal()" style="padding:4px 8px; font-size:1.1rem; line-height:1; border-radius:6px;">&times;</button>
+                    </div>
+                    <div class="ssp-modal-body" style="padding:20px;">
+                        <input type="hidden" id="editdraft_id">
+                        
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">عنوان پیش‌نویس</label>
+                            <input type="text" id="editdraft_title" class="ssp-input" placeholder="عنوان پیش‌نویس...">
+                        </div>
+
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">محتوای پیش‌نویس *</label>
+                            <textarea id="editdraft_content" rows="7" class="ssp-textarea" placeholder="متن پیام یا پست..."></textarea>
+                        </div>
+                    </div>
+                    <div class="ssp-modal-footer" style="padding:14px 20px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:10px; background:var(--bg-alt);">
+                        <button type="button" class="ssp-btn-secondary" onclick="closeEditDraftModal()">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" id="editdraft_save_btn" onclick="saveDraftEdit()">
+                            <span class="ssp-btn-text">ذخیره پیش‌نویس</span>
+                            <span class="ssp-btn-spinner"></span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ============ SCHEDULE DRAFT MODAL ============ -->
+            <div class="ssp-modal-overlay" id="modal_schedule_draft" style="display:none;" onclick="if(event.target===this)closeScheduleDraftModal();">
+                <div class="ssp-modal-box" style="max-width:520px; width:95%; max-height:90vh; overflow-y:auto;">
+                    <div class="ssp-modal-header" style="display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--border);">
+                        <h3 style="margin:0; font-size:1.05rem; font-weight:700; color:var(--text);">📅 زمان‌بندی ارسال پیش‌نویس</h3>
+                        <button type="button" class="ssp-btn-secondary" onclick="closeScheduleDraftModal()" style="padding:4px 8px; font-size:1.1rem; line-height:1; border-radius:6px;">&times;</button>
+                    </div>
+                    <div class="ssp-modal-body" style="padding:20px;">
+                        <input type="hidden" id="schdraft_id">
+                        
+                        <div style="background:var(--bg-alt); padding:12px 14px; border-radius:10px; border:1px solid var(--border); margin-bottom:16px;">
+                            <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:4px;">پیش‌نویس انتخابی:</div>
+                            <div id="schdraft_title_display" style="font-weight:700; color:var(--text);"></div>
+                        </div>
+
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">تاریخ و ساعت ارسال (شمسی) *</label>
+                            <input type="text" id="schdraft_datetime_display" class="ssp-input" readonly placeholder="انتخاب تاریخ و ساعت" style="cursor:pointer;" onclick="schdraftOpenJalaliPicker()">
+                            <input type="hidden" id="schdraft_datetime">
+                            <div id="schdraft_jalali_picker" style="display:none; margin-top:8px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px;"></div>
+                        </div>
+
+                        <div class="ssp-form-group" style="margin-bottom:16px;">
+                            <label class="ssp-label">تکرار خودکار</label>
+                            <select id="schdraft_recurring" class="ssp-select">
+                                <option value="">بدون تکرار (یکباره)</option>
+                                <option value="daily">روزانه</option>
+                                <option value="weekly">هفتگی</option>
+                                <option value="monthly">ماهانه</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="ssp-modal-footer" style="padding:14px 20px; border-top:1px solid var(--border); display:flex; justify-content:flex-end; gap:10px; background:var(--bg-alt);">
+                        <button type="button" class="ssp-btn-secondary" onclick="closeScheduleDraftModal()">انصراف</button>
+                        <button type="button" class="ssp-btn-primary" id="schdraft_confirm_btn" onclick="confirmScheduleDraft()">
+                            <span class="ssp-btn-text">ثبت در تقویم محتوا</span>
+                            <span class="ssp-btn-spinner"></span>
+                        </button>
                     </div>
                 </div>
             </div>
@@ -5552,24 +5931,34 @@ ob_start();
         </button>
 
         <script>
-        (function() {
-            var ajaxurl = '<?php echo admin_url('admin-ajax.php'); ?>';
-            var nonce = '<?php echo $nonce; ?>';
-            var userPlan = '<?php echo $plan; ?>';
-            var sspSiteUrl = '<?php echo esc_url(home_url()); ?>';
-            var isImpersonating = <?php echo $is_impersonating ? 'true' : 'false'; ?>;
+        window.ajaxurl = '<?php echo admin_url('admin-ajax.php'); ?>';
+        window.nonce = '<?php echo $nonce; ?>';
+        window.userPlan = '<?php echo $plan; ?>';
+        window.sspSiteUrl = '<?php echo esc_url(home_url()); ?>';
+        window.isImpersonating = <?php echo $is_impersonating ? 'true' : 'false'; ?>;
+        var ajaxurl = window.ajaxurl;
+        var nonce = window.nonce;
+        var userPlan = window.userPlan;
+        var sspSiteUrl = window.sspSiteUrl;
+        var isImpersonating = window.isImpersonating;
 
+        (function() {
             // Helper to add impersonate param to FormData (global for all IIFEs)
             window.addImpersonate = function(fd) {
                 if (isImpersonating) fd.append('impersonate', '1');
             };
 
             // Store entity data in JS (no raw tokens in HTML attributes)
-            var messengerData = <?php echo $messenger_json; ?>;
-            var wpSiteData = <?php echo $wp_sites_json; ?>;
-            var rssFeedData = <?php echo $rss_feeds_json; ?>;
-            var profileData = <?php echo json_encode($profiles); ?>;
-            var activeProfileId = <?php echo (int)$active_profile_id; ?>;
+            window.messengerData = messengerData = <?php echo $messenger_json; ?>;
+            window.wpSiteData = wpSiteData = <?php echo $wp_sites_json; ?>;
+            window.rssFeedData = rssFeedData = <?php echo $rss_feeds_json; ?>;
+            window.profileData = profileData = <?php echo json_encode($profiles); ?>;
+            window.schedulesData = schedulesData = <?php echo json_encode($schedules); ?>;
+            window.draftsData = draftsData = <?php echo json_encode($drafts); ?>;
+            window.distributionsData = distributionsData = <?php echo json_encode($distributions ?? []); ?>;
+            window.templatesData = templatesData = <?php echo json_encode($template_items); ?>;
+            window.logsData = logsData = <?php echo json_encode($user_logs); ?>;
+            window.activeProfileId = activeProfileId = <?php echo (int)$active_profile_id; ?>;
             window._defaultTemplateId = <?php echo (int) get_user_meta($user_id, 'ssp_default_template_id', true); ?>;
 
             // Profile switching
@@ -5625,61 +6014,6 @@ ob_start();
                     })
                     .catch(function() { showToast('خطا در اتصال', 'error'); });
             };
-
-            // ===== Particles Background =====
-            (function() {
-                var canvas = document.getElementById('sspParticles');
-                if (!canvas || window.innerWidth < 768) return;
-                var ctx = canvas.getContext('2d');
-                var particles = [];
-                var particleCount = 40;
-
-                function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
-                resize();
-                window.addEventListener('resize', resize);
-
-                function getParticleColor() {
-                    return document.documentElement.classList.contains('ssp-theme-dark') ? '56, 189, 248' : '79, 70, 229';
-                }
-
-                function Particle() {
-                    this.x = Math.random() * canvas.width;
-                    this.y = Math.random() * canvas.height;
-                    this.vx = (Math.random() - 0.5) * 0.4;
-                    this.vy = (Math.random() - 0.5) * 0.4;
-                    this.radius = Math.random() * 2 + 1;
-                }
-
-                for (var i = 0; i < particleCount; i++) particles.push(new Particle());
-
-                function animate() {
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    var color = getParticleColor();
-                    particles.forEach(function(p, i) {
-                        p.x += p.vx; p.y += p.vy;
-                        if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
-                        if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
-                        ctx.beginPath();
-                        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-                        ctx.fillStyle = 'rgba(' + color + ', 0.6)';
-                        ctx.fill();
-                        for (var j = i + 1; j < particles.length; j++) {
-                            var p2 = particles[j];
-                            var dist = Math.sqrt(Math.pow(p.x - p2.x, 2) + Math.pow(p.y - p2.y, 2));
-                            if (dist < 120) {
-                                ctx.beginPath();
-                                ctx.moveTo(p.x, p.y);
-                                ctx.lineTo(p2.x, p2.y);
-                                ctx.strokeStyle = 'rgba(' + color + ', ' + (0.15 * (1 - dist/120)) + ')';
-                                ctx.lineWidth = 0.5;
-                                ctx.stroke();
-                            }
-                        }
-                    });
-                    requestAnimationFrame(animate);
-                }
-                animate();
-            })();
 
             // ===== Theme Toggle =====
             window.toggleTheme = function() {
@@ -5745,13 +6079,15 @@ ob_start();
                 var target = document.getElementById('tab-' + tabId);
                 if (target) target.classList.add('active');
                 localStorage.setItem('ssp_active_tab', tabId);
-                window.scrollTo({top: 0, behavior: 'smooth'});
+                window.scrollTo(0, 0);
 
                 // Load data for specific tabs
                 if (tabId === 'drafts' && typeof loadDrafts === 'function') loadDrafts();
                 else if (tabId === 'calendar' && typeof loadCalendar === 'function') loadCalendar();
+                else if (tabId === 'schedules' && typeof updateSchedulesTabList === 'function') updateSchedulesTabList();
                 else if (tabId === 'template' && typeof loadTemplates === 'function') loadTemplates();
                 else if (tabId === 'manual' && typeof loadManualTemplateSelect === 'function') loadManualTemplateSelect();
+                else if (tabId === 'distribution' && typeof loadDistributions === 'function') loadDistributions();
 
                 // Pick up retry data from localStorage
                 if (tabId === 'manual') {
@@ -5816,7 +6152,6 @@ ob_start();
                     '</div></div>' +
                     '<span id="messenger_status_' + m.id + '" class="ssp-connection-status"></span></div>';
             }
-
             function createWpSiteCard(s) {
                 return '<div class="ssp-item-card ssp-card-enter" data-id="' + s.id + '">' +
                     '<div class="ssp-item-card-head"><div>' +
@@ -5831,10 +6166,9 @@ ob_start();
                     '</div></div>' +
                     '<span id="wp_site_status_' + s.id + '" class="ssp-connection-status"></span></div>';
             }
-
             function createRssFeedCard(f) {
                 var lastFetched = f.last_fetched ? '<div class="ssp-item-card-meta" style="margin-top:4px;"><span style="color:var(--success);">\u0622\u062E\u0631\u06CC\u0646 \u062F\u0631\u06CC\u0627\u0641\u062A: ' + formatJalaliDateTime(f.last_fetched) + '</span>' + (f.fetched_count ? ' \u2022 ' + f.fetched_count + ' \u0622\u06CC\u062A\u0645' : '') + '</div>' : '';
-                var extractBadge = f.extract_content ? ' <span class="ssp-badge success" style="background:var(--success);color:#fff;">📄 استخراج کامل</span>' : '';
+                var extractBadge = f.extract_content ? ' <span class="ssp-badge success" style="background:var(--success);color:#fff;">استخراج کامل</span>' : '';
                 return '<div class="ssp-item-card ssp-card-enter" data-id="' + f.id + '">' +
                     '<div class="ssp-item-card-head"><div>' +
                     '<div class="ssp-item-card-title">\uD83D\uDCE1 ' + escapeHtml(f.feed_name) +
@@ -5844,12 +6178,11 @@ ob_start();
                     lastFetched +
                     '</div><div style="display:flex; gap:6px; flex-wrap:wrap;">' +
                     '<button class="ssp-btn-test btn-fetch-rss" data-id="' + f.id + '">\u062F\u0631\u06CC\u0627\u0641\u062A \u0641\u0648\u0631\u06CC</button>' +
-                    '<button class="ssp-btn-primary btn-fetch-extract" data-id="' + f.id + '" style="font-size:0.75rem; padding:4px 10px;">⬇ استخراج کامل</button>' +
+                    '<button class="ssp-btn-primary btn-fetch-extract" data-id="' + f.id + '" style="font-size:0.75rem; padding:4px 10px;">استخراج کامل</button>' +
                     '<button class="ssp-btn-secondary btn-edit-rss" data-id="' + f.id + '">\u0648\u06CC\u0631\u0627\u06CC\u0634</button>' +
                     '<button class="ssp-btn-danger btn-delete-rss" data-id="' + f.id + '">\u062D\u0630\u0641</button>' +
                     '</div></div></div>';
             }
-
             function createScheduleCard(s) {
                 var statusClass = s.status === 'pending' ? 'info' : 'success';
                 var statusIcon = s.status === 'pending' ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
@@ -5865,32 +6198,29 @@ ob_start();
                     '<div class="ssp-item-card-title">' + statusIcon + ' ' + escapeHtml(s.title) +
                     ' <span class="ssp-badge ' + statusClass + '">' + statusText + '</span>' +
                     (s.recurring ? ' <span class="ssp-badge pro">' + (recLabels[s.recurring] || s.recurring) + '</span>' : '') + '</div>' +
-                    '<div class="ssp-item-card-meta" style="margin-top:4px;">☰ ' + escapeHtml(jalaliDt) + '</div>' +
+                    '<div class="ssp-item-card-meta" style="margin-top:4px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg> ' + escapeHtml(jalaliDt) + '</div>' +
                     (msgPreview ? '<div class="ssp-item-card-meta" style="margin-top:4px; font-size:0.8rem;">' + escapeHtml(msgPreview) + '...</div>' : '') +
                     '</div><div style="display:flex; gap:6px; align-items:start;">' +
                     '<button class="ssp-btn-danger btn-delete-schedule" data-id="' + s.id + '">حذف</button>' +
                     '</div></div></div>';
             }
-
             // ===== SPA Helpers =====
             function removeEmptyState(listId) {
                 var el = document.querySelector('#' + listId + ' .ssp-empty');
                 if (el) el.remove();
             }
-            function showEmptyState(listId, icon, text, subtext) {
+            function showEmptyState(listId, icon, text, subtext, actionBtnHtml = '') {
                 var list = document.getElementById(listId);
                 if (list && list.children.length === 0) {
-                    list.innerHTML = '<div class="ssp-empty"><div class="ssp-empty-icon">' + icon + '</div><p>' + text + '</p>' + (subtext ? '<p style="font-size:0.85rem;">' + subtext + '</p>' : '') + '</div>';
+                    list.innerHTML = '<div class="ssp-empty"><div class="ssp-empty-icon" style="font-size:3.5rem; color:var(--text-subtle); margin-bottom:16px;">' + icon + '</div><h4 style="margin:0 0 8px; font-size:1.1rem; color:var(--text);">' + text + '</h4>' + (subtext ? '<p style="font-size:0.9rem; color:var(--text-muted); max-width:400px; margin:0 auto 20px;">' + subtext + '</p>' : '') + (actionBtnHtml ? '<div>'+actionBtnHtml+'</div>' : '') + '</div>';
                 }
             }
-
             function showSaved(id) {
                 var el = document.getElementById(id);
                 if (!el) return;
                 el.classList.add('show');
                 setTimeout(function() { el.classList.remove('show'); }, 2500);
             }
-
             window.selectProvider = function(key, el) {
                 document.querySelectorAll('.ssp-ai-provider-card').forEach(function(c) { c.classList.remove('selected'); });
                 el.classList.add('selected');
@@ -5956,6 +6286,43 @@ ob_start();
                 }
             };
 
+            window._sspBridgeScriptCode = '';
+            window._sspBridgeScriptUrl = '';
+
+            window.copyBridgeCode = function() {
+                var code = window._sspBridgeScriptCode || '';
+                if (!code) {
+                    showToast('کد اسکریپت دریافت نشد، لطفاً دوباره دکمه دریافت را بزنید.', 'error');
+                    return;
+                }
+                var successMsg = 'کد اسکریپت کپی شد! در ScriptCat یا Tampermonkey روی + New Script بزنید، کد را پیست کرده و Save کنید.';
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(code).then(function() {
+                        showToast(successMsg, 'success');
+                    }).catch(function() {
+                        fallbackCopy(code);
+                    });
+                } else {
+                    fallbackCopy(code);
+                }
+                function fallbackCopy(text) {
+                    var ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.left = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    try {
+                        document.execCommand('copy');
+                        showToast(successMsg, 'success');
+                    } catch(e) {
+                        showToast('خطا در کپی خودکار', 'error');
+                    }
+                    document.body.removeChild(ta);
+                }
+            };
+
             window.setupBrowserBridge = function() {
                 var btn = document.getElementById('bridge_setup_btn');
                 btn.classList.add('loading');
@@ -5969,18 +6336,39 @@ ob_start();
                         if (res.success) {
                             var d = res.data;
                             var scriptUrl = d.direct_url || (d.script_url + '?token=' + encodeURIComponent(d.token) + '&site=' + encodeURIComponent(d.site_url));
+                            window._sspBridgeScriptCode = d.script_code || '';
+                            window._sspBridgeScriptUrl = scriptUrl;
+
                             var resultEl = document.getElementById('bridge_setup_result');
-                            resultEl.innerHTML = '<div class="ssp-card" style="background:var(--success-soft); border-color:var(--success);">' +
-                                '<p><strong>مراحل نصب اسکریپت در SnapMonkey:</strong></p>' +
-                                '<ol style="font-size:0.85rem; color:#374151; margin:8px 0; padding-right:20px;">' +
-                                '<li style="margin-bottom:6px;">لینک زیر را کپی کنید (دکمه کپی)</li>' +
-                                '<li style="margin-bottom:6px;">در SnapMonkey روی آیکون افزونه کلیک کنید</li>' +
-                                '<li style="margin-bottom:6px;">گزینه <strong>Install from URL</strong> را انتخاب کنید</li>' +
-                                '<li style="margin-bottom:6px;">لینک را بچسبانید و <strong>Install</strong> را بزنید</li>' +
+                            resultEl.innerHTML = '<div class="ssp-card" style="background:#f8fafc; border:1px solid #cbd5e1; padding:16px; border-radius:10px; margin-top:12px;">' +
+                                '<h4 style="margin:0 0 12px; color:#1e293b; display:flex; align-items:center; gap:8px; font-size:0.95rem;">' +
+                                '<span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#10b981;"></span>' +
+                                'کد و لینک اختصاصی اسکریپت آماده شد (۲ روش ساده برای نصب در مرورگر)' +
+                                '</h4>' +
+                                
+                                '<div style="background:white; border:1px solid #e2e8f0; border-radius:8px; padding:14px; margin-bottom:12px;">' +
+                                '<div style="font-weight:bold; color:#0f172a; margin-bottom:6px; font-size:0.9rem;">روش اول (ساده و مطمئن): جایگذاری مستقیم کد در افزونه مرورگر</div>' +
+                                '<ol style="font-size:0.84rem; color:#475569; margin:0 0 10px; padding-right:20px; line-height:1.7;">' +
+                                '<li>روی دکمه <strong>«کپی کد کامل اسکریپت»</strong> زیر کلیک کنید.</li>' +
+                                '<li>افزونه <strong>ScriptCat</strong> یا <strong>Tampermonkey</strong> را باز کرده و روی دکمه افزودن اسکریپت جدید کلیک کنید.</li>' +
+                                '<li>کل کدهای پیش‌فرض داخل ویرایشگر را پاک کنید (<code>Ctrl + A</code> و سپس <code>Delete</code>).</li>' +
+                                '<li>کد کپی‌شده را پیست کنید (<code>Ctrl + V</code>) و در بالا سمت راست دکمه <strong>Save</strong> را بزنید.</li>' +
                                 '</ol>' +
-                                '<div style="display:flex; gap:8px; align-items:center; margin:8px 0;">' +
-                                '<code id="bridge_script_url" style="word-break:break-all; flex:1; padding:10px 12px; background:white; border:1px solid #d1d5db; border-radius:8px; direction:ltr; text-align:left; font-size:0.8rem; color:#374151; display:block;">' + scriptUrl + '</code>' +
-                                '<button type="button" class="ssp-btn-primary" onclick="navigator.clipboard.writeText(document.getElementById(\'bridge_script_url\').textContent).then(function(){showToast(\'کپی شد!\',\'success\');})" style="white-space:nowrap;">کپی لینک</button>' +
+                                '<button type="button" class="ssp-btn-primary" onclick="copyBridgeCode()" style="display:inline-flex; align-items:center; gap:6px;">' +
+                                '<span>کپی کد کامل اسکریپت (روش پیشنهادی)</span>' +
+                                '</button>' +
+                                '</div>' +
+
+                                '<div style="background:white; border:1px solid #e2e8f0; border-radius:8px; padding:14px;">' +
+                                '<div style="font-weight:bold; color:#0f172a; margin-bottom:6px; font-size:0.9rem;">روش دوم: باز کردن لینک مستقیم در تب مرورگر</div>' +
+                                '<p style="font-size:0.84rem; color:#475569; margin:0 0 8px; line-height:1.6;">' +
+                                'اگر لینک زیر را در یک تب جدید از مرورگر باز کنید، افزونه مرورگر به صورت خودکار فایل اسکریپت را شناخته و پنجره نصب را به شما نشان می‌دهد:' +
+                                '</p>' +
+                                '<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">' +
+                                '<button type="button" class="ssp-btn-secondary" onclick="window.open(window._sspBridgeScriptUrl, \'_blank\');" style="white-space:nowrap;">باز کردن لینک در تب جدید</button>' +
+                                '<button type="button" class="ssp-btn-secondary" onclick="navigator.clipboard.writeText(window._sspBridgeScriptUrl).then(function(){showToast(\'لینک کپی شد!\',\'success\');})" style="white-space:nowrap;">کپی لینک اسکریپت</button>' +
+                                '</div>' +
+                                '<code id="bridge_script_url" style="word-break:break-all; padding:8px 10px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:6px; direction:ltr; text-align:left; font-size:0.75rem; color:#334155; display:block;">' + scriptUrl + '</code>' +
                                 '</div>' +
                                 '</div>';
 
@@ -6016,9757 +6404,334 @@ ob_start();
             window._bridgePostgenResult = null;
 
             window.openChatbotTab = function() {
-                var chatbot = document.getElementById('ssp_ai_chatbot').value;
+                var chatbotObj = document.getElementById('ssp_ai_chatbot');
+                var chatbot = chatbotObj ? chatbotObj.value : 'deepseek';
                 var urls = { 'deepseek': 'https://chat.deepseek.com/', 'chatgpt': 'https://chatgpt.com/' };
                 var url = urls[chatbot] || urls['deepseek'];
                 window._bridgeChatbotTab = window.open(url, '_blank');
+                
                 if (!window._bridgeChatbotTab || window._bridgeChatbotTab.closed || typeof window._bridgeChatbotTab.closed === 'undefined') {
                     // Popup was blocked
-                    updateBridgeModalState('error');
-                    var statusEl = document.getElementById('bridge-wait-status');
-                    if (statusEl) {
-                        statusEl.innerHTML = 'پاپ‌آپ مسدود شد! لطفاً پاپ‌آپ را برای این سایت فعال کنید یا <a href="' + url + '" target="_blank" style="color:#4f46e5;text-decoration:underline;">اینجا کلیک کنید</a>';
+                    if (typeof window.setBridgeModalState === 'function') {
+                        window.setBridgeModalState(1, 'پاپ‌آپ مرورگر شما مسدود شده است! لطفاً پاپ‌آپ را برای این سایت فعال کنید یا <a href="' + url + '" target="_blank" style="color:var(--error);text-decoration:underline;font-weight:bold;">اینجا کلیک کنید تا تب جدید باز شود</a> و سپس دکمه تلاش مجدد را بزنید.');
+                    } else {
+                        if (typeof showToast === 'function') showToast('پاپ‌آپ مسدود شد! لطفاً پاپ‌آپ را فعال کنید.', 'error');
                     }
-                    return;
                 }
             };
 
             // ===== Modal State Machine =====
             var bridgeStates = {
-                'opening':   { step: 1, status: 'مرورگر چت‌بات باز شد...', progress: 33, icon1: 'spinner', icon2: 'pending', icon3: 'pending' },
-                'waiting':   { step: 2, status: 'به سایت چت‌بات بروید و منتظر پاسخ بمانید...', progress: 50, icon1: 'done', icon2: 'spinner', icon3: 'pending' },
-                'receiving': { step: 3, status: 'پاسخ دریافت شد! در حال پردازش...', progress: 85, icon1: 'done', icon2: 'done', icon3: 'spinner' },
-                'tab_closed':{ step: 2, status: 'تب چت‌بات بسته شد! کار ناتمام ماند.', progress: 50, icon1: 'done', icon2: 'error', icon3: 'pending' },
-                'timeout':   { step: 2, status: 'پاسخی دریافت نشد. مجدداً تلاش کنید.', progress: 50, icon1: 'done', icon2: 'error', icon3: 'pending' },
-                'error':     { step: 0, status: 'خطایی رخ داد. لطفاً مجدداً تلاش کنید.', progress: 0, icon1: 'error', icon2: 'error', icon3: 'error' },
+
                 'success':   { step: 3, status: 'پاسخ با موفقیت دریافت شد!', progress: 100, icon1: 'done', icon2: 'done', icon3: 'done' }
             };
-
             function getStepIcon(state) {
-                if (state === 'done') return '<span style="color:#22c55e;font-weight:bold;">&#10003;</span>';
-                if (state === 'spinner') return '<span style="color:#4f46e5;font-weight:bold;">&#8635;</span>';
-                if (state === 'error') return '<span style="color:#ef4444;font-weight:bold;">&#10007;</span>';
-                return '<span style="color:#94a3b8;">' + (arguments[1] || '') + '</span>';
+                if (state === 'done') return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><polyline points="20 6 9 17 4 12"/></svg>';
+                if (state === 'spinner') return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><circle cx="12" cy="12" r="3"/></svg>';
+                if (state === 'error') return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;margin-left:4px;"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+                return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>';
             }
 
-            window.updateBridgeModalState = function(state) {
-                window._bridgeModalState = state;
-                var s = bridgeStates[state];
-                if (!s) return;
-
-                // Update status text
-                var statusEl = document.getElementById('bridge-wait-status');
-                if (statusEl) statusEl.textContent = s.status;
-
-                // Update status color
-                if (statusEl) {
-                    if (state === 'tab_closed' || state === 'timeout' || state === 'error') {
-                        statusEl.style.color = '#ef4444';
-                        statusEl.style.fontWeight = 'bold';
-                    } else if (state === 'success') {
-                        statusEl.style.color = '#22c55e';
-                        statusEl.style.fontWeight = 'bold';
-                    } else {
-                        statusEl.style.color = '#64748b';
-                        statusEl.style.fontWeight = 'normal';
-                    }
+            // ===== AI Post & Product Generation (Delegated to Unified portal-ai.js) =====
+            window.pgGeneratePostViaBrowser = function() {
+                if (typeof window.pgGeneratePost === 'function') {
+                    window.pgGeneratePost();
+                } else {
+                    showToast('در حال بارگذاری موتور هوش مصنوعی...', 'info');
                 }
-
-                // Update step icons
-                var i1 = document.getElementById('bridge-step-icon-1');
-                var i2 = document.getElementById('bridge-step-icon-2');
-                var i3 = document.getElementById('bridge-step-icon-3');
-                if (i1) i1.innerHTML = getStepIcon(s.icon1, '1');
-                if (i2) i2.innerHTML = getStepIcon(s.icon2, '2');
-                if (i3) i3.innerHTML = getStepIcon(s.icon3, '3');
-
-                // Update step circles
-                var c1 = document.getElementById('bridge-step-circle-1');
-                var c2 = document.getElementById('bridge-step-circle-2');
-                var c3 = document.getElementById('bridge-step-circle-3');
-                if (c1) c1.style.borderColor = s.icon1 === 'done' ? '#22c55e' : s.icon1 === 'spinner' ? '#4f46e5' : s.icon1 === 'error' ? '#ef4444' : '#d1d5db';
-                if (c2) c2.style.borderColor = s.icon2 === 'done' ? '#22c55e' : s.icon2 === 'spinner' ? '#4f46e5' : s.icon2 === 'error' ? '#ef4444' : '#d1d5db';
-                if (c3) c3.style.borderColor = s.icon3 === 'done' ? '#22c55e' : s.icon3 === 'spinner' ? '#4f46e5' : s.icon3 === 'error' ? '#ef4444' : '#d1d5db';
-
-                // Update progress bar
-                var bar = document.getElementById('bridge-wait-progress');
-                if (bar) bar.style.width = s.progress + '%';
-
-                // Update buttons
-                var btnArea = document.getElementById('bridge-buttons');
-                if (btnArea) {
-                    var btns = '';
-                    if (state === 'opening' || state === 'waiting' || state === 'receiving') {
-                        btns = '<button class="ssp-btn-secondary" onclick="closeBridgeModal(true)">لغو</button>' +
-                               '<button class="ssp-btn-primary" onclick="openChatbotTab()">باز کردن چت‌بات</button>';
-                    } else if (state === 'tab_closed') {
-                        btns = '<button class="ssp-btn-secondary" onclick="closeBridgeModal(true)">لغو</button>' +
-                               '<button class="ssp-btn-primary" onclick="restartBridgeTask()">شروع مجدد</button>' +
-                               '<button class="ssp-btn-primary" style="background:#10B981;color:white;" onclick="retryBridgeTask()">ادامه کار</button>';
-                    } else if (state === 'timeout') {
-                        btns = '<button class="ssp-btn-secondary" onclick="closeBridgeModal(true)">لغو</button>' +
-                               '<button class="ssp-btn-primary" onclick="retryBridgeTask()">تلاش مجدد</button>';
-                    } else if (state === 'error') {
-                        btns = '<button class="ssp-btn-secondary" onclick="closeBridgeModal(true)">لغو</button>' +
-                               '<button class="ssp-btn-primary" onclick="restartBridgeTask()">شروع مجدد</button>' +
-                               '<button class="ssp-btn-primary" style="background:#10B981;color:white;" onclick="retryBridgeTask()">تلاش مجدد</button>';
-                    } else if (state === 'success') {
-                        btns = '<button class="ssp-btn-primary" style="background:#22c55e;color:white;" onclick="closeBridgeModal()">بستن</button>';
-                    }
-                    btnArea.innerHTML = btns;
-                }
-
-                // Show/hide tab closed warning
-                var warning = document.getElementById('bridge-tab-closed-warning');
-                if (warning) {
-                    warning.style.display = (state === 'tab_closed' || state === 'timeout' || state === 'error') ? 'block' : 'none';
-                }
-            };
-
-            window.showBridgeWaitingModal = function(taskId) {
-                window._bridgeCurrentTaskId = taskId;
-                var modal = document.createElement('div');
-                modal.id = 'bridge-waiting-modal';
-                modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;';
-                modal.innerHTML = '<div style="background:white; border-radius:16px; padding:32px; max-width:520px; width:90%; font-family:IRANSansX,sans-serif; direction:rtl;">' +
-                    /* Step indicators */
-                    '<div style="display:flex; align-items:center; justify-content:center; gap:0; margin-bottom:24px;">' +
-                        '<div style="text-align:center;">' +
-                            '<div id="bridge-step-circle-1" style="width:40px;height:40px;border-radius:50%;border:2px solid #d1d5db;display:flex;align-items:center;justify-content:center;margin:0 auto 6px;background:white;">' +
-                                '<span id="bridge-step-icon-1" style="font-size:16px;">1</span></div>' +
-                            '<div style="font-size:0.7rem;color:#64748b;">باز کردن</div></div>' +
-                        '<div style="flex:1;height:2px;background:#e2e8f0;margin:0 -4px;margin-bottom:20px;"></div>' +
-                        '<div style="text-align:center;">' +
-                            '<div id="bridge-step-circle-2" style="width:40px;height:40px;border-radius:50%;border:2px solid #d1d5db;display:flex;align-items:center;justify-content:center;margin:0 auto 6px;background:white;">' +
-                                '<span id="bridge-step-icon-2" style="font-size:16px;">2</span></div>' +
-                            '<div style="font-size:0.7rem;color:#64748b;">انتظار پاسخ</div></div>' +
-                        '<div style="flex:1;height:2px;background:#e2e8f0;margin:0 -4px;margin-bottom:20px;"></div>' +
-                        '<div style="text-align:center;">' +
-                            '<div id="bridge-step-circle-3" style="width:40px;height:40px;border-radius:50%;border:2px solid #d1d5db;display:flex;align-items:center;justify-content:center;margin:0 auto 6px;background:white;">' +
-                                '<span id="bridge-step-icon-3" style="font-size:16px;">3</span></div>' +
-                            '<div style="font-size:0.7rem;color:#64748b;">دریافت نتیجه</div></div>' +
-                    '</div>' +
-                    /* Status text */
-                    '<p id="bridge-wait-status" style="color:#64748b; margin:0 0 16px; text-align:center; font-size:0.95rem;">در حال باز کردن چت‌بات...</p>' +
-                    /* Progress bar */
-                    '<div style="width:100%; height:4px; background:#e2e8f0; border-radius:2px; overflow:hidden; margin-bottom:16px;">' +
-                        '<div id="bridge-wait-progress" style="width:10%; height:100%; background:#4f46e5; border-radius:2px; transition:width 0.8s ease;"></div></div>' +
-                    /* Tab closed warning */
-                    '<div id="bridge-tab-closed-warning" style="display:none; background:#fef2f2; border:1px solid #fecaca; border-radius:8px; padding:12px; margin-bottom:16px; text-align:center;">' +
-                        '<p style="color:#991b1b; margin:0 0 4px; font-size:0.85rem;">تب چت‌بات بسته شده است.</p>' +
-                        '<p style="color:#7f1d1d; margin:0; font-size:0.8rem;">می‌توانید کار را ادامه دهید یا از ابتدا شروع کنید.</p></div>' +
-                    /* Task ID */
-                    '<p style="font-size:0.75rem; color:#94a3b8; direction:ltr; text-align:center; margin:0 0 12px;">Task: ' + taskId + '</p>' +
-                    /* Buttons */
-                    '<div id="bridge-buttons" style="display:flex; gap:8px; justify-content:center;">' +
-                        '<button class="ssp-btn-secondary" onclick="closeBridgeModal(true)">لغو</button>' +
-                        '<button class="ssp-btn-primary" onclick="openChatbotTab()">باز کردن چت‌بات</button>' +
-                    '</div></div>';
-                document.body.appendChild(modal);
-
-                // Set initial state
-                updateBridgeModalState('opening');
-
-                // Start polling
-                window._bridgePollInterval = setInterval(function() {
-                    pollBridgeStatus(taskId);
-                }, 3000);
-
-                // Tab closure detection
-                window._bridgeTabCheckInterval = setInterval(function() {
-                    if (window._bridgeModalState !== 'waiting') return;
-                    if (window._bridgeChatbotTab && window._bridgeChatbotTab.closed) {
-                        updateBridgeModalState('tab_closed');
-                    }
-                }, 2000);
-
-                // Transition to waiting after a short delay (tab should be open by now)
-                setTimeout(function() {
-                    if (window._bridgeModalState === 'opening') {
-                        updateBridgeModalState('waiting');
-                    }
-                }, 2000);
-            };
-
-            window.closeBridgeModal = function(cancelTask) {
-                var modal = document.getElementById('bridge-waiting-modal');
-                if (modal) modal.remove();
-                clearInterval(window._bridgePollInterval);
-                clearInterval(window._bridgeProgressInterval);
-                clearInterval(window._bridgeTabCheckInterval);
-                window._bridgeChatbotTab = null;
-                window._bridgeModalState = null;
-
-                if (cancelTask && window._bridgeCurrentTaskId) {
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_bridge_cancel_task');
-                    fd.append('security', nonce);
-                    fd.append('task_id', window._bridgeCurrentTaskId);
-                    fetch(ajaxurl, {method: 'POST', body: fd});
-                    window._bridgeCurrentTaskId = null;
-                }
-            };
-
-            window.retryBridgeTask = function() {
-                if (!window._bridgeCurrentPrompt) {
-                    showToast('خطا: اطلاعات تسک موجود نیست.', 'error');
-                    return;
-                }
-                // Cancel old task
-                if (window._bridgeCurrentTaskId) {
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_bridge_cancel_task');
-                    fd.append('security', nonce);
-                    fd.append('task_id', window._bridgeCurrentTaskId);
-                    fetch(ajaxurl, {method: 'POST', body: fd});
-                }
-                // Create new task with same prompt
-                var fd2 = new FormData();
-                fd2.append('action', 'ssp_bridge_create_task');
-                fd2.append('security', nonce);
-                fd2.append('prompt', window._bridgeCurrentPrompt);
-                fd2.append('context_type', window._bridgeCurrentContext || 'general');
-                fetch(ajaxurl, {method: 'POST', body: fd2})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            window._bridgeCurrentTaskId = res.data.task_id;
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            updateBridgeModalState('waiting');
-                            openChatbotTab();
-                            // Restart polling
-                            clearInterval(window._bridgePollInterval);
-                            window._bridgePollInterval = setInterval(function() {
-                                pollBridgeStatus(res.data.task_id);
-                            }, 3000);
-                        } else {
-                            showToast(res.data.message || 'خطا در ایجاد تسک', 'error');
-                        }
-                    });
-            };
-
-            window.restartBridgeTask = function() {
-                closeBridgeModal(true);
-                // Re-run the original tool function
-                var fnMap = {
-                    'contentgen': cgGenerateViaBrowser,
-                    'productgen': pgGenerateViaBrowser,
-                    'postgen': pgGeneratePostViaBrowser,
-                    'brainstorm': bsGenerateViaBrowser,
-                    'seo': seoAnalyzeViaBrowser,
-                    'batchgen': batchGenerate
-                };
-                var fn = fnMap[window._bridgeCurrentTool];
-                if (fn) fn();
-            };
-
-            window.pollBridgeStatus = function(taskId) {
-                console.log('[SSP Bridge] Polling for task:', taskId);
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_poll_status');
-                fd.append('security', nonce);
-                fd.append('task_id', taskId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        console.log('[SSP Bridge] Poll response:', JSON.stringify(res));
-                        if (!res.success) {
-                            console.error('[SSP Bridge] Poll failed:', res);
-                            if (window._bridgeModalState === 'waiting' || window._bridgeModalState === 'receiving') {
-                                updateBridgeModalState('error');
-                            }
-                            return;
-                        }
-                        if (res.data.status === 'completed') {
-                            console.log('[SSP Bridge] Response found! Parsed:', res.data.parsed);
-                            updateBridgeModalState('success');
-                            setTimeout(function() {
-                                window._bridgeCurrentTaskId = null;
-                                closeBridgeModal();
-                                var parsed = res.data.parsed;
-                                var raw = res.data.raw;
-
-                                // Client-side fallback parsing
-                                if (!parsed && raw) {
-                                    console.log('[SSP Bridge] Server parse failed, trying client-side...');
-                                    try { parsed = JSON.parse(raw); } catch(e) {
-                                        // Try array [{...}] first
-                                        var arrMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                                        if (arrMatch) { try { parsed = JSON.parse(arrMatch[0]); } catch(e2) {} }
-                                        // Then try object
-                                        if (!parsed) {
-                                            var match = raw.match(/\{[\s\S]*\}/);
-                                            if (match) { try { parsed = JSON.parse(match[0]); } catch(e3) {} }
-                                        }
-                                    }
-                                }
-
-                                console.log('[SSP Bridge] Dispatching bridge-response with:', parsed);
-                                window.dispatchEvent(new CustomEvent('bridge-response', { detail: { taskId: taskId, parsed: parsed, raw: raw }}));
-
-                                // Direct render for brainstorm (bypass event chain)
-                                if (window._bridgeCurrentTool === 'brainstorm') {
-                                    console.log('[SSP Brainstorm] Direct render started. parsed:', parsed, 'raw length:', raw ? raw.length : 0);
-                                    var ideas = null;
-                                    // Step 1: Try to get ideas from parsed
-                                    if (parsed && Array.isArray(parsed)) ideas = parsed;
-                                    else if (parsed && parsed.ideas && Array.isArray(parsed.ideas)) ideas = parsed.ideas;
-                                    // Step 2: Try to parse from raw
-                                    if (!ideas && raw) {
-                                        var parseStrategies = [
-                                            function(s) { return JSON.parse(s); },
-                                            function(s) { var m = s.match(/\[\s*\{[\s\S]*\}\s*\]/); return m ? JSON.parse(m[0]) : null; },
-                                            function(s) { var t = s.replace(/```(?:json)?\s*\n?/gi, '').replace(/```\s*$/gm, '').trim(); var m = t.match(/\[\s*\{[\s\S]*\}\s*\]/); return m ? JSON.parse(m[0]) : null; },
-                                            function(s) { var v = validateAndParseBridgeResponse(s); if (Array.isArray(v)) return v; if (v && v.ideas && Array.isArray(v.ideas)) return v.ideas; return null; }
-                                        ];
-                                        for (var si = 0; si < parseStrategies.length; si++) {
-                                            try {
-                                                var result = parseStrategies[si](raw);
-                                                if (Array.isArray(result) && result.length > 0) { ideas = result; break; }
-                                            } catch(pe) {}
-                                        }
-                                    }
-                                    console.log('[SSP Brainstorm] Parsed ideas:', ideas ? ideas.length + ' items' : 'null');
-                                    // Step 3: Store result
-                                    window._bridgeBrainstormResult = ideas;
-                                    // Step 4: Show results section + render or fallback
-                                    var bsGrid = document.getElementById('bs_ideas_grid');
-                                    var bsResults = document.getElementById('bs_results');
-                                    if (bsResults) bsResults.style.display = 'block';
-                                    if (bsGrid) {
-                                        if (ideas && ideas.length > 0) {
-                                            // Render ideas
-                                            try {
-                                                bsRenderIdeas(ideas);
-                                                console.log('[SSP Brainstorm] Rendered', ideas.length, 'ideas successfully');
-                                            } catch(e) {
-                                                console.error('[SSP Brainstorm] Render failed:', e);
-                                                // Fallback: show raw response
-                                                bsGrid.innerHTML = '<div class="ssp-item-card" style="grid-column:1/-1;border-left:3px solid var(--success);padding:20px;">' +
-                                                    '<h4 style="margin:0 0 12px;color:var(--success);">&#9989; پاسخ AI دریافت شد</h4>' +
-                                                    '<p style="font-size:0.85rem;color:var(--text-muted);margin:0 0 8px;">پاسخ زیر از چت‌بات دریافت شد:</p>' +
-                                                    '<pre style="background:var(--bg-alt);padding:12px;border-radius:8px;font-size:0.8rem;white-space:pre-wrap;direction:ltr;max-height:500px;overflow:auto;border:1px solid var(--border);">' + (function(s){if(!s)return'';var d=document.createElement('div');d.appendChild(document.createTextNode(String(s)));return d.innerHTML;})(JSON.stringify(ideas, null, 2)) + '</pre>' +
-                                                    '<div style="margin-top:12px;display:flex;gap:8px;"><button class="ssp-btn-primary" style="font-size:0.8rem;" onclick="bsRetryBridgeParse()">&#128260; تلاش مجدد پردازش</button></div></div>';
-                                            }
-                                        } else if (raw) {
-                                            // No ideas parsed - show raw response as card
-                                            var displayText = raw;
-                                            try {
-                                                var vp = validateAndParseBridgeResponse(raw);
-                                                if (vp) displayText = JSON.stringify(vp, null, 2);
-                                            } catch(pe2) {}
-                                            bsGrid.innerHTML = '<div class="ssp-item-card" style="grid-column:1/-1;border-left:3px solid var(--success);padding:20px;">' +
-                                                '<h4 style="margin:0 0 12px;color:var(--success);">&#9989; پاسخ AI دریافت شد</h4>' +
-                                                '<p style="font-size:0.85rem;color:var(--text-muted);margin:0 0 8px;">پاسخ زیر از چت‌بات دریافت شد. می‌توانید از آن استفاده کنید:</p>' +
-                                                '<pre style="background:var(--bg-alt);padding:12px;border-radius:8px;font-size:0.8rem;white-space:pre-wrap;direction:ltr;max-height:500px;overflow:auto;border:1px solid var(--border);">' + (function(s){if(!s)return'';var d=document.createElement('div');d.appendChild(document.createTextNode(String(s)));return d.innerHTML;})(displayText) + '</pre>' +
-                                                '<div style="margin-top:12px;display:flex;gap:8px;">' +
-                                                '<button class="ssp-btn-primary" style="font-size:0.8rem;" onclick="navigator.clipboard.writeText(this.closest(\'.ssp-item-card\').querySelector(\'pre\').textContent).then(function(){showToast(\'کپی شد!\',\'success\')})">&#128203; کپی متن</button>' +
-                                                '<button class="ssp-btn-secondary" style="font-size:0.8rem;" onclick="bsRetryBridgeParse()">&#128260; تلاش مجدد پردازش</button>' +
-                                                '</div></div>';
-                                            console.log('[SSP Brainstorm] No ideas parsed, showing raw response');
-                                        } else {
-                                            bsGrid.innerHTML = '<div class="ssp-item-card" style="grid-column:1/-1;border-left:3px solid var(--warning);padding:20px;"><h4 style="margin:0;">&#9888; پاسخی دریافت نشد</h4></div>';
-                                            console.log('[SSP Brainstorm] No raw response available');
-                                        }
-                                    }
-                                }
-
-                                // Direct render for postgen (bypass event chain)
-                                if (window._bridgeCurrentTool === 'postgen') {
-                                    // Store raw result for polling fallback
-                                    window._bridgePostgenResult = parsed || raw;
-                                    if (parsed && parsed.title) {
-                                        try {
-                                            var el;
-                                            el = document.getElementById('pg_result_title');
-                                            if (el) el.value = parsed.title;
-                                            var content = parsed.message || parsed.content || '';
-                                            content = content.replace(/\\n\\n/g, '\n\n').replace(/\\n/g, '\n').replace(/\\r\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-content = content.replace(/nn(?=[^\s])/g, '\n\n').replace(/([\u0600-\u06FF])n(?=[^\sa-zA-Z\u0600-\u06FF])/g, '$1\n').replace(/([^\sa-zA-Z\u0600-\u06FF])n(?=[^\s])/g, '$1\n');
-                                            el = document.getElementById('pg_result_content');
-                                            if (el) el.value = content;
-                                            var preview = document.getElementById('pg_result_preview');
-                                            if (preview) preview.innerText = content;
-                                            el = document.getElementById('pg_result_hashtags');
-                                            if (el) el.value = parsed.hashtags || '';
-                                            var resultEl = document.getElementById('pg_post_result');
-                                            if (resultEl) resultEl.style.display = 'block';
-                                            if (typeof pgToggleView === 'function') pgToggleView('visual');
-                                        } catch(e) { console.error('[SSP Postgen] Direct render error:', e); }
-                                    } else if (raw) {
-                                        // Fallback: try to extract object from raw text
-                                        try {
-                                            var objMatch = raw.match(/\{[\s\S]*"title"[\s\S]*\}/);
-                                            if (objMatch) {
-                                                var obj = JSON.parse(objMatch[0]);
-                                                if (obj && obj.title) {
-                                                    var el;
-                                                    el = document.getElementById('pg_result_title');
-                                                    if (el) el.value = obj.title;
-                                                    var content = obj.message || obj.content || '';
-                                                    content = content.replace(/\\n\\n/g, '\n\n').replace(/\\n/g, '\n').replace(/\\r\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-content = content.replace(/nn(?=[^\s])/g, '\n\n').replace(/([\u0600-\u06FF])n(?=[^\sa-zA-Z\u0600-\u06FF])/g, '$1\n').replace(/([^\sa-zA-Z\u0600-\u06FF])n(?=[^\s])/g, '$1\n');
-                                                    el = document.getElementById('pg_result_content');
-                                                    if (el) el.value = content;
-                                                    var preview = document.getElementById('pg_result_preview');
-                                                    if (preview) preview.innerText = content;
-                                                    el = document.getElementById('pg_result_hashtags');
-                                                    if (el) el.value = obj.hashtags || '';
-                                                    var resultEl = document.getElementById('pg_post_result');
-                                                    if (resultEl) resultEl.style.display = 'block';
-                                                    if (typeof pgToggleView === 'function') pgToggleView('visual');
-                                                    window._bridgePostgenResult = obj;
-                                                }
-                                            }
-                                        } catch(e) { console.error('[SSP Postgen] Raw fallback error:', e); }
-                                    }
-                                }
-
-                                // Direct render for batchgen (bypass event chain)
-                                if (window._bridgeCurrentTool === 'batchgen') {
-                                    console.log('[SSP Batchgen] Direct render started');
-                                    var items = null;
-                                    if (parsed && Array.isArray(parsed)) items = parsed;
-                                    else if (parsed && Array.isArray(parsed.items)) items = parsed.items;
-                                    if (!items && raw) {
-                                        var parseStrategies = [
-                                            function(s) { return JSON.parse(s); },
-                                            function(s) { var m = s.match(/\[\s*\{[\s\S]*\}\s*\]/); return m ? JSON.parse(m[0]) : null; },
-                                            function(s) { var t = s.replace(/```(?:json)?\s*\n?/gi, '').replace(/```\s*$/gm, '').trim(); var m = t.match(/\[\s*\{[\s\S]*\}\s*\]/); return m ? JSON.parse(m[0]) : null; }
-                                        ];
-                                        for (var si = 0; si < parseStrategies.length; si++) {
-                                            try {
-                                                var result = parseStrategies[si](raw);
-                                                if (Array.isArray(result) && result.length > 0) { items = result; break; }
-                                            } catch(pe) {}
-                                        }
-                                    }
-                                    if (items && items.length) {
-                                        var batchResults = document.getElementById('batch_results');
-                                        var batchBtn = document.getElementById('batch_gen_btn');
-                                        if (batchBtn) batchBtn.classList.remove('loading');
-                                        if (batchResults) {
-                                            renderBatchResults(items, batchResults);
-                                            showToast(items.length + ' محتوا تولید شد!', 'success');
-                                        }
-                                    } else {
-                                        var batchResults2 = document.getElementById('batch_results');
-                                        var batchBtn2 = document.getElementById('batch_gen_btn');
-                                        if (batchBtn2) batchBtn2.classList.remove('loading');
-                                        if (batchResults2) batchResults2.innerHTML = '<div style="color:var(--error);">پاسخ AI قابل تفسیر نیست. لطفاً دوباره تلاش کنید.</div>';
-                                    }
-                                }
-                            }, 1200);
-                        } else if (res.data.status === 'expired') {
-                            updateBridgeModalState('timeout');
-                        } else if (res.data.status === 'sent') {
-                            if (window._bridgeModalState === 'waiting') updateBridgeModalState('receiving');
-                        } else {
-                            console.log('[SSP Bridge] Still waiting... status:', res.data.status);
-                        }
-                    })
-                    .catch(function(err) {
-                        console.error('[SSP Bridge] Poll error:', err);
-                        if (window._bridgeModalState === 'waiting' || window._bridgeModalState === 'receiving') {
-                            updateBridgeModalState('error');
-                        }
-                    });
-            };
-
-            window.cgGenerateViaBrowser = function() {
-                window._bridgeCurrentTool = 'contentgen';
-                window._bridgeCurrentToolFn = 'cgGenerateViaBrowser';
-                var name = document.getElementById('cg_ai_name').value.trim();
-                var brief = document.getElementById('cg_ai_brief').value.trim();
-                var promptMode = document.getElementById('cg_prompt_mode').value;
-                var customPrompt = document.getElementById('cg_custom_prompt').value;
-                if (!name) { document.getElementById('cg_ai_error').textContent = 'عنوان را وارد کنید'; document.getElementById('cg_ai_error').style.display = 'block'; return; }
-
-                var prompt = 'You are an expert Persian SEO content writer.\n\n';
-                prompt += 'TASK: Generate a comprehensive, SEO-optimized article.\n\n';
-                prompt += 'TITLE: ' + name + '\n';
-                if (brief) prompt += 'DESCRIPTION: ' + brief + '\n';
-                prompt += '\nREQUIREMENTS:\n';
-                prompt += '- Write 800-1500 words of high-quality Persian content\n';
-                prompt += '- Use E-E-A-T principles (Experience, Expertise, Authority, Trust)\n';
-                prompt += '- Include semantic variations and LSI keywords naturally\n';
-                prompt += '- Use short paragraphs and clear structure\n';
-                prompt += '- Include a compelling introduction and strong conclusion\n';
-                prompt += '- Content must be people-first, not keyword-stuffed\n';
-                prompt += '- Follow Google Helpful Content System guidelines\n';
-                if (promptMode === 'custom' && customPrompt) prompt += '\nCUSTOM INSTRUCTIONS:\n' + customPrompt + '\n';
-                prompt += '\nCRITICAL RULES - READ CAREFULLY:\n';
-                prompt += '1. Return ONLY the raw JSON object. No explanations, no markdown, no text before or after.\n';
-                prompt += '2. Do NOT wrap in code blocks (no ```json or ```).\n';
-                prompt += '3. Do NOT add any commentary or description.\n';
-                prompt += '4. The JSON must be valid and parseable.\n';
-                prompt += '5. All string values must be in Persian (فارسی).\n';
-                prompt += '6. The content field must contain the full article in HTML format.\n';
-                prompt += '7. If you cannot generate the content, return: {"error":"reason here"}\n';
-                prompt += '8. ABSOLUTELY NO hashtags (#) anywhere in the content or tags field.\n';
-                prompt += '\nReturn JSON ONLY: {"title":"","content":"","excerpt":"","tags":[""],"meta_title":"","meta_description":""}';
-                window._bridgeCurrentPrompt = prompt;
-                window._bridgeCurrentContext = 'contentgen';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_create_task');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('context_type', 'contentgen');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            showBridgeWaitingModal(res.data.task_id);
-                            openChatbotTab();
-                        } else if (res.data && res.data.can_force) {
-                            if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید و تسک جدید ایجاد کنید؟')) {
-                                fd.append('force', '1');
-                                fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r2) { return r2.json(); }).then(function(res2) {
-                                    if (res2.success) {
-                                        localStorage.setItem('ssp_bridge_pending_task', res2.data.task_id);
-                                        showBridgeWaitingModal(res2.data.task_id);
-                                        openChatbotTab();
-                                    } else {
-                                        showToast(res2.data.message || 'خطا', 'error');
-                                    }
-                                });
-                            }
-                        } else {
-                            showToast(res.data.message || 'خطا', 'error');
-                        }
-                    });
             };
 
             window.pgGenerateViaBrowser = function() {
-                window._bridgeCurrentTool = 'productgen';
-                window._bridgeCurrentToolFn = 'pgGenerateViaBrowser';
-                var name = document.getElementById('pg_ai_name').value.trim();
-                var brief = document.getElementById('pg_ai_brief').value.trim();
-                var promptMode = document.getElementById('pg_prompt_mode').value;
-                var customPrompt = document.getElementById('pg_custom_prompt').value;
-                if (!name) { document.getElementById('pg_ai_error').textContent = 'نام محصول را وارد کنید'; document.getElementById('pg_ai_error').style.display = 'block'; return; }
-
-                // Check if a saved template is selected
-                if (promptMode && promptMode.indexOf('saved_') === 0) {
-                    var templateId = parseInt(promptMode.substring(6));
-                    var fdTemplate = new FormData();
-                    fdTemplate.append('action', 'ssp_preview_prompt');
-                    fdTemplate.append('security', nonce);
-                    fdTemplate.append('template_id', templateId);
-                    fdTemplate.append('product_name', name);
-                    
-                    fetch(ajaxurl, {method: 'POST', body: fdTemplate})
-                        .then(function(r) { return r.json(); })
-                        .then(function(resTemplate) {
-                            if (resTemplate.success) {
-                                var prompt = resTemplate.data.prompt;
-                                prompt += '\n\nCRITICAL RULES - READ CAREFULLY:\n';
-                                prompt += '1. Return ONLY the raw JSON object. No explanations, no markdown, no text before or after.\n';
-                                prompt += '2. Do NOT wrap in code blocks (no ```json or ```).\n';
-                                prompt += '3. Do NOT add any commentary or description.\n';
-                                prompt += '4. The JSON must be valid and parseable.\n';
-                                prompt += '5. All string values must be in Persian (فارسی).\n';
-                                prompt += '6. If you cannot generate the content, return: {"error":"reason here"}\n';
-                                window._bridgeCurrentPrompt = prompt;
-                                window._bridgeCurrentContext = 'productgen';
-
-                                var fd = new FormData();
-                                fd.append('action', 'ssp_bridge_create_task');
-                                fd.append('security', nonce);
-                                fd.append('prompt', prompt);
-                                fd.append('context_type', 'productgen');
-
-                                fetch(ajaxurl, {method: 'POST', body: fd})
-                                    .then(function(r) { return r.json(); })
-                                    .then(function(res) {
-                                        if (res.success) {
-                                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                                            showBridgeWaitingModal(res.data.task_id);
-                                            openChatbotTab();
-                                        } else if (res.data && res.data.can_force) {
-                                            if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید و تسک جدید ایجاد کنید؟')) {
-                                                fd.append('force', '1');
-                                                fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r2) { return r2.json(); }).then(function(res2) {
-                                                    if (res2.success) {
-                                                        localStorage.setItem('ssp_bridge_pending_task', res2.data.task_id);
-                                                        showBridgeWaitingModal(res2.data.task_id);
-                                                        openChatbotTab();
-                                                    } else {
-                                                        showToast(res2.data.message || 'خطا', 'error');
-                                                    }
-                                                });
-                                            }
-                                        } else {
-                                            showToast(res.data.message || 'خطا', 'error');
-                                        }
-                                    });
-                            } else {
-                                showToast(resTemplate.data.message || 'خطا در دریافت قالب', 'error');
-                            }
-                        })
-                        .catch(function() { showToast('خطا در اتصال', 'error'); });
-                    return;
-                }
-
-                var prompt = 'You are an expert e-commerce product copywriter.\n\n';
-                prompt += 'TASK: Generate a complete, SEO-optimized product listing.\n\n';
-                prompt += 'PRODUCT NAME: ' + name + '\n';
-                if (brief) prompt += 'DESCRIPTION: ' + brief + '\n';
-                prompt += '\nREQUIREMENTS:\n';
-                prompt += '- Write compelling, persuasive product descriptions in Persian\n';
-                prompt += '- Highlight benefits, features, and unique selling points\n';
-                prompt += '- Use SEO-friendly language with natural keyword placement\n';
-                prompt += '- Include practical use cases and specifications\n';
-                prompt += '- Generate relevant Persian categories and tags\n';
-                prompt += '- Price should be realistic for the Iranian market\n';
-                if (promptMode === 'custom' && customPrompt) prompt += '\nCUSTOM INSTRUCTIONS:\n' + customPrompt + '\n';
-                prompt += '\nCRITICAL RULES - READ CAREFULLY:\n';
-                prompt += '1. Return ONLY the raw JSON object. No explanations, no markdown, no text before or after.\n';
-                prompt += '2. Do NOT wrap in code blocks (no ```json or ```).\n';
-                prompt += '3. Do NOT add any commentary or description.\n';
-                prompt += '4. The JSON must be valid and parseable.\n';
-                prompt += '5. All string values must be in Persian (فارسی).\n';
-                prompt += '6. If you cannot generate the content, return: {"error":"reason here"}\n';
-                prompt += '\nReturn JSON ONLY: {"name":"","short_description":"","description":"","regular_price":"","sku":"","categories":[""],"tags":[""]}';
-                window._bridgeCurrentPrompt = prompt;
-                window._bridgeCurrentContext = 'productgen';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_create_task');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('context_type', 'productgen');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            showBridgeWaitingModal(res.data.task_id);
-                            openChatbotTab();
-                        } else if (res.data && res.data.can_force) {
-                            if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید و تسک جدید ایجاد کنید؟')) {
-                                fd.append('force', '1');
-                                fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r2) { return r2.json(); }).then(function(res2) {
-                                    if (res2.success) {
-                                        localStorage.setItem('ssp_bridge_pending_task', res2.data.task_id);
-                                        showBridgeWaitingModal(res2.data.task_id);
-                                        openChatbotTab();
-                                    } else {
-                                        showToast(res2.data.message || 'خطا', 'error');
-                                    }
-                                });
-                            }
-                        } else {
-                            showToast(res.data.message || 'خطا', 'error');
-                        }
-                    });
-            };
-
-            window.pgGeneratePostViaBrowser = function() {
-                window._bridgeCurrentTool = 'postgen';
-                window._bridgeCurrentToolFn = 'pgGeneratePostViaBrowser';
-                var topic = document.getElementById('pg_topic').value.trim();
-                var style = document.getElementById('pg_style').value;
-                var details = document.getElementById('pg_details').value.trim();
-                var length = document.getElementById('pg_length').value;
-                if (!topic) { showToast('موضوع را وارد کنید', 'error'); return; }
-
-                var prompt = 'You are an expert social media content strategist.\n\n';
-                prompt += 'TASK: Generate an engaging Persian social media post.\n\n';
-                prompt += 'TOPIC: ' + topic + '\n';
-                prompt += 'STYLE: ' + style + '\n';
-                if (details) prompt += 'DETAILS: ' + details + '\n';
-                prompt += '\nREQUIREMENTS:\n';
-                prompt += '- Write engaging, shareable content in Persian\n';
-                prompt += '- Match the specified tone and style\n';
-                prompt += '- Include a strong hook in the first line\n';
-                prompt += '- Use emojis strategically\n';
-                prompt += '- Content should be concise but impactful\n';
-                prompt += '- DO NOT include any hashtags (#) in the content or at the end\n';
-                prompt += '- DO NOT add hashtags like #tag1 #tag2 anywhere in the text\n';
-                prompt += '\nRECOMMENDED LENGTH:\n';
-                var rangeMap = {'400':'300-500','700':'600-800','1000':'900-1100','2000':'1800-2200','3000':'2700-3300','4000':'3600-4000'};
-                prompt += '- Total message (title + content) should be ' + (rangeMap[length] || '1800-2200') + ' characters.\n';
-                prompt += '- Write concisely but naturally. Aim for this range.\n';
-                prompt += '\nCRITICAL RULES - READ CAREFULLY:\n';
-                prompt += '1. Return ONLY the raw JSON object. No explanations, no markdown, no text before or after.\n';
-                prompt += '2. Do NOT wrap in code blocks (no ```json or ```).\n';
-                prompt += '3. Do NOT add any commentary or description.\n';
-                prompt += '4. The JSON must be valid and parseable.\n';
-                prompt += '5. All string values must be in Persian (فارسی).\n';
-                prompt += '6. If you cannot generate the content, return: {"error":"reason here"}\n';
-                prompt += '7. ABSOLUTELY NO hashtags (#) in the content. No #word at the end of the text.\n';
-                prompt += '\nReturn JSON ONLY: {"title":"","message":""}';
-                window._bridgeCurrentPrompt = prompt;
-                window._bridgeCurrentContext = 'postgen';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_create_task');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('context_type', 'postgen');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            showBridgeWaitingModal(res.data.task_id);
-                            openChatbotTab();
-                        } else if (res.data && res.data.can_force) {
-                            if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید و تسک جدید ایجاد کنید؟')) {
-                                fd.append('force', '1');
-                                fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r2) { return r2.json(); }).then(function(res2) {
-                                    if (res2.success) {
-                                        localStorage.setItem('ssp_bridge_pending_task', res2.data.task_id);
-                                        showBridgeWaitingModal(res2.data.task_id);
-                                        openChatbotTab();
-                                    } else {
-                                        showToast(res2.data.message || 'خطا', 'error');
-                                    }
-                                });
-                            }
-                        } else {
-                            showToast(res.data.message || 'خطا', 'error');
-                        }
-                    });
-            };
-
-            window.seoAnalyzeViaBrowser = function() {
-                window._bridgeCurrentTool = 'seo';
-                window._bridgeCurrentToolFn = 'seoAnalyzeViaBrowser';
-                var title = document.getElementById('seo_title').value.trim();
-                var content = document.getElementById('seo_content').value.trim();
-                var hashtags = document.getElementById('seo_hashtags').value.trim();
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'error'); return; }
-
-                var prompt = 'You are an expert SEO specialist and content analyst.\n\n';
-                prompt += 'TASK: Analyze the following content for SEO optimization.\n\n';
-                if (title) prompt += 'TITLE: ' + title + '\n';
-                if (content) prompt += 'CONTENT: ' + content + '\n';
-                if (hashtags) prompt += 'HASHTAGS: ' + hashtags + '\n';
-                prompt += '\nREQUIREMENTS:\n';
-                prompt += '- Evaluate on a 0-100 SEO score scale\n';
-                prompt += '- Identify specific strengths and weaknesses\n';
-                prompt += '- Provide actionable improvement suggestions\n';
-                prompt += '- Generate an optimized title and content\n';
-                prompt += '- Be specific and practical in recommendations\n';
-                prompt += '- Follow Google E-E-A-T and Helpful Content guidelines\n';
-                prompt += '\nCRITICAL RULES - READ CAREFULLY:\n';
-                prompt += '1. Return ONLY the raw JSON object. No explanations, no markdown, no text before or after.\n';
-                prompt += '2. Do NOT wrap in code blocks (no ```json or ```).\n';
-                prompt += '3. Do NOT add any commentary or description.\n';
-                prompt += '4. The JSON must be valid and parseable.\n';
-                prompt += '5. All string values must be in Persian (فارسی).\n';
-                prompt += '6. If you cannot generate the content, return: {"error":"reason here"}\n';
-                prompt += '\nReturn JSON ONLY: {"score":0,"summary":"","strengths":[""],"weaknesses":[""],"improvements":[""],"optimized_title":"","optimized_content":""}';
-
-                // Apply prompt mode if selected
-                var promptMode = document.getElementById('seo_prompt_mode') ? document.getElementById('seo_prompt_mode').value : '';
-                if (promptMode) {
-                    var modePrefix = getPromptModePrefix(promptMode);
-                    if (modePrefix) prompt = modePrefix + '\n\n' + prompt;
-                }
-
-                window._bridgeCurrentPrompt = prompt;
-                window._bridgeCurrentContext = 'seo';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_create_task');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('context_type', 'seo');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            showBridgeWaitingModal(res.data.task_id);
-                            openChatbotTab();
-                        } else {
-                            showToast(res.data.message || 'خطا', 'error');
-                        }
-                    });
-            };
-
-            // ===== Client-side JSON Validation =====
-            function validateAndParseBridgeResponse(raw) {
-                if (!raw) return null;
-                raw = raw.trim();
-
-                // 1. Direct parse
-                try {
-                    var p = JSON.parse(raw);
-                    if (p && typeof p === 'object') return p;
-                } catch(e) {}
-
-                // 2. Extract JSON array [{...}] — look for [ followed by { (not just any [)
-                var arrMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                if (arrMatch) {
-                    var arrStr = arrMatch[0].replace(/\n\s*/g, ' ').replace(/,\s*]/g, ']');
-                    try {
-                        var p = JSON.parse(arrStr);
-                        if (Array.isArray(p)) return p;
-                    } catch(e) {}
-                }
-
-                // 3. Extract JSON object { ... }
-                var start = raw.indexOf('{');
-                var lastEnd = raw.lastIndexOf('}');
-                if (start !== -1 && lastEnd > start) {
-                    var jsonStr = raw.substring(start, lastEnd + 1);
-                    jsonStr = jsonStr.replace(/\n\s*/g, ' ');
-                    jsonStr = jsonStr.replace(/,\s*}/g, '}');
-                    try {
-                        var p = JSON.parse(jsonStr);
-                        if (p && typeof p === 'object') return p;
-                    } catch(e) {}
-                }
-
-                // 4. Try code block extraction
-                var codeMatch = raw.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-                if (codeMatch) {
-                    try {
-                        var p = JSON.parse(codeMatch[1].trim());
-                        if (p && typeof p === 'object') return p;
-                    } catch(e) {}
-                }
-
-                // 5. Replace smart quotes and retry
-                var cleaned = raw.replace(/[\u201C\u201D\u2018\u2019\u00AB\u00BB]/g, '"');
-                cleaned = cleaned.replace(/\u200B/g, '');
-                arrMatch = cleaned.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                if (arrMatch) {
-                    try {
-                        var p = JSON.parse(arrMatch[0]);
-                        if (Array.isArray(p)) return p;
-                    } catch(e) {}
-                }
-                start = cleaned.indexOf('{');
-                lastEnd = cleaned.lastIndexOf('}');
-                if (start !== -1 && lastEnd > start) {
-                    try {
-                        var p = JSON.parse(cleaned.substring(start, lastEnd + 1));
-                        if (p && typeof p === 'object') return p;
-                    } catch(e) {}
-                }
-
-                return null;
-            }
-
-            // Listen for bridge response
-            window.addEventListener('bridge-response', function(e) {
-                var detail = e.detail;
-                var parsed = detail.parsed;
-                var raw = detail.raw;
-                console.log('[SSP Bridge] ===== BRIDGE RESPONSE EVENT =====');
-                console.log('[SSP Bridge] Task ID:', detail.taskId);
-                console.log('[SSP Bridge] Parsed:', parsed);
-                console.log('[SSP Bridge] Raw length:', raw ? raw.length : 0);
-                console.log('[SSP Bridge] Raw preview:', raw ? raw.substring(0, 200) : 'none');
-
-                // Try client-side validation if server-side parse failed
-                if (!parsed && raw) {
-                    console.log('[SSP Bridge] Server parse failed, trying client-side validation...');
-                    parsed = validateAndParseBridgeResponse(raw);
-                    if (parsed) {
-                        console.log('[SSP Bridge] Client-side parse SUCCEEDED:', parsed);
-                    } else {
-                        console.warn('[SSP Bridge] Client-side parse also FAILED');
-                    }
-                }
-
-                if (!parsed) {
-                    // Skip raw modal for brainstorm, postgen, batchgen (handled by direct render + polling)
-                    if (window._bridgeCurrentTool === 'brainstorm' || window._bridgeCurrentTool === 'postgen' || window._bridgeCurrentTool === 'batchgen') {
-                        console.warn('[SSP Bridge] Parse failed for ' + window._bridgeCurrentTool + ', handled by direct render + polling');
-                        // Ensure raw is stored for polling fallback
-                        if (raw && window._bridgeCurrentTool === 'brainstorm' && !window._bridgeBrainstormRaw) {
-                            window._bridgeBrainstormRaw = raw;
-                        }
-                        return;
-                    }
-                    // Show raw response in a textarea for manual copy
-                    console.warn('[SSP Bridge] Parse failed, showing raw response');
-                    var modal = document.createElement('div');
-                    modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;';
-                    modal.innerHTML = '<div style="background:white;border-radius:16px;padding:32px;max-width:600px;width:90%;max-height:80vh;overflow:auto;font-family:IRANSansX,sans-serif;direction:rtl;">' +
-                        '<h3 style="margin:0 0 16px;">پاسخ دریافت شد (قابل تفسیر نبود)</h3>' +
-                        '<p style="color:#666;margin-bottom:12px;">متن خام پاسخ را کپی کنید و در فرم مورد نظر قرار دهید:</p>' +
-                        '<textarea style="width:100%;height:300px;padding:8px;border:1px solid #ddd;border-radius:8px;font-size:13px;direction:ltr;text-align:left;">' + (raw || '') + '</textarea>' +
-                        '<div style="margin-top:16px;display:flex;gap:10px;">' +
-                        '<button onclick="navigator.clipboard.writeText(this.closest(\'div\').querySelector(\'textarea\').value);showToast(\'کپی شد!\',\'success\')" style="background:#4f46e5;color:white;padding:8px 16px;border:none;border-radius:8px;cursor:pointer;">کپی متن</button>' +
-                        '<button onclick="this.closest(\'div\').parentElement.remove()" style="background:#666;color:white;padding:8px 16px;border:none;border-radius:8px;cursor:pointer;">بستن</button>' +
-                        '</div></div>';
-                    document.body.appendChild(modal);
-                    return;
-                }
-
-                // Fill forms based on which tool initiated the request
-                var filled = false;
-                var tool = window._bridgeCurrentTool || 'unknown';
-                console.log('[SSP Bridge] Current tool:', tool);
-
-                if (tool === 'postgen') {
-                    // Post generation form
-                    if (parsed.title) {
-                        var el = document.getElementById('pg_result_title');
-                        if (el) { el.value = parsed.title; filled = true; }
-                    }
-                    if (parsed.message || parsed.content) {
-                        var content = parsed.message || parsed.content;
-                        // Step 1: Convert escaped newlines to actual newlines
-                        content = content.replace(/\\n\\n/g, '\n\n').replace(/\\n/g, '\n').replace(/\\r\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-                        // Step 2: Convert nn to double newline (AI sometimes outputs nn instead of \n\n)
-                        content = content.replace(/nn(?=[^\s])/g, '\n\n');
-                        // Step 3: Convert single n to newline when NOT part of a word
-                        // Match n after any non-letter char (emoji, punctuation, ▪️, etc.) followed by non-space
-                        content = content.replace(/([^\sa-zA-Z\u0600-\u06FF])n(?=[^\s])/g, '$1\n');
-                        // Step 4: Clean up triple+ newlines
-                        content = content.replace(/\n{3,}/g, '\n\n');
-                        var el = document.getElementById('pg_result_content');
-                        if (el) { el.value = content; filled = true; }
-                        var preview = document.getElementById('pg_result_preview');
-                        if (preview) preview.innerText = content;
-                    }
-                    if (parsed.hashtags) {
-                        var el = document.getElementById('pg_result_hashtags');
-                        if (el) { el.value = parsed.hashtags; filled = true; }
-                    }
-                    // Show the result container and switch to visual view
-                    var resultEl = document.getElementById('pg_post_result');
-                    if (resultEl) { resultEl.style.display = 'block'; }
-                    if (typeof pgToggleView === 'function') pgToggleView('visual');
-                } else if (tool === 'contentgen') {
-                    // Content generation form
-                    if (parsed.title) {
-                        var el = document.getElementById('cg_post_title');
-                        if (el) { el.value = parsed.title; filled = true; }
-                    }
-                    if (parsed.content) {
-                        var el = document.getElementById('cg_post_content');
-                        if (el) { el.value = parsed.content; filled = true; }
-                    }
-                    if (parsed.excerpt) {
-                        var el = document.getElementById('cg_ai_brief');
-                        if (el) { el.value = parsed.excerpt; filled = true; }
-                    }
-                    if (parsed.tags) {
-                        var tags = Array.isArray(parsed.tags) ? parsed.tags.join(', ') : parsed.tags;
-                        var el = document.getElementById('cg_post_tags');
-                        if (el) { el.value = tags; filled = true; }
-                    }
-                    if (parsed.meta_title) {
-                        var el = document.getElementById('cg_meta_title');
-                        if (el) { el.value = parsed.meta_title; filled = true; }
-                    }
-                    if (parsed.meta_description) {
-                        var el = document.getElementById('cg_meta_description');
-                        if (el) { el.value = parsed.meta_description; filled = true; }
-                    }
-                } else if (tool === 'productgen') {
-                    // Product generation form
-                    if (parsed.name) {
-                        var el = document.getElementById('pg_product_name');
-                        if (el) { el.value = parsed.name; filled = true; }
-                    }
-                    if (parsed.short_description) {
-                        var el = document.getElementById('pg_short_desc');
-                        if (el) { 
-                            // حذف پاراگراف اول اگر با "خلاصه سریع" شروع می‌شود
-                            let shortDesc = parsed.short_description;
-                            if (shortDesc.includes('<strong>خلاصه سریع:</strong>')) {
-                                shortDesc = shortDesc.replace(/<p>\s*<strong>خلاصه سریع:<\/strong>\s*[^<]*<\/p>/gi, '');
-                                shortDesc = shortDesc.trim();
-                            }
-                            el.value = shortDesc; 
-                            filled = true; 
-                        }
-                    }
-                    if (parsed.description) {
-                        var el = document.getElementById('pg_description');
-                        if (el) { el.value = parsed.description; filled = true; }
-                    }
-                    if (parsed.regular_price) {
-                        var el = document.getElementById('pg_regular_price');
-                        if (el) { el.value = parsed.regular_price; filled = true; }
-                    }
-                    if (parsed.sku) {
-                        var el = document.getElementById('pg_sku');
-                        if (el) { el.value = parsed.sku; filled = true; }
-                    }
-                } else if (tool === 'brainstorm') {
-                    var ideas = null;
-                    if (Array.isArray(parsed)) { ideas = parsed; }
-                    else if (parsed && parsed.ideas && Array.isArray(parsed.ideas)) { ideas = parsed.ideas; }
-                    // Fallback: try to extract array from raw text
-                    if (!ideas && raw) {
-                        try {
-                            var arrMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                            if (arrMatch) {
-                                var arr = JSON.parse(arrMatch[0]);
-                                if (Array.isArray(arr)) ideas = arr;
-                            }
-                        } catch(e) {}
-                    }
-                    if (ideas && ideas.length > 0) {
-                        bsRenderIdeas(ideas);
-                        filled = true;
-                    } else {
-                        // Last resort: show raw response in a card
-                        var grid = document.getElementById('bs_ideas_grid');
-                        if (grid) {
-                            grid.innerHTML = '<div class="ssp-item-card" style="grid-column:1/-1; border-left:3px solid var(--warning);"><h4 style="margin:0 0 8px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;margin-right:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> پاسخ AI قابل تفسیر نبود</h4><p style="font-size:0.85rem; color:var(--text-muted); margin:0 0 8px;">متن خام پاسخ:</p><pre style="background:var(--bg-alt); padding:12px; border-radius:8px; font-size:0.8rem; white-space:pre-wrap; direction:ltr; max-height:300px; overflow:auto;">' + (function(s){if(!s)return'';var d=document.createElement('div');d.appendChild(document.createTextNode(String(s)));return d.innerHTML;})(raw || '') + '</pre></div>';
-                            document.getElementById('bs_results').style.display = 'block';
-                        }
-                    }
-                } else if (tool === 'seo') {
-                    // SEO form
-                    if (parsed.optimized_title) {
-                        var el = document.getElementById('seo_title');
-                        if (el) { el.value = parsed.optimized_title; filled = true; }
-                    }
-                    if (parsed.optimized_content) {
-                        var el = document.getElementById('seo_content');
-                        if (el) { el.value = parsed.optimized_content; filled = true; }
-                    }
-                    if (parsed.hashtags) {
-                        var tags = Array.isArray(parsed.hashtags) ? parsed.hashtags.join(' ') : parsed.hashtags;
-                        var el = document.getElementById('seo_hashtags');
-                        if (el) { el.value = tags; filled = true; }
-                    }
-                    if (parsed.score || parsed.summary) {
-                        var resultHtml = '<div class="ssp-card" style="border-color:var(--accent);">' +
-                            '<h3>نتیجه تحلیل SEO</h3>' +
-                            (parsed.score ? '<p><strong>امتیاز:</strong> ' + parsed.score + '/100</p>' : '') +
-                            (parsed.summary ? '<p>' + parsed.summary + '</p>' : '') +
-                            (parsed.strengths ? '<p><strong>نقاط قوت:</strong> ' + (Array.isArray(parsed.strengths) ? parsed.strengths.join('، ') : parsed.strengths) + '</p>' : '') +
-                            (parsed.weaknesses ? '<p><strong>نقاط ضعف:</strong> ' + (Array.isArray(parsed.weaknesses) ? parsed.weaknesses.join('، ') : parsed.weaknesses) + '</p>' : '') +
-                            (parsed.improvements ? '<p><strong>پیشنهادات:</strong> ' + (Array.isArray(parsed.improvements) ? parsed.improvements.join('، ') : parsed.improvements) + '</p>' : '') +
-                            '</div>';
-                        var resultsEl = document.getElementById('seo_results');
-                        if (resultsEl) { resultsEl.innerHTML = resultHtml; filled = true; }
-                    }
-                } else if (tool === 'batchgen') {
-                    // Batch content generation results
-                    var items = null;
-                    if (Array.isArray(parsed)) { items = parsed; }
-                    else if (parsed && Array.isArray(parsed.items)) { items = parsed.items; }
-                    // Fallback: try to extract array from raw text
-                    if (!items && raw) {
-                        try {
-                            var arrMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                            if (arrMatch) {
-                                var arr = JSON.parse(arrMatch[0]);
-                                if (Array.isArray(arr)) items = arr;
-                            }
-                        } catch(e) {}
-                    }
-                    if (items && items.length > 0) {
-                        var batchResults = document.getElementById('batch_results');
-                        var batchBtn = document.getElementById('batch_gen_btn');
-                        if (batchBtn) batchBtn.classList.remove('loading');
-                        if (batchResults) {
-                            renderBatchResults(items, batchResults);
-                            filled = true;
-                        }
-                    }
-                } else if (tool === 'siteaudit') {
-                    // Site Audit results
-                    renderSiteAuditResults(parsed);
-                    filled = true;
-                }
-
-                if (filled) {
-                    console.log('[SSP Bridge] Forms filled successfully!');
-                    showToast('پاسخ در فرم قرار گرفت!', 'success');
+                if (typeof window.pgGenerateWithAI === 'function') {
+                    window.pgGenerateWithAI();
                 } else {
-                    console.warn('[SSP Bridge] No matching form fields found!');
-                    console.log('[SSP Bridge] Available forms:', {
-                        pg_result_title: !!document.getElementById('pg_result_title'),
-                        pg_result_content: !!document.getElementById('pg_result_content'),
-                        cg_post_title: !!document.getElementById('cg_post_title'),
-                        cg_post_content: !!document.getElementById('cg_post_content'),
-                        pg_product_name: !!document.getElementById('pg_product_name'),
-                        pg_description: !!document.getElementById('pg_description')
-                    });
-                    showToast('فرم مورد نظر یافت نشد.', 'warning');
+                    showToast('در حال بارگذاری موتور هوش مصنوعی...', 'info');
                 }
-            });
-
-            // ===== Enhanced Toast =====
-            window.showToast = function(msg, type) {
-                type = type || 'success';
-                var toast = document.getElementById('ssp-toast');
-                toast.className = 'ssp-toast toast-' + type + ' show';
-                toast.querySelector('.toast-msg').textContent = msg;
-                clearTimeout(toast._hideTimer);
-                toast._hideTimer = setTimeout(function() { toast.classList.remove('show'); }, 3500);
             };
 
-            // ===== Modal =====
-            window.closeModal = function(id) {
-                document.getElementById(id).classList.remove('active');
-            };
-
-            // Close modal on overlay click
-            document.querySelectorAll('.ssp-modal-overlay').forEach(function(overlay) {
-                overlay.addEventListener('click', function(e) {
-                    if (e.target === overlay) overlay.classList.remove('active');
-                });
-            });
-
-            // Close modal on Escape
-            document.addEventListener('keydown', function(e) {
-                if (e.key === 'Escape') {
-                    document.querySelectorAll('.ssp-modal-overlay.active').forEach(function(m) { m.classList.remove('active'); });
-                }
-            });
-
-            // ===== Messenger CRUD =====
-            // Platform-specific help text
-            var platformHelp = {
-                'telegram': {token: 'توکن ربات تلگرام', channel: '@mychannel یا -100123456789', hint: 'از @BotFather توکن بگیرید'},
-                'bale': {token: 'توکن بازوی بله', channel: '@mychannel یا -100123456789', hint: 'از @botfather بله توکن بگیرید'},
-                'eitaa': {token: 'توکن ربات ایتا', channel: '@mychannel یا -100123456789', hint: 'از BotFather ایتا توکن بگیرید'},
-                'rubika': {token: 'توکن بات روبیکا', channel: '@mychannel یا -100123456789', hint: 'از BotFather روبیکا توکن بگیرید'},
-                'instagram': {token: 'Instagram Access Token', channel: 'Instagram User ID', hint: 'از Graph API اینستاگرام استفاده کنید'},
-                'whatsapp': {token: 'WhatsApp Business Token', channel: 'Phone Number ID', hint: 'از Facebook Business API استفاده کنید'}
-            };
-
-            document.getElementById('new_messenger_platform').addEventListener('change', function() {
-                var p = platformHelp[this.value];
-                if (p) {
-                    document.getElementById('new_messenger_token').placeholder = p.token;
-                    document.getElementById('new_messenger_channel').placeholder = p.channel;
-                    document.getElementById('messenger_platform_hint').innerHTML = '<strong>راهنما:</strong> ' + p.hint;
-                }
-            });
-
-            window.addMessenger = function() {
-                var platform = document.getElementById('new_messenger_platform').value;
-                var name = document.getElementById('new_messenger_name').value;
-                var token = document.getElementById('new_messenger_token').value;
-                var channel = document.getElementById('new_messenger_channel').value;
-                var active = document.getElementById('new_messenger_active').checked ? 1 : 0;
-
-                if (!name || !token) { showToast('\u0646\u0627\u0645 \u0648 \u062A\u0648\u06A9\u0646 \u0631\u0627 \u0648\u0627\u0631\u062F \u06A9\u0646\u06CC\u062F', 'warning'); return; }
-
-                var btn = document.getElementById('add_messenger_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_messenger');
-                fd.append('security', nonce);
-                fd.append('platform', platform);
-                fd.append('name', name);
-                fd.append('token', token);
-                fd.append('channel_id', channel);
-                fd.append('is_active', active);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            removeEmptyState('messengers_list');
-                            var masked = token.length > 8 ? token.substring(0, 4) + '****' + token.substring(token.length - 4) : '****';
-                            var newM = {id: res.data.id || Date.now(), platform: platform, name: name, token_masked: masked, channel_id: channel, is_active: active};
-                            messengerData.push(newM);
-                            document.getElementById('messengers_list').insertAdjacentHTML('beforeend', createMessengerCard(newM));
-                            document.getElementById('new_messenger_name').value = '';
-                            document.getElementById('new_messenger_token').value = '';
-                            document.getElementById('new_messenger_channel').value = '';
-                            document.getElementById('new_messenger_active').checked = true;
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            window.deleteMessenger = function(id) {
-                if (!confirm('\u0622\u06CC\u0627 \u0627\u0646 \u067E\u06CC\u0627\u0645\u200C\u0631\u0633\u0627\u0646 \u062D\u0630\u0641 \u0634\u0648\u062F\u061F')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_messenger');
-                fd.append('security', nonce);
-                fd.append('messenger_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            var card = document.querySelector('#messengers_list [data-id="' + id + '"]');
-                            if (card) { card.classList.add('removing'); setTimeout(function() { card.remove(); showEmptyState('messengers_list', '\uD83D\uDCAC', '\u0647\u0646\u0648\u0632 \u067E\u06CC\u0627\u0645\u200C\u0631\u0633\u0627\u0646\u06CC \u0627\u0636\u0627\u0641\u0647 \u0646\u06A9\u0631\u062F\u0647\u0627\u06CC\u062F.', '\u0627\u0632 \u0641\u0631\u0645 \u0632\u06CC\u0631 \u0627\u0648\u0644\u06CC\u0646 \u067E\u06CC\u0627\u0645\u200C\u0631\u0633\u0627\u0646 \u062E\u0648\u062F \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u06A9\u0646\u06CC\u062F.'); }, 300); }
-                            messengerData = messengerData.filter(function(d) { return d.id !== id; });
-                        }
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            window.testMessengerConnection = function(id) {
-                var m = messengerData.find(function(d) { return d.id === id; });
-                if (!m) return;
-                var s = document.getElementById('messenger_status_' + id);
-                s.textContent = '\u062F\u0631 \u062D\u0627\u0644 \u062A\u0633\u062A...';
-                s.className = 'ssp-connection-status';
-                var fd = new FormData();
-                fd.append('action', 'ssp_test_connection');
-                fd.append('security', nonce);
-                fd.append('platform', m.platform);
-                fd.append('messenger_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { s.textContent = res.data.message + ' - ' + res.data.bot_name; s.classList.add('success'); }
-                        else { s.textContent = res.data.message; s.classList.add('error'); }
-                    })
-                    .catch(function() { s.textContent = '\u062E\u0637\u0627 \u062F\u0631 \u062A\u0633\u062A'; s.classList.add('error'); });
-            };
-
-            window.editMessenger = function(id) {
-                var m = messengerData.find(function(d) { return d.id === id; });
-                if (!m) return;
-                document.getElementById('edit_messenger_id').value = m.id;
-                document.getElementById('edit_messenger_platform').value = m.platform;
-                document.getElementById('edit_messenger_name').value = m.name;
-                document.getElementById('edit_messenger_token').value = m.token_masked || '';
-                document.getElementById('edit_messenger_token').placeholder = 'توکن فعلی حفظ می‌شود';
-                document.getElementById('edit_messenger_channel').value = m.channel_id;
-                document.getElementById('edit_messenger_active').checked = m.is_active === 1;
-                document.getElementById('modal_edit_messenger').classList.add('active');
-            };
-
-            window.saveEditMessenger = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_update_messenger');
-                fd.append('security', nonce);
-                var id = parseInt(document.getElementById('edit_messenger_id').value);
-                fd.append('messenger_id', id);
-                fd.append('platform', document.getElementById('edit_messenger_platform').value);
-                fd.append('name', document.getElementById('edit_messenger_name').value);
-                fd.append('token', document.getElementById('edit_messenger_token').value);
-                fd.append('channel_id', document.getElementById('edit_messenger_channel').value);
-                fd.append('is_active', document.getElementById('edit_messenger_active').checked ? 1 : 0);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeModal('modal_edit_messenger');
-                            var updated = {
-                                id: id,
-                                platform: document.getElementById('edit_messenger_platform').value,
-                                name: document.getElementById('edit_messenger_name').value,
-                                token_masked: document.getElementById('edit_messenger_token').value,
-                                channel_id: document.getElementById('edit_messenger_channel').value,
-                                is_active: document.getElementById('edit_messenger_active').checked ? 1 : 0
-                            };
-                            var idx = messengerData.findIndex(function(d) { return d.id === id; });
-                            if (idx >= 0) messengerData[idx] = updated;
-                            var card = document.querySelector('#messengers_list [data-id="' + id + '"]');
-                            if (card) {
-                                var temp = document.createElement('div');
-                                temp.innerHTML = createMessengerCard(updated);
-                                card.outerHTML = temp.firstChild.outerHTML;
-                            }
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            // Event delegation for messenger buttons
-            document.getElementById('messengers_list').addEventListener('click', function(e) {
-                var btn = e.target.closest('[data-id]');
-                if (!btn) return;
-                var id = parseInt(btn.dataset.id);
-                if (btn.classList.contains('btn-test-messenger')) testMessengerConnection(id);
-                else if (btn.classList.contains('btn-edit-messenger')) editMessenger(id);
-                else if (btn.classList.contains('btn-delete-messenger')) deleteMessenger(id);
-            });
-
-            // ===== Bot Builder =====
-            var currentBotConfig = null;
-
-            window.showAddBotForm = function() {
-                document.getElementById('bot_list_section').style.display = 'none';
-                document.getElementById('bot_templates_section').style.display = 'none';
-                document.getElementById('bot_editor_section').style.display = 'block';
-                document.getElementById('bot_editor_id').value = '';
-                document.getElementById('bot_editor_title').textContent = 'بات جدید';
-                document.getElementById('bot_name').value = '';
-                document.getElementById('bot_token').value = '';
-                document.getElementById('bot_platform').value = 'telegram';
-                document.getElementById('bot_active').checked = true;
-                document.getElementById('bot_welcome').value = '';
-                currentBotConfig = null;
-                updateBotCommandsList([]);
-                updateBotButtonsList([]);
-                updateBotAutoRepliesList([]);
-            };
-
-            window.showBotList = function() {
-                document.getElementById('bot_list_section').style.display = 'block';
-                document.getElementById('bot_templates_section').style.display = 'block';
-                document.getElementById('bot_editor_section').style.display = 'none';
-            };
-
-            // ========================================
-            // BOT TEMPLATES
-            // ========================================
-
-            // Helper: Open bot editor with config
-            function openBotEditor(config, botId) {
-                currentBotConfig = config;
-                document.getElementById('bot_list_section').style.display = 'none';
-                document.getElementById('bot_templates_section').style.display = 'none';
-                document.getElementById('bot_editor_section').style.display = 'block';
-                document.getElementById('bot_editor_id').value = botId;
-                document.getElementById('bot_editor_title').textContent = 'ویرایش: ' + (config.name || '') + ' (#' + botId + ')';
-                document.getElementById('bot_name').value = config.name || '';
-                document.getElementById('bot_token').value = config.token || '';
-                document.getElementById('bot_platform').value = config.platform || 'telegram';
-                document.getElementById('bot_active').checked = config.is_active == 1;
-                document.getElementById('bot_welcome').value = config.welcome_message || '';
-                updateBotCommandsList(config.commands || []);
-                updateBotButtonsList(config.buttons || []);
-                updateBotAutoRepliesList(config.auto_replies || []);
-                updateBotScenariosList(config.scenarios || []);
-
-                // Webhook URL display
-                var whDisplay = document.getElementById('bot_webhook_url_display');
-                if (whDisplay) {
-                    var url = (typeof sspSiteUrl !== 'undefined' ? sspSiteUrl : ajaxurl.replace('/wp-admin/admin-ajax.php', ''));
-                    whDisplay.value = url + '/wp-json/ssp/v1/bot-webhook/' + botId;
-                }
-
-                // Token warning
-                var statusDiv = document.getElementById('bot_webhook_status');
-                if (statusDiv) {
-                    if (!config.token) {
-                        statusDiv.style.display = 'block';
-                        statusDiv.style.background = 'var(--warning-soft)';
-                        statusDiv.style.border = '1px solid var(--warning)';
-                        statusDiv.style.color = 'var(--warning)';
-                        statusDiv.innerHTML = '&#9888; <strong>توکن ربات تنظیم نشده!</strong><br>برای استفاده از وبهوک، ابتدا توکن ربات را وارد کرده و ذخیره کنید.';
-                    } else {
-                        statusDiv.style.display = 'none';
-                    }
-                }
-            }
-
-            window.toggleTemplatesSection = function() {
-                var grid = document.getElementById('templates_grid');
-                var btn = document.getElementById('toggle_templates_btn');
-                if (grid.style.display === 'none') {
-                    grid.style.display = 'grid';
-                    btn.textContent = 'پنهان کردن';
+            window.cgGenerateViaBrowser = function() {
+                if (typeof window.cgGenerateWithAI === 'function') {
+                    window.cgGenerateWithAI();
                 } else {
-                    grid.style.display = 'none';
-                    btn.textContent = 'نمایش قالب‌ها';
+                    showToast('در حال بارگذاری موتور هوش مصنوعی...', 'info');
                 }
-            };
-
-            window.applyBotTemplate = function(templateKey) {
-                var msgs = {
-                    'content_publisher': 'بات انتشار محتوا',
-                    'faq_bot': 'بات سوالات متداول',
-                    'appointment': 'بات نوبت‌دهی'
-                };
-                var tplName = msgs[templateKey] || templateKey;
-
-                if (!confirm('قالب «' + tplName + '» بارگذاری شود؟\n\nیک بات جدید با تنظیمات از پیش تعریف شده ایجاد می‌شود.\nتوکن ربات را باید جداگانه وارد کنید.')) return;
-
-                showToast('در حال بارگذاری قالب...', 'info');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_apply_bot_template');
-                fd.append('security', nonce);
-                fd.append('template_key', templateKey);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            openBotEditor(res.data.config, res.data.bot_id);
-                            showToast('قالب بارگذاری شد! توکن ربات را وارد کنید.', 'success');
-                        } else {
-                            showToast(res.data.message || 'خطا در بارگذاری قالب', 'error');
-                        }
-                    })
-                    .catch(function() {
-                        showToast('خطا در ارتباط با سرور', 'error');
-                    });
-            };
-
-            window.editBot = function(botId) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_bot_config');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            openBotEditor(res.data.config, botId);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در دریافت اطلاعات', 'error'); });
-            };
-
-            window.saveBotConfig = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_bot_config');
-                fd.append('security', nonce);
-                fd.append('bot_id', document.getElementById('bot_editor_id').value);
-                fd.append('name', document.getElementById('bot_name').value);
-                fd.append('platform', document.getElementById('bot_platform').value);
-                fd.append('token', document.getElementById('bot_token').value);
-                fd.append('is_active', document.getElementById('bot_active').checked ? 1 : 0);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            var savedBotId = res.data.bot_id;
-                            document.getElementById('bot_editor_id').value = savedBotId;
-
-                            // Update currentBotConfig with saved data
-                            if (currentBotConfig) {
-                                currentBotConfig.id = savedBotId;
-                                currentBotConfig.name = document.getElementById('bot_name').value;
-                                currentBotConfig.token = document.getElementById('bot_token').value;
-                                currentBotConfig.platform = document.getElementById('bot_platform').value;
-                                currentBotConfig.is_active = document.getElementById('bot_active').checked ? 1 : 0;
-                            }
-
-                            // Update title with bot ID
-                            document.getElementById('bot_editor_title').textContent = 'ویرایش: ' + (currentBotConfig.name || '') + ' (#' + savedBotId + ')';
-
-                            // Generate webhook URL for the saved bot
-                            var whDisplay = document.getElementById('bot_webhook_url_display');
-                            if (whDisplay && savedBotId) {
-                                if (typeof sspSiteUrl !== 'undefined') {
-                                    whDisplay.value = sspSiteUrl + '/wp-json/ssp/v1/bot-webhook/' + savedBotId;
-                                } else {
-                                    whDisplay.value = ajaxurl.replace('/wp-admin/admin-ajax.php', '/wp-json/ssp/v1/bot-webhook/' + savedBotId);
-                                }
-                            }
-
-                            // Auto-set webhook after saving (only if token exists)
-                            var webhookUrl = whDisplay ? whDisplay.value : '';
-                            if (webhookUrl && savedBotId && document.getElementById('bot_token').value) {
-                                // Small delay to ensure save is complete
-                                setTimeout(function() {
-                                    autoSetBotWebhook(savedBotId, webhookUrl);
-                                }, 500);
-                            }
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ذخیره', 'error'); });
-            };
-
-            window.deleteBot = function(botId) {
-                if (!confirm('آیا از حذف این بات مطمئن هستید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_bot');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('بات حذف شد', 'success');
-                            var card = document.querySelector('#bots_list [data-id="' + botId + '"]');
-                            if (card) card.remove();
-                        } else {
-                            showToast(res.data ? res.data.message : 'خطا در حذف', 'error');
-                        }
-                    });
-            };
-
-            window.testBotConnection = function() {
-                var platform = document.getElementById('bot_platform').value;
-                var token = document.getElementById('bot_token').value;
-                if (!token) { showToast('توکن را وارد کنید', 'warning'); return; }
-
-                var resultDiv = document.getElementById('bot_connection_result');
-                resultDiv.style.display = 'block';
-                resultDiv.innerHTML = '<span style="color:var(--info);">در حال تست...</span>';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_validate_messenger_token');
-                fd.append('security', nonce);
-                fd.append('platform', platform);
-                fd.append('token', token);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.valid) {
-                            resultDiv.innerHTML = '<span style="color:var(--success);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> اتصال موفق! نام بات: ' + res.data.bot_name + ' (@' + res.data.bot_username + ')</span>';
-                        } else {
-                            resultDiv.innerHTML = '<span style="color:var(--error);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> ' + (res.data.error || 'توکن نامعتبر') + '</span>';
-                        }
-                    })
-                    .catch(function() { resultDiv.innerHTML = '<span style="color:var(--error);">خطا در تست اتصال</span>'; });
-            };
-
-            window.getBotStats = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_bot_stats');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var info = res.data.bot_info;
-                            showToast('نام: ' + info.name + ' | username: @' + info.username + ' | دستورات: ' + res.data.commands_count + ' | دکمه‌ها: ' + res.data.buttons_count, 'success');
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    });
-            };
-
-            window.saveBotWelcome = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_set_bot_welcome');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('welcome_message', document.getElementById('bot_welcome').value);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.data.message, res.success ? 'success' : 'error'); });
-            };
-
-            // Commands
-            window.showAddCommandForm = function() {
-                document.getElementById('add_command_form').style.display = 'block';
-                document.getElementById('edit_command_id').value = '';
-                document.getElementById('command_name').value = '';
-                document.getElementById('command_desc').value = '';
-                document.getElementById('command_response').value = '';
-            };
-
-            window.hideAddCommandForm = function() {
-                document.getElementById('add_command_form').style.display = 'none';
-            };
-
-            window.saveCommand = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_bot_command');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('command', document.getElementById('command_name').value);
-                fd.append('description', document.getElementById('command_desc').value);
-                fd.append('response', document.getElementById('command_response').value);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            hideAddCommandForm();
-                            if (currentBotConfig) {
-                                if (!currentBotConfig.commands) currentBotConfig.commands = [];
-                                currentBotConfig.commands.push(res.data.command);
-                                updateBotCommandsList(currentBotConfig.commands);
-                            }
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    });
-            };
-
-            window.deleteCommand = function(commandId) {
-                var botId = document.getElementById('bot_editor_id').value;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_bot_command');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('command_id', commandId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            if (currentBotConfig) {
-                                currentBotConfig.commands = (currentBotConfig.commands || []).filter(function(c) { return c.id != commandId; });
-                                updateBotCommandsList(currentBotConfig.commands);
-                            }
-                        }
-                    });
-            };
-
-            function updateBotCommandsList(commands) {
-                var container = document.getElementById('bot_commands_list');
-                if (!commands || commands.length === 0) {
-                    container.innerHTML = '<div class="ssp-empty" style="padding:20px;"><p>هنوز دستوری اضافه نکرده‌اید.</p></div>';
-                    return;
-                }
-                var html = '';
-                commands.forEach(function(cmd) {
-                    html += '<div class="ssp-item-card" data-id="' + cmd.id + '" style="margin-bottom:8px;">';
-                    html += '<div class="ssp-item-card-head"><div>';
-                    html += '<div class="ssp-item-card-title">/' + cmd.command + ' <span style="color:var(--text-muted); font-size:0.8rem;">' + (cmd.description || '') + '</span></div>';
-                    html += '<div class="ssp-item-card-meta" style="max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + (cmd.response || '').substring(0, 80) + '</div>';
-                    html += '</div><button class="ssp-btn-icon" onclick="deleteCommand(' + cmd.id + ')" title="حذف">✕</button></div></div>';
-                });
-                container.innerHTML = html;
-            }
-
-            // Buttons
-            window.showAddButtonForm = function() {
-                document.getElementById('add_button_form').style.display = 'block';
-                document.getElementById('edit_button_id').value = '';
-                document.getElementById('button_text').value = '';
-                document.getElementById('button_type').value = 'callback';
-                document.getElementById('button_keyboard_type').value = 'inline';
-                document.getElementById('button_value').value = '';
-                document.getElementById('button_row').value = '0';
-                document.getElementById('button_col').value = '0';
-                clearChildButtons();
-                toggleButtonTypeFields();
-            };
-
-            window.hideAddButtonForm = function() {
-                document.getElementById('add_button_form').style.display = 'none';
-            };
-
-            window.toggleButtonTypeFields = function() {
-                var type = document.getElementById('button_type').value;
-                var kbdType = document.getElementById('button_keyboard_type').value;
-
-                // Hide all type-specific fields
-                var fields = ['button_url_fields', 'button_webapp_fields', 'button_login_fields',
-                             'button_switch_inline_fields', 'button_request_peer_fields', 'button_callback_fields',
-                             'button_value_group'];
-                fields.forEach(function(id) {
-                    var el = document.getElementById(id);
-                    if (el) el.style.display = 'none';
-                });
-
-                // Show warning for simple buttons in inline keyboard
-                var warningEl = document.getElementById('inline_type_warning');
-                if (warningEl) {
-                    if (kbdType === 'inline' && type === 'simple') {
-                        warningEl.style.display = 'block';
-                    } else {
-                        warningEl.style.display = 'none';
-                    }
-                }
-
-                // Show relevant fields based on type
-                var valueGroup = document.getElementById('button_value_group');
-                var valueLabel = document.getElementById('button_value_label');
-                var valueInput = document.getElementById('button_value');
-
-                switch(type) {
-                    case 'url':
-                        document.getElementById('button_url_fields').style.display = 'block';
-                        break;
-                    case 'web_app':
-                        document.getElementById('button_webapp_fields').style.display = 'block';
-                        break;
-                    case 'login_url':
-                        document.getElementById('button_login_fields').style.display = 'block';
-                        break;
-                    case 'switch_inline':
-                        document.getElementById('button_switch_inline_fields').style.display = 'block';
-                        break;
-                    case 'request_peer':
-                        document.getElementById('button_request_peer_fields').style.display = 'block';
-                        break;
-                    case 'callback':
-                        document.getElementById('button_callback_fields').style.display = 'block';
-                        break;
-                    case 'request_contact':
-                    case 'request_location':
-                    case 'request_poll':
-                    case 'pay':
-                        // These don't need a value field
-                        break;
-                    default:
-                        valueGroup.style.display = 'block';
-                        valueLabel.textContent = 'مقدار (اختیاری)';
-                        valueInput.placeholder = 'مقدار دلخواه';
-                        break;
-                }
-            };
-
-            // Child buttons management
-            window.addChildButtonField = function() {
-                var container = document.getElementById('child_buttons_container');
-                var row = document.createElement('div');
-                row.className = 'child-btn-row';
-                row.style.cssText = 'display:flex; gap:6px; margin-bottom:6px; align-items:center;';
-                row.innerHTML = '<input type="text" class="child-btn-text ssp-input" placeholder="متن دکمه" style="flex:1; font-size:0.85rem;">' +
-                    '<input type="text" class="child-btn-value ssp-input" placeholder="شناسه" style="width:80px; font-size:0.85rem; dir:ltr;">' +
-                    '<button type="button" class="ssp-btn-icon" onclick="this.parentElement.remove()" title="حذف">✕</button>';
-                container.appendChild(row);
-            };
-
-            window.clearChildButtons = function() {
-                document.getElementById('child_buttons_container').innerHTML = '';
-            };
-
-            function getChildButtonsData() {
-                var childBtns = [];
-                var rows = document.querySelectorAll('#child_buttons_container .child-btn-row');
-                rows.forEach(function(row) {
-                    var text = row.querySelector('.child-btn-text').value.trim();
-                    var value = row.querySelector('.child-btn-value').value.trim();
-                    if (text && value) {
-                        childBtns.push({text: text, value: value});
-                    }
-                });
-                return childBtns;
-            }
-
-            function setChildButtonsData(childBtns) {
-                var container = document.getElementById('child_buttons_container');
-                container.innerHTML = '';
-                if (!childBtns || childBtns.length === 0) return;
-                childBtns.forEach(function(btn) {
-                    var row = document.createElement('div');
-                    row.className = 'child-btn-row';
-                    row.style.cssText = 'display:flex; gap:6px; margin-bottom:6px; align-items:center;';
-                    row.innerHTML = '<input type="text" class="child-btn-text ssp-input" value="' + (btn.text || '') + '" placeholder="متن دکمه" style="flex:1; font-size:0.85rem;">' +
-                        '<input type="text" class="child-btn-value ssp-input" value="' + (btn.value || '') + '" placeholder="شناسه" style="width:80px; font-size:0.85rem; dir:ltr;">' +
-                        '<button type="button" class="ssp-btn-icon" onclick="this.parentElement.remove()" title="حذف">✕</button>';
-                    container.appendChild(row);
-                });
-            }
-
-            window.saveButton = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var btnType = document.getElementById('button_type').value;
-                var kbdType = document.getElementById('button_keyboard_type').value;
-
-                // Validate: simple buttons can't be in inline keyboard
-                if (kbdType === 'inline' && btnType === 'simple') {
-                    showToast('دکمه ساده در Inline Keyboard مجاز نیست. از Reply Keyboard یا نوع دکمه دیگری استفاده کنید.', 'error');
-                    return;
-                }
-
-                var editId = document.getElementById('edit_button_id').value;
-                var isEdit = editId !== '';
-
-                var fd = new FormData();
-                fd.append('action', isEdit ? 'ssp_update_bot_button' : 'ssp_add_bot_button');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                if (isEdit) fd.append('button_id', editId);
-                fd.append('text', document.getElementById('button_text').value);
-                fd.append('type', document.getElementById('button_type').value);
-                fd.append('keyboard_type', document.getElementById('button_keyboard_type').value);
-                fd.append('row', document.getElementById('button_row').value);
-                fd.append('col', document.getElementById('button_col').value);
-
-                // Type-specific values
-                var type = document.getElementById('button_type').value;
-                switch(type) {
-                    case 'url':
-                        fd.append('value', document.getElementById('button_url').value);
-                        break;
-                    case 'web_app':
-                        fd.append('value', document.getElementById('button_webapp_url').value);
-                        break;
-                    case 'login_url':
-                        fd.append('value', document.getElementById('button_login_url').value);
-                        fd.append('bot_username', document.getElementById('button_bot_username').value);
-                        fd.append('forward_text', document.getElementById('button_forward_text').value);
-                        break;
-                    case 'switch_inline':
-                        fd.append('value', document.getElementById('button_switch_query').value);
-                        fd.append('switch_to_chat', document.getElementById('button_switch_to_chat').checked ? '1' : '0');
-                        break;
-                    case 'request_peer':
-                        fd.append('peer_type', document.getElementById('button_peer_type').value);
-                        fd.append('max_quantity', document.getElementById('button_max_quantity').value);
-                        fd.append('name_requested', document.getElementById('button_name_requested').checked ? '1' : '0');
-                        fd.append('username_requested', document.getElementById('button_username_requested').checked ? '1' : '0');
-                        fd.append('photo_requested', document.getElementById('button_photo_requested').checked ? '1' : '0');
-                        break;
-                    case 'callback':
-                        fd.append('value', document.getElementById('button_callback_data').value);
-                        fd.append('requires_password', document.getElementById('button_requires_password').checked ? '1' : '0');
-                        break;
-                    default:
-                        fd.append('value', document.getElementById('button_value').value);
-                        break;
-                }
-
-                // Collect child buttons
-                var childBtns = [];
-                var childContainer = document.getElementById('child_buttons_container');
-                var childRows = childContainer.querySelectorAll('.child-btn-row');
-                childRows.forEach(function(row) {
-                    var text = row.querySelector('.child-btn-text').value.trim();
-                    var value = row.querySelector('.child-btn-value').value.trim();
-                    if (text && value) {
-                        childBtns.push({text: text, value: value});
-                    }
-                });
-                if (childBtns.length > 0) {
-                    fd.append('next_buttons', JSON.stringify(childBtns));
-                }
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            hideAddButtonForm();
-                            if (currentBotConfig) {
-                                if (isEdit) {
-                                    // Update existing button in array
-                                    var idx = currentBotConfig.buttons.findIndex(function(b) { return b.id == editId; });
-                                    if (idx !== -1) {
-                                        currentBotConfig.buttons[idx] = res.data.button;
-                                    }
-                                } else {
-                                    // Add new button
-                                    if (!currentBotConfig.buttons) currentBotConfig.buttons = [];
-                                    currentBotConfig.buttons.push(res.data.button);
-                                }
-                                updateBotButtonsList(currentBotConfig.buttons);
-                            }
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    });
-            };
-
-            window.deleteButton = function(buttonId) {
-                var botId = document.getElementById('bot_editor_id').value;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_bot_button');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('button_id', buttonId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            if (currentBotConfig) {
-                                currentBotConfig.buttons = (currentBotConfig.buttons || []).filter(function(b) { return b.id != buttonId; });
-                                updateBotButtonsList(currentBotConfig.buttons);
-                            }
-                        }
-                    });
-            };
-
-            function updateBotButtonsList(buttons) {
-                var container = document.getElementById('bot_buttons_list');
-                var preview = document.getElementById('button_preview');
-                var keyboardPreview = document.getElementById('keyboard_preview');
-
-                if (!buttons || buttons.length === 0) {
-                    container.innerHTML = '<div class="ssp-empty" style="padding:20px;"><p>هنوز دکمه‌ای اضافه نکرده‌اید.</p></div>';
-                    preview.style.display = 'none';
-                    return;
-                }
-
-                var typeLabels = {
-                    'simple': '□ ساده',
-                    'url': '→ لینک',
-                    'callback': 'Callback',
-                    'web_app': '◎ Web App',
-                    'login_url': '⊞ Login',
-                    'switch_inline': '🔄 Switch',
-                    'request_contact': '📱 شماره',
-                    'request_location': '📍 موقعیت',
-                    'request_poll': '▥ نظرسنجی',
-                    'request_peer': '👤 کاربر',
-                    'pay': '💳 پرداخت'
-                };
-
-                var kbdLabels = {
-                    'inline': 'Inline',
-                    'reply': 'Reply'
-                };
-
-                var html = '';
-                buttons.forEach(function(btn) {
-                    var typeLabel = typeLabels[btn.type] || btn.type;
-                    var kbdLabel = kbdLabels[btn.keyboard_type] || 'inline';
-                    var styleInfo = '';
-                    if (btn.style) {
-                        if (btn.style.bg) styleInfo += ' | 🎨 ' + btn.style.bg;
-                        if (btn.style.icon) styleInfo += ' | 🔣';
-                    }
-
-                    html += '<div class="ssp-item-card" data-id="' + btn.id + '" style="margin-bottom:8px;">';
-                    html += '<div class="ssp-item-card-head"><div>';
-                    html += '<div class="ssp-item-card-title">' + btn.text + '</div>';
-                    html += '<div class="ssp-item-card-meta">';
-                    html += '<span class="ssp-badge">' + typeLabel + '</span> ';
-                    html += '<span class="ssp-badge">' + kbdLabel + '</span> ';
-                    html += 'ردیف: ' + btn.row;
-                    if (btn.value) html += ' | ' + (btn.value.length > 30 ? btn.value.substring(0, 30) + '...' : btn.value);
-                    if (btn.next_buttons && btn.next_buttons.length > 0) {
-                        html += ' | <span style="color:var(--primary);">🌳 ' + btn.next_buttons.length + ' زیرمجموعه</span>';
-                    }
-                    html += styleInfo;
-                    html += '</div>';
-                    html += '</div><div style="display:flex; gap:4px;">';
-                    html += '<button class="ssp-btn-icon" onclick="editButton(' + btn.id + ')" title="ویرایش">✎</button>';
-                    html += '<button class="ssp-btn-icon" onclick="deleteButton(' + btn.id + ')" title="حذف">✕</button>';
-                    html += '</div></div></div>';
-                });
-                container.innerHTML = html;
-
-                // Update preview
-                preview.style.display = 'block';
-                var inlineRows = {};
-                var replyRows = {};
-
-                buttons.forEach(function(btn) {
-                    if (btn.keyboard_type === 'reply') {
-                        var row = btn.row || 0;
-                        if (!replyRows[row]) replyRows[row] = [];
-                        replyRows[row].push(btn);
-                    } else {
-                        var row = btn.row || 0;
-                        if (!inlineRows[row]) inlineRows[row] = [];
-                        inlineRows[row].push(btn);
-                    }
-                });
-
-                var previewHtml = '';
-
-                // Inline keyboard preview
-                if (Object.keys(inlineRows).length > 0) {
-                    previewHtml += '<div style="margin-bottom:12px;"><strong style="font-size:0.8rem; color:var(--text-muted);">Inline Keyboard:</strong></div>';
-                    previewHtml += '<div style="background:var(--surface); padding:12px; border-radius:12px; border:1px solid var(--border);">';
-                    Object.keys(inlineRows).sort().forEach(function(row) {
-                        previewHtml += '<div style="display:flex; gap:6px; margin-bottom:6px;">';
-                        inlineRows[row].forEach(function(btn) {
-                            var bg = 'var(--primary)';
-                            var color = '#fff';
-                            if (btn.style && btn.style.bg === 'danger') { bg = 'var(--danger)'; }
-                            else if (btn.style && btn.style.bg === 'success') { bg = 'var(--success)'; }
-                            else if (btn.type === 'url') { bg = '#3b82f6'; }
-                            else if (btn.type === 'callback') { bg = '#8b5cf6'; }
-                            else if (btn.type === 'pay') { bg = '#f59e0b'; color = '#000'; }
-
-                            var icon = btn.style && btn.style.icon ? '🔘 ' : '';
-                            previewHtml += '<div style="padding:8px 16px; background:' + bg + '; color:' + color + '; border-radius:8px; font-size:0.85rem;">' + icon + btn.text + '</div>';
-                        });
-                        previewHtml += '</div>';
-                    });
-                    previewHtml += '</div>';
-                }
-
-                // Reply keyboard preview
-                if (Object.keys(replyRows).length > 0) {
-                    previewHtml += '<div style="margin-top:12px; margin-bottom:12px;"><strong style="font-size:0.8rem; color:var(--text-muted);">Reply Keyboard:</strong></div>';
-                    previewHtml += '<div style="background:var(--bg-alt); padding:12px; border-radius:12px; border:1px solid var(--border);">';
-                    Object.keys(replyRows).sort().forEach(function(row) {
-                        previewHtml += '<div style="display:flex; gap:6px; margin-bottom:6px;">';
-                        replyRows[row].forEach(function(btn) {
-                            previewHtml += '<div style="padding:8px 16px; background:var(--surface); border-radius:8px; font-size:0.85rem; border:1px solid var(--border);">' + btn.text + '</div>';
-                        });
-                        previewHtml += '</div>';
-                    });
-                    previewHtml += '</div>';
-                }
-
-                keyboardPreview.innerHTML = previewHtml;
-            }
-
-            window.editButton = function(buttonId) {
-                var btn = currentBotConfig.buttons.find(function(b) { return b.id === buttonId; });
-                if (!btn) return;
-
-                document.getElementById('add_button_form').style.display = 'block';
-                document.getElementById('edit_button_id').value = btn.id;
-                document.getElementById('button_text').value = btn.text;
-                document.getElementById('button_type').value = btn.type;
-                document.getElementById('button_keyboard_type').value = btn.keyboard_type || 'inline';
-                document.getElementById('button_row').value = btn.row || 0;
-                document.getElementById('button_col').value = btn.col || 0;
-
-                // Set type-specific values
-                switch(btn.type) {
-                    case 'url':
-                        document.getElementById('button_url').value = btn.value || '';
-                        break;
-                    case 'web_app':
-                        document.getElementById('button_webapp_url').value = btn.value || '';
-                        break;
-                    case 'login_url':
-                        document.getElementById('button_login_url').value = btn.value || '';
-                        document.getElementById('button_bot_username').value = btn.bot_username || '';
-                        document.getElementById('button_forward_text').value = btn.forward_text || '';
-                        break;
-                    case 'switch_inline':
-                        document.getElementById('button_switch_query').value = btn.value || '';
-                        document.getElementById('button_switch_to_chat').checked = btn.switch_to_chat || false;
-                        break;
-                    case 'request_peer':
-                        document.getElementById('button_peer_type').value = btn.peer_type || 'user';
-                        document.getElementById('button_max_quantity').value = btn.max_quantity || 1;
-                        document.getElementById('button_name_requested').checked = btn.name_requested || false;
-                        document.getElementById('button_username_requested').checked = btn.username_requested || false;
-                        document.getElementById('button_photo_requested').checked = btn.photo_requested || false;
-                        break;
-                    case 'callback':
-                        document.getElementById('button_callback_data').value = btn.value || '';
-                        document.getElementById('button_requires_password').checked = btn.requires_password || false;
-                        break;
-                    default:
-                        document.getElementById('button_value').value = btn.value || '';
-                        break;
-                }
-
-                // Load child buttons
-                setChildButtonsData(btn.next_buttons || []);
-
-                toggleButtonTypeFields();
-            };
-
-            // Auto Replies
-            window.showAddAutoReplyForm = function() {
-                document.getElementById('add_auto_reply_form').style.display = 'block';
-                document.getElementById('edit_reply_id').value = '';
-                document.getElementById('reply_trigger').value = '';
-                document.getElementById('reply_match_type').value = 'exact';
-                document.getElementById('reply_response').value = '';
-            };
-
-            window.hideAddAutoReplyForm = function() {
-                document.getElementById('add_auto_reply_form').style.display = 'none';
-            };
-
-            window.saveAutoReply = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_bot_auto_reply');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('trigger', document.getElementById('reply_trigger').value);
-                fd.append('match_type', document.getElementById('reply_match_type').value);
-                fd.append('response', document.getElementById('reply_response').value);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            hideAddAutoReplyForm();
-                            if (currentBotConfig) {
-                                if (!currentBotConfig.auto_replies) currentBotConfig.auto_replies = [];
-                                currentBotConfig.auto_replies.push(res.data.reply);
-                                updateBotAutoRepliesList(currentBotConfig.auto_replies);
-                            }
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    });
-            };
-
-            window.deleteAutoReply = function(replyId) {
-                var botId = document.getElementById('bot_editor_id').value;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_bot_auto_reply');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('reply_id', replyId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            if (currentBotConfig) {
-                                currentBotConfig.auto_replies = (currentBotConfig.auto_replies || []).filter(function(r) { return r.id != replyId; });
-                                updateBotAutoRepliesList(currentBotConfig.auto_replies);
-                            }
-                        }
-                    });
-            };
-
-            function updateBotAutoRepliesList(replies) {
-                var container = document.getElementById('bot_auto_replies_list');
-                if (!replies || replies.length === 0) {
-                    container.innerHTML = '<div class="ssp-empty" style="padding:20px;"><p>هنوز پاسخ خودکاری اضافه نکرده‌اید.</p></div>';
-                    return;
-                }
-                var matchLabels = {exact: 'دقیق', contains: 'شامل', starts_with: 'شروع با'};
-                var html = '';
-                replies.forEach(function(reply) {
-                    html += '<div class="ssp-item-card" data-id="' + reply.id + '" style="margin-bottom:8px;">';
-                    html += '<div class="ssp-item-card-head"><div>';
-                    html += '<div class="ssp-item-card-title">💬 ' + reply.trigger + ' <span style="color:var(--text-muted); font-size:0.8rem;">(' + (matchLabels[reply.match_type] || reply.match_type) + ')</span></div>';
-                    html += '<div class="ssp-item-card-meta" style="max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + (reply.response || '').substring(0, 80) + '</div>';
-                    html += '</div><button class="ssp-btn-icon" onclick="deleteAutoReply(' + reply.id + ')" title="حذف">✕</button></div></div>';
-                });
-                container.innerHTML = html;
-            }
-
-            // ========================================
-            // SCENARIOS
-            // ========================================
-
-            var scenarioStepsData = [];
-
-            window.showAddScenarioForm = function() {
-                document.getElementById('add_scenario_form').style.display = 'block';
-                document.getElementById('edit_scenario_id').value = '';
-                document.getElementById('scenario_name').value = '';
-                document.getElementById('scenario_trigger').value = '/start';
-                scenarioStepsData = [];
-                renderScenarioSteps();
-            };
-
-            window.hideAddScenarioForm = function() {
-                document.getElementById('add_scenario_form').style.display = 'none';
-            };
-
-            window.addScenarioStep = function() {
-                var stepId = 'step_' + (scenarioStepsData.length + 1);
-                scenarioStepsData.push({
-                    id: stepId,
-                    message: '',
-                    buttons: [{text: '', next: 'end', action: ''}]
-                });
-                renderScenarioSteps();
-            };
-
-            window.removeScenarioStep = function(idx) {
-                scenarioStepsData.splice(idx, 1);
-                renderScenarioSteps();
-            };
-
-            window.addScenarioStepButton = function(stepIdx) {
-                scenarioStepsData[stepIdx].buttons.push({text: '', next: 'end', action: ''});
-                renderScenarioSteps();
-            };
-
-            window.removeScenarioStepButton = function(stepIdx, btnIdx) {
-                scenarioStepsData[stepIdx].buttons.splice(btnIdx, 1);
-                renderScenarioSteps();
-            };
-
-            window.updateScenarioStep = function(idx, field, value) {
-                scenarioStepsData[idx][field] = value;
-            };
-
-            window.updateScenarioStepButton = function(stepIdx, btnIdx, field, value) {
-                scenarioStepsData[stepIdx].buttons[btnIdx][field] = value;
-            };
-
-            function renderScenarioSteps() {
-                var container = document.getElementById('scenario_steps_container');
-                if (scenarioStepsData.length === 0) {
-                    container.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">هنوز مرحله‌ای اضافه نشده است.</p>';
-                    return;
-                }
-
-                var html = '';
-                scenarioStepsData.forEach(function(step, si) {
-                    html += '<div style="border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:12px; background:var(--surface);">';
-                    html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">';
-                    html += '<strong style="font-size:0.85rem;">مرحله ' + (si + 1) + ': <input type="text" value="' + (step.id || '') + '" onchange="updateScenarioStep(' + si + ', \'id\', this.value)" style="border:none; background:transparent; font-weight:bold; width:120px;" placeholder="شناسه"></strong>';
-                    html += '<button class="ssp-btn-icon" onclick="removeScenarioStep(' + si + ')" title="حذف مرحله">✕</button>';
-                    html += '</div>';
-                    html += '<div class="ssp-form-group" style="margin-bottom:8px;">';
-                    html += '<textarea rows="2" class="ssp-textarea" style="font-size:0.85rem;" onchange="updateScenarioStep(' + si + ', \'message\', this.value)" placeholder="متن پیام این مرحله...">' + (step.message || '') + '</textarea>';
-                    html += '</div>';
-
-                    // Buttons for this step
-                    html += '<div style="margin-top:8px;">';
-                    html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">';
-                    html += '<span style="font-size:0.8rem; color:var(--text-muted);">دکمه‌های این مرحله:</span>';
-                    html += '<button class="ssp-btn-secondary" onclick="addScenarioStepButton(' + si + ')" style="font-size:0.75rem; padding:4px 8px;">+ دکمه</button>';
-                    html += '</div>';
-
-                    (step.buttons || []).forEach(function(btn, bi) {
-                        html += '<div style="display:flex; gap:6px; margin-bottom:4px; align-items:center;">';
-                        html += '<input type="text" value="' + (btn.text || '') + '" onchange="updateScenarioStepButton(' + si + ',' + bi + ', \'text\', this.value)" style="flex:1; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:0.8rem;" placeholder="متن دکمه">';
-                        html += '<input type="text" value="' + (btn.next || 'end') + '" onchange="updateScenarioStepButton(' + si + ',' + bi + ', \'next\', this.value)" style="width:80px; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:0.8rem; dir:ltr;" placeholder="مرحله بعد">';
-                        html += '<input type="text" value="' + (btn.action || '') + '" onchange="updateScenarioStepButton(' + si + ',' + bi + ', \'action\', this.value)" style="width:80px; padding:4px 8px; border:1px solid var(--border); border-radius:4px; font-size:0.8rem; dir:ltr;" placeholder="عملیات">';
-                        html += '<button class="ssp-btn-icon" onclick="removeScenarioStepButton(' + si + ',' + bi + ')" style="font-size:0.7rem;">✕</button>';
-                        html += '</div>';
-                    });
-
-                    html += '</div></div>';
-                });
-
-                container.innerHTML = html;
-            }
-
-            window.saveScenario = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var name = document.getElementById('scenario_name').value.trim();
-                var trigger = document.getElementById('scenario_trigger').value.trim();
-                if (!name) { showToast('نام سناریو را وارد کنید', 'warning'); return; }
-
-                // Validate steps
-                if (scenarioStepsData.length === 0) { showToast('حداقل یک مرحله اضافه کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_bot_scenario');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('scenario_id', document.getElementById('edit_scenario_id').value);
-                fd.append('name', name);
-                fd.append('trigger', trigger);
-                fd.append('steps', JSON.stringify(scenarioStepsData));
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            hideAddScenarioForm();
-                            if (currentBotConfig) {
-                                if (!currentBotConfig.scenarios) currentBotConfig.scenarios = [];
-                                var existIdx = currentBotConfig.scenarios.findIndex(function(s) { return s.id == res.data.scenario.id; });
-                                if (existIdx >= 0) {
-                                    currentBotConfig.scenarios[existIdx] = res.data.scenario;
-                                } else {
-                                    currentBotConfig.scenarios.push(res.data.scenario);
-                                }
-                                updateBotScenariosList(currentBotConfig.scenarios);
-                            }
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    });
-            };
-
-            window.deleteScenario = function(scenarioId) {
-                if (!confirm('آیا از حذف این سناریو مطمئن هستید؟')) return;
-                var botId = document.getElementById('bot_editor_id').value;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_bot_scenario');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('scenario_id', scenarioId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            if (currentBotConfig) {
-                                currentBotConfig.scenarios = (currentBotConfig.scenarios || []).filter(function(s) { return s.id != scenarioId; });
-                                updateBotScenariosList(currentBotConfig.scenarios);
-                            }
-                        }
-                    });
-            };
-
-            window.editScenario = function(scenarioId) {
-                if (!currentBotConfig || !currentBotConfig.scenarios) return;
-                var scenario = currentBotConfig.scenarios.find(function(s) { return s.id == scenarioId; });
-                if (!scenario) return;
-
-                document.getElementById('add_scenario_form').style.display = 'block';
-                document.getElementById('edit_scenario_id').value = scenario.id;
-                document.getElementById('scenario_name').value = scenario.name || '';
-                document.getElementById('scenario_trigger').value = scenario.trigger || '';
-                scenarioStepsData = JSON.parse(JSON.stringify(scenario.steps || []));
-                renderScenarioSteps();
-            };
-
-            function updateBotScenariosList(scenarios) {
-                var container = document.getElementById('bot_scenarios_list');
-                if (!scenarios || scenarios.length === 0) {
-                    container.innerHTML = '<div class="ssp-empty" style="padding:20px;"><p>هنوز سناریویی اضافه نکرده‌اید.</p><p style="font-size:0.85rem; color:var(--text-muted);">سناریوها به شما امکان ایجاد گفتگوهای چندمرحله‌ای با کاربر را می‌دهند.</p></div>';
-                    return;
-                }
-                var html = '';
-                scenarios.forEach(function(scenario) {
-                    var stepsCount = (scenario.steps || []).length;
-                    html += '<div class="ssp-item-card" style="margin-bottom:8px;">';
-                    html += '<div class="ssp-item-card-head"><div>';
-                    html += '<div class="ssp-item-card-title">▶ ' + (scenario.name || 'سناریو') + ' <span style="color:var(--text-muted); font-size:0.8rem;">(محرک: ' + (scenario.trigger || '-') + ')</span></div>';
-                    html += '<div class="ssp-item-card-meta">' + stepsCount + ' مرحله</div>';
-                    html += '</div><div style="display:flex; gap:4px;">';
-                    html += '<button class="ssp-btn-icon" onclick="editScenario(' + scenario.id + ')" title="ویرایش">✎</button>';
-                    html += '<button class="ssp-btn-icon" onclick="deleteScenario(' + scenario.id + ')" title="حذف">✕</button>';
-                    html += '</div></div></div>';
-                });
-                container.innerHTML = html;
-            }
-
-            // Webhook & Advanced
-            window.setBotMenu = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_set_bot_menu');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.data.message, res.success ? 'success' : 'error'); });
-            };
-
-            window.testBotWebhook = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var btn = event.target.closest('button');
-                if (btn) btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_test_bot_webhook');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (btn) btn.classList.remove('loading');
-                        var statusDiv = document.getElementById('bot_webhook_status');
-                        statusDiv.style.display = 'block';
-                        if (res.success) {
-                            var info = res.data;
-                            var isError = info.has_error;
-                            statusDiv.style.background = isError ? 'var(--warning-soft)' : 'var(--success-soft)';
-                            statusDiv.style.border = '1px solid ' + (isError ? 'var(--warning)' : 'var(--success)');
-                            statusDiv.style.color = isError ? 'var(--warning)' : 'var(--success)';
-                            var html = '<strong>' + (isError ? '&#9888; وضعیت webhook' : '&#10003; webhook فعال') + '</strong><br>';
-                            html += '<span style="font-size:0.8rem; opacity:0.8;">URL: ' + escapeHtml(info.url || 'تنظیم نشده') + '</span><br>';
-                            html += '<span style="font-size:0.8rem;">پیام‌های در انتظار: ' + info.pending_count + '</span>';
-                            if (isError) html += '<br><span style="font-size:0.8rem;">خطا: ' + escapeHtml(info.last_error) + '</span>';
-                            statusDiv.innerHTML = html;
-                        } else {
-                            statusDiv.style.background = 'var(--error-soft)';
-                            statusDiv.style.border = '1px solid var(--error)';
-                            statusDiv.style.color = 'var(--error)';
-                            statusDiv.innerHTML = '&#10007; ' + escapeHtml(res.data.message);
-                        }
-                    })
-                    .catch(function() {
-                        if (btn) btn.classList.remove('loading');
-                        var statusDiv = document.getElementById('bot_webhook_status');
-                        statusDiv.style.display = 'block';
-                        statusDiv.style.background = 'var(--error-soft)';
-                        statusDiv.style.border = '1px solid var(--error)';
-                        statusDiv.style.color = 'var(--error)';
-                        statusDiv.innerHTML = '&#10007; خطا در برقراری ارتباط';
-                    });
-            };
-
-            window.autoSetBotWebhook = function(botId, webhookUrl) {
-                if (!botId || !webhookUrl) return;
-
-                // Validate token exists
-                if (currentBotConfig && !currentBotConfig.token) {
-                    var statusDiv = document.getElementById('bot_webhook_status');
-                    if (statusDiv) {
-                        statusDiv.style.display = 'block';
-                        statusDiv.style.background = 'var(--danger-soft)';
-                        statusDiv.style.border = '1px solid var(--danger)';
-                        statusDiv.style.color = 'var(--danger)';
-                        statusDiv.innerHTML = '&#10007; <strong>توکن ربات تنظیم نشده!</strong><br>ابتدا توکن ربات را وارد کرده و ذخیره کنید.';
-                    }
-                    return;
-                }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_set_bot_webhook');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fd.append('webhook_url', webhookUrl);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        var statusDiv = document.getElementById('bot_webhook_status');
-                        if (statusDiv) {
-                            statusDiv.style.display = 'block';
-                            if (res.success) {
-                                statusDiv.style.background = 'var(--success-soft)';
-                                statusDiv.style.border = '1px solid var(--success)';
-                                statusDiv.style.color = 'var(--success)';
-                                statusDiv.innerHTML = '&#10003; <strong>Webhook تنظیم شد!</strong><br>' +
-                                    '<small style="opacity:0.8;">آدرس: ' + escapeHtml(webhookUrl) + '</small><br>' +
-                                    '<small>bat_id: ' + botId + '</small>';
-                            } else {
-                                statusDiv.style.background = 'var(--warning-soft)';
-                                statusDiv.style.border = '1px solid var(--warning)';
-                                statusDiv.style.color = 'var(--warning)';
-                                var errorMsg = res.data.message || 'خطا';
-                                var helpText = '';
-
-                                // Provide specific help based on error
-                                if (errorMsg.indexOf('Unauthorized') !== -1) {
-                                    helpText = 'توکن ربات نامعتبر است. توکن را از @BotFather کپی کنید.';
-                                } else if (errorMsg.indexOf('Bad Request') !== -1) {
-                                    helpText = 'آدرس وبهوک نامعتبر است. مطمئن شوید سایت با HTTPS باشد.';
-                                } else if (errorMsg.indexOf('token') !== -1) {
-                                    helpText = 'مشکل در توکن ربات. توکن را دوباره بررسی کنید.';
-                                } else if (errorMsg.indexOf('شامل') !== -1 || errorMsg.indexOf('نامعتبر') !== -1) {
-                                    helpText = 'شناسه بات یا توکن نامعتبر است.';
-                                }
-
-                                statusDiv.innerHTML = '&#9888; <strong>Webhook تنظیم نشد:</strong> ' + escapeHtml(errorMsg) +
-                                    '<br><small>آدرس: ' + escapeHtml(webhookUrl) + '</small>' +
-                                    '<br><small>bat_id: ' + botId + '</small>' +
-                                    (helpText ? '<br><br><small style="color:var(--info);">' + helpText + '</small>' : '');
-                            }
-                            setTimeout(function() { statusDiv.style.display = 'none'; }, 10000);
-                        }
-                    })
-                    .catch(function(err) {
-                        var statusDiv = document.getElementById('bot_webhook_status');
-                        if (statusDiv) {
-                            statusDiv.style.display = 'block';
-                            statusDiv.style.background = 'var(--danger-soft)';
-                            statusDiv.style.border = '1px solid var(--danger)';
-                            statusDiv.style.color = 'var(--danger)';
-                            statusDiv.innerHTML = '&#10007; <strong>خطا در ارتباط با سرور</strong><br><small>' + escapeHtml(err.message || 'خطای ناشناخته') + '</small>';
-                            setTimeout(function() { statusDiv.style.display = 'none'; }, 5000);
-                        }
-                    });
-            };
-
-            // Manual webhook set function
-            window.setBotWebhookManual = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var webhookUrl = document.getElementById('bot_webhook_url_display').value;
-                if (!webhookUrl) { showToast('آدرس وبهوک نمایش داده نشده', 'warning'); return; }
-
-                var statusDiv = document.getElementById('bot_webhook_status');
-                if (statusDiv) {
-                    statusDiv.style.display = 'block';
-                    statusDiv.style.background = 'var(--info-soft)';
-                    statusDiv.style.border = '1px solid var(--info)';
-                    statusDiv.style.color = 'var(--info)';
-                    statusDiv.innerHTML = '&#8987; در حال تنظیم وبهوک...';
-                }
-
-                autoSetBotWebhook(botId, webhookUrl);
-            };
-
-            // Debug function to list all bots
-            window.debugBotList = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_debug_bot_list');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var info = res.data;
-                            var html = '<strong>اطلاعات دیباگ:</strong><br>';
-                            html += 'کاربر فعلی: #' + info.current_user_id + '<br>';
-                            html += 'تعداد کل بات‌ها: ' + info.total_bots + '<br>';
-                            html += 'تعداد کل کاربران: ' + info.total_users + '<br>';
-
-                            // Show current user's bots
-                            html += '<br><strong>بات‌های کاربر فعلی:</strong><br>';
-                            if (info.current_user_bots.length === 0) {
-                                html += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> هیچ باتی برای کاربر فعلی وجود ندارد!<br>';
-                            } else {
-                                info.current_user_bots.forEach(function(bot) {
-                                    html += '<div style="padding:6px; margin:4px 0; border:1px solid var(--border); border-radius:8px;">';
-                                    html += '<strong>بات #' + bot.bot_id + '</strong> | ' + bot.name + '<br>';
-                                    html += 'پلتفرم: ' + bot.platform + ' | وضعیت: ' + (bot.is_active ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> فعال' : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> غیرفعال') + '<br>';
-                                    html += 'توکن: ' + (bot.has_token ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> ' + bot.token_preview : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> بدون توکن') + '<br>';
-                                    html += 'دستورات: ' + bot.commands_count + ' | دکمه‌ها: ' + bot.buttons_count;
-                                    html += '</div>';
-                                });
-                            }
-
-                            // Show all bots
-                            html += '<br><strong>همه بات‌ها:</strong><br>';
-                            if (info.bots.length === 0) {
-                                html += 'هیچ باتی یافت نشد!';
-                            } else {
-                                info.bots.forEach(function(bot) {
-                                    html += '• بات #' + bot.bot_id + ' (کاربر: ' + bot.user_id + ')' +
-                                            (bot.is_current_user ? ' <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> فعلی' : '') +
-                                            ' | ' + bot.name + ' | ' + bot.platform +
-                                            (bot.is_active ? ' | فعال' : ' | غیرفعال') +
-                                            (bot.has_token ? ' | توکن: <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>' : ' | توکن: <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>') +
-                                            '<br>';
-                                });
-                            }
-
-                            // Show current bot config if exists
-                            if (typeof currentBotConfig !== 'undefined' && currentBotConfig) {
-                                html += '<br><strong>بات فعلی در فرم:</strong><br>';
-                                html += 'bot_id: ' + currentBotConfig.id + '<br>';
-                                html += 'نام: ' + (currentBotConfig.name || '') + '<br>';
-                                html += 'توکن: ' + (currentBotConfig.token ? currentBotConfig.token.substring(0, 10) + '...' : 'خالی');
-                            }
-
-                            var statusDiv = document.getElementById('bot_webhook_status');
-                            if (statusDiv) {
-                                statusDiv.style.display = 'block';
-                                statusDiv.style.background = 'var(--info-soft)';
-                                statusDiv.style.border = '1px solid var(--info)';
-                                statusDiv.style.color = 'var(--info)';
-                                statusDiv.innerHTML = html;
-                            }
-                            console.log('Bot List Debug:', info);
-                        }
-                    });
-            };
-
-            // Debug function to show buttons data
-            window.debugBotButtons = function() {
-                var botId = document.getElementById('bot_editor_id').value;
-                if (!botId) { showToast('ابتدا بات را ذخیره کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_debug_bot_buttons');
-                fd.append('security', nonce);
-                fd.append('bot_id', botId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var info = res.data;
-                            var html = '<strong>اطلاعات دکمه‌های بات #' + info.bot_id + ':</strong><br>';
-                            html += '<pre style="direction:ltr; text-align:left; font-size:0.75rem; max-height:300px; overflow:auto; background:#1e293b; color:#e2e8f0; padding:10px; border-radius:8px;">' + escapeHtml(info.buttons_json) + '</pre>';
-
-                            var statusDiv = document.getElementById('bot_webhook_status');
-                            if (statusDiv) {
-                                statusDiv.style.display = 'block';
-                                statusDiv.style.background = 'var(--info-soft)';
-                                statusDiv.style.border = '1px solid var(--info)';
-                                statusDiv.style.color = 'var(--info)';
-                                statusDiv.innerHTML = html;
-                            }
-                            console.log('Buttons Debug:', info.buttons);
-                        }
-                    });
-            };
-
-            // ===== WP Sites CRUD =====
-            window.addWpSite = function() {
-                var name = document.getElementById('new_site_name').value;
-                var url = document.getElementById('new_site_url').value;
-                var user = document.getElementById('new_site_user').value;
-                var pass = document.getElementById('new_site_pass').value;
-                var active = document.getElementById('new_site_active').checked ? 1 : 0;
-                var auto = document.getElementById('new_site_auto').checked ? 1 : 0;
-
-                if (!name || !url || !user || !pass) { showToast('\u0647\u0645\u0647 \u0641\u06CC\u0644\u062F\u0647\u0627 \u0631\u0627 \u067E\u0631 \u06A9\u0646\u06CC\u062F', 'warning'); return; }
-
-                var btn = document.getElementById('add_wpsite_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_wp_site');
-                fd.append('security', nonce);
-                fd.append('site_name', name);
-                fd.append('site_url', url);
-                fd.append('username', user);
-                fd.append('app_password', pass);
-                fd.append('is_active', active);
-                fd.append('auto_publish', auto);
-                fd.append('post_type', document.getElementById('new_site_post_type').value);
-                fd.append('categories', document.getElementById('new_site_categories').value);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            removeEmptyState('wp_sites_list');
-                            var newS = {id: res.data.id || Date.now(), site_name: name, site_url: url, username: user, app_password: pass, is_active: active, auto_publish: auto, post_type: document.getElementById('new_site_post_type').value, categories: document.getElementById('new_site_categories').value};
-                            wpSiteData.push(newS);
-                            document.getElementById('wp_sites_list').insertAdjacentHTML('beforeend', createWpSiteCard(newS));
-                            document.getElementById('new_site_name').value = '';
-                            document.getElementById('new_site_url').value = '';
-                            document.getElementById('new_site_user').value = '';
-                            document.getElementById('new_site_pass').value = '';
-                            document.getElementById('new_site_categories').value = '';
-                            var out = document.getElementById('new_site_test_output');
-                            if (out) { out.style.display = 'none'; out.textContent = ''; }
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            window.testNewWpSite = function() {
-                var url = document.getElementById('new_site_url').value;
-                var user = document.getElementById('new_site_user').value;
-                var pass = document.getElementById('new_site_pass').value;
-                var out = document.getElementById('new_site_test_output');
-
-                if (!url || !user || !pass) { showToast('\u0622\u062F\u0631\u0633 \u0633\u0627\u06CC\u062A \u0648 \u0631\u0648\u06CC\u062F \u0648 \u0631\u0645\u0632 \u0631\u0627 \u0648\u0627\u0631\u062F \u06A9\u0646\u06CC\u062F', 'warning'); return; }
-
-                out.style.display = 'block';
-                out.textContent = '\u062F\u0631 \u062D\u0627\u0644 \u062A\u0635\u062A...';
-                out.style.color = 'var(--text-muted)';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_test_wp_site');
-                fd.append('security', nonce);
-                fd.append('site_url', url);
-                fd.append('username', user);
-                fd.append('app_password', pass);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            out.textContent = '\u2705 ' + res.data.message;
-                            out.style.color = 'var(--success)';
-                        } else {
-                            out.textContent = '\u274C ' + res.data.message;
-                            out.style.color = 'var(--error)';
-                        }
-                    })
-                    .catch(function() {
-                        out.textContent = '\u274C \u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637';
-                        out.style.color = 'var(--error)';
-                    });
-            };
-
-            window.deleteWpSite = function(id) {
-                if (!confirm('\u0622\u06CC\u0627 \u0627\u0646 \u0633\u0627\u06CC\u062A \u062D\u0630\u0641 \u0634\u0648\u062F\u061F')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_wp_site');
-                fd.append('security', nonce);
-                fd.append('site_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            var card = document.querySelector('#wp_sites_list [data-id="' + id + '"]');
-                            if (card) { card.classList.add('removing'); setTimeout(function() { card.remove(); showEmptyState('wp_sites_list', '\uD83C\uDF10', '\u0647\u0646\u0648\u0632 \u0633\u0627\u06CC\u062A \u0648\u0631\u062F\u067E\u0631\u0633\u06CC \u0627\u0636\u0627\u0641\u0647 \u0646\u06A9\u0631\u062F\u0647\u0627\u06CC\u062F.'); }, 300); }
-                            wpSiteData = wpSiteData.filter(function(d) { return d.id !== id; });
-                        }
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            window.testWpSiteConnection = function(id) {
-                var s = wpSiteData.find(function(d) { return d.id === id; });
-                if (!s) return;
-                var el = document.getElementById('wp_site_status_' + id);
-                el.textContent = '\u062F\u0631 \u062D\u0627\u0644 \u062A\u0633\u062A...';
-                el.className = 'ssp-connection-status';
-                var fd = new FormData();
-                fd.append('action', 'ssp_test_wp_site');
-                fd.append('security', nonce);
-                fd.append('site_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { el.textContent = res.data.message; el.classList.add('success'); }
-                        else { el.textContent = res.data.message; el.classList.add('error'); }
-                    })
-                    .catch(function() { el.textContent = '\u062E\u0637\u0627 \u062F\u0631 \u062A\u0633\u062A'; el.classList.add('error'); });
-            };
-
-            window.fetchCategories = function(mode) {
-                var urlEl = document.getElementById(mode === 'new' ? 'new_site_url' : 'edit_wpsite_url');
-                var userEl = document.getElementById(mode === 'new' ? 'new_site_user' : 'edit_wpsite_user');
-                var passEl = document.getElementById(mode === 'new' ? 'new_site_pass' : 'edit_wpsite_pass');
-                var catListEl = document.getElementById(mode + '_cat_list');
-                var url = urlEl.value, user = userEl.value, pass = passEl.value;
-                if (!url || !user || !pass) { showToast('\u0627\u0628\u062A\u062F\u0627 \u0622\u062F\u0631\u0633\u060C \u0646\u0627\u0645 \u06A9\u0627\u0631\u0628\u0631\u06CC \u0648 \u0631\u0645\u0632 \u0631\u0627 \u0648\u0627\u0631\u062F \u06A9\u0646\u06CC\u062F', 'warning'); return; }
-                catListEl.textContent = '\u062F\u0631 \u062D\u0627\u0644 \u062F\u0631\u06CC\u0627\u0641\u062A...';
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_wp_categories');
-                fd.append('security', nonce);
-                fd.append('site_url', url);
-                fd.append('username', user);
-                fd.append('app_password', pass);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.categories.length) {
-                            var html = '\u062F\u0633\u062A\u0647\u200C\u0628\u0646\u062F\u06CC\u200C\u0647\u0627: ';
-                            res.data.categories.forEach(function(c) { html += '<strong>' + escapeHtml(c.name) + '</strong> (ID: ' + c.id + ') '; });
-                            catListEl.innerHTML = html;
-                        } else {
-                            catListEl.textContent = '\u062F\u0633\u062A\u0647\u200C\u0628\u0646\u062F\u06CC\u0627\u06CC \u06CC\u0627\u0641\u062A \u0646\u0634\u062F';
-                        }
-                    })
-                    .catch(function() { catListEl.textContent = '\u062E\u0637\u0627 \u062F\u0631 \u062F\u0631\u06CC\u0627\u0641\u062A'; });
-            };
-
-            window.editWpSite = function(id) {
-                var s = wpSiteData.find(function(d) { return d.id === id; });
-                if (!s) return;
-                document.getElementById('edit_wpsite_id').value = s.id;
-                document.getElementById('edit_wpsite_name').value = s.site_name;
-                document.getElementById('edit_wpsite_url').value = s.site_url;
-                document.getElementById('edit_wpsite_user').value = s.username;
-                document.getElementById('edit_wpsite_pass').value = '';
-                document.getElementById('edit_wpsite_active').checked = s.is_active === 1;
-                document.getElementById('edit_wpsite_auto').checked = s.auto_publish === 1;
-                document.getElementById('edit_wpsite_post_type').value = s.post_type || 'post';
-                document.getElementById('edit_wpsite_categories').value = s.categories || '';
-                document.getElementById('modal_edit_wpsite').classList.add('active');
-            };
-
-            window.saveEditWpSite = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_update_wp_site');
-                fd.append('security', nonce);
-                var id = parseInt(document.getElementById('edit_wpsite_id').value);
-                fd.append('site_id', id);
-                fd.append('site_name', document.getElementById('edit_wpsite_name').value);
-                fd.append('site_url', document.getElementById('edit_wpsite_url').value);
-                fd.append('username', document.getElementById('edit_wpsite_user').value);
-                fd.append('app_password', document.getElementById('edit_wpsite_pass').value);
-                fd.append('is_active', document.getElementById('edit_wpsite_active').checked ? 1 : 0);
-                fd.append('auto_publish', document.getElementById('edit_wpsite_auto').checked ? 1 : 0);
-                fd.append('post_type', document.getElementById('edit_wpsite_post_type').value);
-                fd.append('categories', document.getElementById('edit_wpsite_categories').value);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeModal('modal_edit_wpsite');
-                            var newPass = document.getElementById('edit_wpsite_pass').value;
-                            var updated = {
-                                id: id,
-                                site_name: document.getElementById('edit_wpsite_name').value,
-                                site_url: document.getElementById('edit_wpsite_url').value,
-                                username: document.getElementById('edit_wpsite_user').value,
-                                app_password_masked: newPass || (wpSiteData.find(function(d) { return d.id === id; }) || {}).app_password_masked,
-                                is_active: document.getElementById('edit_wpsite_active').checked ? 1 : 0,
-                                auto_publish: document.getElementById('edit_wpsite_auto').checked ? 1 : 0,
-                                post_type: document.getElementById('edit_wpsite_post_type').value,
-                                categories: document.getElementById('edit_wpsite_categories').value
-                            };
-                            var idx = wpSiteData.findIndex(function(d) { return d.id === id; });
-                            if (idx >= 0) wpSiteData[idx] = updated;
-                            var card = document.querySelector('#wp_sites_list [data-id="' + id + '"]');
-                            if (card) {
-                                var temp = document.createElement('div');
-                                temp.innerHTML = createWpSiteCard(updated);
-                                card.outerHTML = temp.firstChild.outerHTML;
-                            }
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            // Event delegation for WP site buttons
-            document.getElementById('wp_sites_list').addEventListener('click', function(e) {
-                var btn = e.target.closest('[data-id]');
-                if (!btn) return;
-                var id = parseInt(btn.dataset.id);
-                if (btn.classList.contains('btn-test-wpsite')) testWpSiteConnection(id);
-                else if (btn.classList.contains('btn-edit-wpsite')) editWpSite(id);
-                else if (btn.classList.contains('btn-delete-wpsite')) deleteWpSite(id);
-            });
-
-            // ===== RSS Feeds CRUD =====
-            window.toggleRssTargetMode = function() {
-                var mode = document.getElementById('new_feed_target_mode').value;
-                var list = document.getElementById('new_feed_messenger_list');
-                if (list) list.style.display = mode === 'messengers' ? 'block' : 'none';
-            };
-
-            window.addRssFeed = function() {
-                var name = document.getElementById('new_feed_name').value;
-                var url = document.getElementById('new_feed_url').value;
-                var active = document.getElementById('new_feed_active').checked ? 1 : 0;
-                var auto = document.getElementById('new_feed_auto').checked ? 1 : 0;
-                var extractContent = document.getElementById('new_feed_extract').checked ? 1 : 0;
-                var cleanAds = document.getElementById('new_feed_clean_ads').checked ? 1 : 0;
-                var cleanUrls = document.getElementById('new_feed_clean_urls').checked ? 1 : 0;
-                var maxLength = document.getElementById('new_feed_max_length').value;
-                var contentMode = document.getElementById('new_feed_content_mode').value;
-                var targetMode = document.getElementById('new_feed_target_mode').value;
-
-                if (!name || !url) { showToast('نام و آدرس فید را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('add_rss_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_rss_feed');
-                fd.append('security', nonce);
-                fd.append('feed_name', name);
-                fd.append('feed_url', url);
-                fd.append('is_active', active);
-                fd.append('auto_fetch', auto);
-                fd.append('extract_content', extractContent);
-                fd.append('clean_ads', cleanAds);
-                fd.append('clean_urls', cleanUrls);
-                fd.append('max_length', maxLength);
-                fd.append('content_mode', contentMode);
-                fd.append('target_mode', targetMode);
-
-                // Collect selected messengers
-                if (targetMode === 'messengers') {
-                    var targets = [];
-                    document.querySelectorAll('.new_feed_messenger_cb:checked').forEach(function(cb) { targets.push(cb.value); });
-                    fd.append('target_messengers', targets.join(','));
-                }
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            removeEmptyState('rss_feeds_list');
-                            var newF = {id: res.data.id || Date.now(), feed_name: name, feed_url: url, is_active: active, auto_fetch: auto, extract_content: extractContent, clean_ads: cleanAds, clean_urls: cleanUrls, max_length: maxLength, content_mode: contentMode, target_mode: targetMode};
-                            rssFeedData.push(newF);
-                            document.getElementById('rss_feeds_list').insertAdjacentHTML('beforeend', createRssFeedCard(newF));
-                            document.getElementById('new_feed_name').value = '';
-                            document.getElementById('new_feed_url').value = '';
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.deleteRssFeed = function(id) {
-                if (!confirm('\u0622\u06CC\u0627 \u0627\u0646 \u0627\u0646 \u0641\u06CC\u062F \u062D\u0630\u0641 \u0634\u0648\u062F\u061F')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_rss_feed');
-                fd.append('security', nonce);
-                fd.append('feed_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('\u062D\u0630\u0641 \u0634\u062F', 'success');
-                            var card = document.querySelector('#rss_feeds_list [data-id="' + id + '"]');
-                            if (card) { card.classList.add('removing'); setTimeout(function() { card.remove(); showEmptyState('rss_feeds_list', '\uD83D\uDCE1', '\u0647\u0646\u0648\u0632 RSS Feed \u0627\u0636\u0627\u0641\u0647 \u0646\u06A9\u0631\u062F\u0647\u0627\u06CC\u062F.'); }, 300); }
-                            rssFeedData = rssFeedData.filter(function(d) { return d.id !== id; });
-                        }
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            window.editRssFeed = function(id) {
-                var f = rssFeedData.find(function(d) { return d.id === id; });
-                if (!f) return;
-                document.getElementById('edit_rss_id').value = f.id;
-                document.getElementById('edit_rss_name').value = f.feed_name;
-                document.getElementById('edit_rss_url').value = f.feed_url;
-                document.getElementById('edit_rss_active').checked = f.is_active === 1;
-                document.getElementById('edit_rss_auto').checked = f.auto_fetch === 1;
-                document.getElementById('edit_rss_extract').checked = f.extract_content === 1;
-                document.getElementById('edit_rss_clean_ads').checked = f.clean_ads !== 0;
-                document.getElementById('edit_rss_clean_urls').checked = f.clean_urls !== 0;
-                document.getElementById('edit_rss_max_length').value = f.max_length || 500;
-                document.getElementById('edit_rss_content_mode').value = f.content_mode || 'summary';
-                document.getElementById('modal_edit_rss').classList.add('active');
-            };
-
-            window.saveEditRssFeed = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_update_rss_feed');
-                fd.append('security', nonce);
-                var id = parseInt(document.getElementById('edit_rss_id').value);
-                fd.append('feed_id', id);
-                fd.append('feed_name', document.getElementById('edit_rss_name').value);
-                fd.append('feed_url', document.getElementById('edit_rss_url').value);
-                fd.append('is_active', document.getElementById('edit_rss_active').checked ? 1 : 0);
-                fd.append('auto_fetch', document.getElementById('edit_rss_auto').checked ? 1 : 0);
-                fd.append('extract_content', document.getElementById('edit_rss_extract').checked ? 1 : 0);
-                fd.append('clean_ads', document.getElementById('edit_rss_clean_ads').checked ? 1 : 0);
-                fd.append('clean_urls', document.getElementById('edit_rss_clean_urls').checked ? 1 : 0);
-                fd.append('max_length', document.getElementById('edit_rss_max_length').value);
-                fd.append('content_mode', document.getElementById('edit_rss_content_mode').value);
-                fd.append('target_mode', 'all');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeModal('modal_edit_rss');
-                            var updated = {
-                                id: id,
-                                feed_name: document.getElementById('edit_rss_name').value,
-                                feed_url: document.getElementById('edit_rss_url').value,
-                                is_active: document.getElementById('edit_rss_active').checked ? 1 : 0,
-                                auto_fetch: document.getElementById('edit_rss_auto').checked ? 1 : 0,
-                                extract_content: document.getElementById('edit_rss_extract').checked ? 1 : 0,
-                                clean_ads: document.getElementById('edit_rss_clean_ads').checked ? 1 : 0,
-                                clean_urls: document.getElementById('edit_rss_clean_urls').checked ? 1 : 0,
-                                max_length: parseInt(document.getElementById('edit_rss_max_length').value),
-                                content_mode: document.getElementById('edit_rss_content_mode').value
-                            };
-                            var idx = rssFeedData.findIndex(function(d) { return d.id === id; });
-                            if (idx >= 0) rssFeedData[idx] = updated;
-                            var card = document.querySelector('#rss_feeds_list [data-id="' + id + '"]');
-                            if (card) {
-                                var temp = document.createElement('div');
-                                temp.innerHTML = createRssFeedCard(updated);
-                                card.outerHTML = temp.firstChild.outerHTML;
-                            }
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            // Event delegation for RSS buttons
-            document.getElementById('rss_feeds_list').addEventListener('click', function(e) {
-                var btn = e.target.closest('[data-id]');
-                if (!btn) return;
-                var id = parseInt(btn.dataset.id);
-                if (btn.classList.contains('btn-edit-rss')) editRssFeed(id);
-                else if (btn.classList.contains('btn-delete-rss')) deleteRssFeed(id);
-                else if (btn.classList.contains('btn-fetch-rss')) fetchRssNow(id, 0);
-                else if (btn.classList.contains('btn-fetch-extract')) fetchRssNow(id, 1);
-            });
-
-            // ===== Schedules CRUD =====
-            window.addSchedule = function() {
-                var title = document.getElementById('schedule_title').value;
-                var message = document.getElementById('schedule_message').value;
-                var datetime = document.getElementById('sch_schedule_datetime').value;
-                var recurring = document.getElementById('schedule_recurring').value;
-
-                if (!title || !message || !datetime) { showToast('\u0647\u0645\u0647 \u0641\u06CC\u0644\u062F\u0647\u0627 \u0631\u0627 \u067E\u0631 \u06A9\u0646\u06CC\u062F', 'warning'); return; }
-
-                var btn = document.getElementById('add_schedule_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_schedule');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('message', message);
-                fd.append('scheduled_at', datetime);
-                fd.append('recurring', recurring);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            removeEmptyState('schedules_list');
-                            var newS = {id: res.data.id || Date.now(), title: title, message: message, scheduled_at: datetime, recurring: recurring, status: 'pending'};
-                            document.getElementById('schedules_list').insertAdjacentHTML('beforeend', createScheduleCard(newS));
-                            document.getElementById('schedule_title').value = '';
-                            document.getElementById('schedule_message').value = '';
-                            document.getElementById('sch_schedule_datetime').value = '';
-                            document.getElementById('sch_schedule_date_display').value = '';
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            window.deleteSchedule = function(id) {
-                if (!confirm('\u0622\u06CC\u0627 \u0627\u0646 \u0627\u0646 \u0632\u0645\u0627\u0646\u200C\u0628\u0646\u062F\u06CC \u062D\u0630\u0641 \u0634\u0648\u062F\u061F')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_schedule');
-                fd.append('security', nonce);
-                fd.append('schedule_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            var cards = document.querySelectorAll('#schedules_list .ssp-item-card');
-                            cards.forEach(function(card) {
-                                var delBtn = card.querySelector('[data-id="' + id + '"]');
-                                if (delBtn) { card.classList.add('removing'); setTimeout(function() { card.remove(); showEmptyState('schedules_list', '\u23F0', '\u0647\u0646\u0648\u0632 \u0632\u0645\u0627\u0646\u200C\u0628\u0646\u062F\u06CC \u0627\u06CC\u062C\u0627\u062F \u0646\u06A9\u0631\u062F\u0647\u0627\u06CC\u062F.'); }, 300); }
-                            });
-                        }
-                    })
-                    .catch(function() { showToast('\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631', 'error'); });
-            };
-
-            // Event delegation for schedule buttons
-            document.getElementById('schedules_list').addEventListener('click', function(e) {
-                var btn = e.target.closest('[data-id]');
-                if (!btn) return;
-                var id = parseInt(btn.dataset.id);
-                if (btn.classList.contains('btn-delete-schedule')) deleteSchedule(id);
-            });
-
-            // ===== Manual Send Helpers =====
-            window.toggleAllManualMessengers = function(select) {
-                document.querySelectorAll('#manual_messenger_list input[type=checkbox]').forEach(function(cb) { cb.checked = select; });
-                updateManualMediaNotice();
-            };
-
-            window.updateManualMediaNotice = function() {
-                var notice = document.getElementById('manual_media_notice');
-                if (!notice) return;
-                var hasMedia = (window._manualMediaUrls && window._manualMediaUrls.length > 1) || (window._manualUrlList && window._manualUrlList.length > 1);
-                if (!hasMedia) { notice.style.display = 'none'; return; }
-                var hasLimited = false;
-                document.querySelectorAll('#manual_messenger_list input[type=checkbox]:checked').forEach(function(cb) {
-                    var label = cb.closest('label');
-                    if (label) {
-                        var platEl = label.querySelector('div > div:last-child');
-                        if (platEl) {
-                            var txt = platEl.textContent.trim().toLowerCase();
-                            if (txt === 'روبیکا' || txt === 'ایتا') hasLimited = true;
-                        }
-                    }
-                });
-                notice.style.display = hasLimited ? 'block' : 'none';
-            };
-
-            // Listen for individual checkbox changes
-            document.addEventListener('change', function(e) {
-                if (e.target.matches('#manual_messenger_list input[type=checkbox]')) {
-                    updateManualMediaNotice();
-                }
-            });
-
-            window._manualMediaUrls = [];
-
-            window.handleManualMediaUpload = function(input) {
-                var files = Array.from(input.files);
-                if (!files.length) return;
-                var placeholder = document.getElementById('manual_media_placeholder');
-                var preview = document.getElementById('manual_media_preview');
-                var progress = document.getElementById('manual_media_progress');
-                var progressBar = document.getElementById('manual_media_progress_bar');
-                var statusEl = document.getElementById('manual_media_status');
-                placeholder.style.display = 'none';
-                progress.style.display = 'block';
-                var uploaded = 0;
-                var total = files.length;
-                progressBar.style.width = '0%';
-                statusEl.textContent = 'در حال آپلود 0/' + total + '...';
-
-                function uploadFile(idx) {
-                    if (idx >= files.length) {
-                        progress.style.display = 'none';
-                        document.getElementById('manual_image_url').value = JSON.stringify(window._manualMediaUrls);
-                        renderManualMediaPreviews();
-                        return;
-                    }
-                    var file = files[idx];
-                    var maxSize = file.type.startsWith('video/') ? 80 * 1024 * 1024 : 10 * 1024 * 1024;
-                    if (file.size > maxSize) {
-                        showToast(file.name + ': ' + (file.type.startsWith('video/') ? 'حداکثر حجم ویدیو ۸۰ مگابایت' : 'حداکثر حجم تصویر ۱۰ مگابایت'), 'error');
-                        uploadFile(idx + 1);
-                        return;
-                    }
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_upload_media');
-                    fd.append('security', nonce);
-                    fd.append('media_file', file);
-                    var xhr = new XMLHttpRequest();
-                    xhr.open('POST', ajaxurl, true);
-                    xhr.upload.onprogress = function(e) {
-                        if (e.lengthComputable) {
-                            var pct = Math.round(((uploaded + e.loaded / e.total) / total) * 100);
-                            progressBar.style.width = pct + '%';
-                            statusEl.textContent = 'در حال آپلود ' + (uploaded + 1) + '/' + total + '... ' + pct + '%';
-                        }
-                    };
-                    xhr.onload = function() {
-                        try {
-                            var res = JSON.parse(xhr.responseText);
-                            if (res.success) {
-                                window._manualMediaUrls.push({ url: res.data.url, name: file.name, type: file.type, size: file.size });
-                            } else {
-                                showToast(file.name + ': ' + (res.data ? res.data.message : 'خطا'), 'error');
-                            }
-                        } catch(ex) {
-                            showToast(file.name + ': خطا در آپلود', 'error');
-                        }
-                        uploaded++;
-                        uploadFile(idx + 1);
-                    };
-                    xhr.onerror = function() {
-                        showToast(file.name + ': خطا در ارتباط', 'error');
-                        uploaded++;
-                        uploadFile(idx + 1);
-                    };
-                    xhr.send(fd);
-                }
-                uploadFile(0);
-            };
-
-            window.renderManualMediaPreviews = function() {
-                var preview = document.getElementById('manual_media_preview');
-                var placeholder = document.getElementById('manual_media_placeholder');
-                if (!window._manualMediaUrls.length) {
-                    preview.style.display = 'none';
-                    preview.innerHTML = '';
-                    if (placeholder) placeholder.style.display = 'block';
-                    return;
-                }
-                if (placeholder) placeholder.style.display = 'none';
-                var html = '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(100px, 1fr)); gap:8px;">';
-                window._manualMediaUrls.forEach(function(item, idx) {
-                    var isVideo = item.type && item.type.startsWith('video/');
-                    var thumb = isVideo
-                        ? '<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="var(--accent)" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>'
-                        : '<img src="' + escapeHtml(item.url) + '" style="width:100%; height:70px; object-fit:cover; border-radius:6px;">';
-                    html += '<div style="position:relative; border:1px solid var(--border); border-radius:8px; padding:6px; text-align:center;">';
-                    html += '<div style="height:70px; display:flex; align-items:center; justify-content:center;">' + thumb + '</div>';
-                    html += '<div style="font-size:0.65rem; color:var(--text-muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:4px;">' + escapeHtml(item.name) + '</div>';
-                    html += '<button type="button" onclick="removeManualMediaItem(' + idx + ')" style="position:absolute; top:2px; right:2px; background:var(--error); color:white; border:none; border-radius:50%; width:18px; height:18px; font-size:10px; cursor:pointer; display:flex; align-items:center; justify-content:center;">&times;</button>';
-                    html += '</div>';
-                });
-                html += '</div>';
-                html += '<div style="font-size:0.75rem; color:var(--text-muted); margin-top:6px;">' + window._manualMediaUrls.length + ' فایل انتخاب شده (تصاویر به صورت آلبوم ارسال می‌شوند)</div>';
-                preview.innerHTML = html;
-                preview.style.display = 'block';
-                updateManualMediaNotice();
-            };
-
-            window.removeManualMediaItem = function(idx) {
-                window._manualMediaUrls.splice(idx, 1);
-                document.getElementById('manual_image_url').value = window._manualMediaUrls.length ? JSON.stringify(window._manualMediaUrls) : '';
-                renderManualMediaPreviews();
-            };
-
-            window.removeManualMedia = function(e) {
-                e.stopPropagation();
-                window._manualMediaUrls = [];
-                document.getElementById('manual_image_url').value = '';
-                document.getElementById('manual_media_file').value = '';
-                document.getElementById('manual_media_preview').style.display = 'none';
-                document.getElementById('manual_media_preview').innerHTML = '';
-                document.getElementById('manual_media_placeholder').style.display = 'block';
-            };
-
-            window.removeManualMediaUrl = function(e) {
-                e.stopPropagation();
-                window._manualUrlList = [];
-                document.getElementById('manual_image_url').value = '';
-                document.getElementById('manual_media_url_input').value = '';
-                document.getElementById('manual_media_url_list').innerHTML = '';
-                document.getElementById('manual_media_url_preview').style.display = 'none';
-                document.getElementById('manual_media_url_preview').innerHTML = '';
-            };
-
-            window.switchManualMediaTab = function(tab) {
-                document.querySelectorAll('.manual_media_tab').forEach(function(t) { t.classList.remove('active'); t.style.background = ''; t.style.color = ''; });
-                var tabs = document.querySelectorAll('.manual_media_tab');
-                if (tab === 'upload') {
-                    tabs[0].classList.add('active');
-                    tabs[0].style.background = 'var(--accent)';
-                    tabs[0].style.color = '#fff';
-                    document.getElementById('manual_media_tab_upload').style.display = 'block';
-                    document.getElementById('manual_media_tab_url').style.display = 'none';
-                } else {
-                    tabs[1].classList.add('active');
-                    tabs[1].style.background = 'var(--accent)';
-                    tabs[1].style.color = '#fff';
-                    document.getElementById('manual_media_tab_upload').style.display = 'none';
-                    document.getElementById('manual_media_tab_url').style.display = 'block';
-                }
-                // Clear the other tab's value
-                if (tab === 'url') {
-                    window._manualMediaUrls = [];
-                    document.getElementById('manual_media_file').value = '';
-                    document.getElementById('manual_media_preview').style.display = 'none';
-                    document.getElementById('manual_media_preview').innerHTML = '';
-                    document.getElementById('manual_media_placeholder').style.display = 'block';
-                    document.getElementById('manual_media_progress').style.display = 'none';
-                } else {
-                    window._manualUrlList = [];
-                    document.getElementById('manual_media_url_input').value = '';
-                    document.getElementById('manual_media_url_list').innerHTML = '';
-                    document.getElementById('manual_media_url_preview').style.display = 'none';
-                    document.getElementById('manual_media_url_preview').innerHTML = '';
-                }
-                syncManualMediaHidden();
-            };
-
-            // Set initial active tab
-            (function() {
-                var firstTab = document.querySelector('.manual_media_tab');
-                if (firstTab) {
-                    firstTab.style.background = 'var(--accent)';
-                    firstTab.style.color = '#fff';
-                }
-            })();
-
-            window._manualUrlList = [];
-
-            window.addManualMediaUrl = function() {
-                var input = document.getElementById('manual_media_url_input');
-                var url = input.value.trim();
-                if (!url) { showToast('لینک را وارد کنید', 'warning'); return; }
-                if (window._manualUrlList.indexOf(url) !== -1) { showToast('این لینک قبلاً اضافه شده', 'warning'); return; }
-                window._manualUrlList.push(url);
-                input.value = '';
-                renderManualUrlList();
-                syncManualMediaHidden();
-            };
-
-            window.removeManualUrlItem = function(idx) {
-                window._manualUrlList.splice(idx, 1);
-                renderManualUrlList();
-                syncManualMediaHidden();
-            };
-
-            window.syncManualMediaHidden = function() {
-                var hidden = document.getElementById('manual_image_url');
-                if (window._manualMediaUrls.length > 0) {
-                    hidden.value = JSON.stringify(window._manualMediaUrls);
-                } else if (window._manualUrlList.length > 0) {
-                    var items = window._manualUrlList.map(function(u) { return { url: u, name: u.split('/').pop().split('?')[0], type: '', size: 0 }; });
-                    hidden.value = JSON.stringify(items);
-                } else {
-                    hidden.value = '';
-                }
-            };
-
-            window.renderManualUrlList = function() {
-                var list = document.getElementById('manual_media_url_list');
-                if (!list) return;
-                if (!window._manualUrlList.length) { list.innerHTML = ''; return; }
-                var html = '';
-                window._manualUrlList.forEach(function(url, idx) {
-                    var isVideo = /\.(mp4|mpeg|mpg|mov|avi|webm)(\?|$)/i.test(url);
-                    var name = url.split('/').pop().split('?')[0] || url.substring(0, 30);
-                    html += '<div style="display:flex; align-items:center; gap:8px; padding:6px 8px; background:var(--bg-alt); border-radius:8px; border:1px solid var(--border); margin-bottom:4px;">';
-                    html += '<span style="font-size:0.75rem;">' + (isVideo ? '▶' : '□') + '</span>';
-                    html += '<span style="flex:1; font-size:0.75rem; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + escapeHtml(name) + '</span>';
-                    html += '<button type="button" onclick="removeManualUrlItem(' + idx + ')" style="background:none; border:none; color:var(--error); cursor:pointer; font-size:0.75rem; padding:2px 4px;">&times;</button>';
-                    html += '</div>';
-                });
-                if (window._manualUrlList.length > 1) {
-                    html += '<div style="font-size:0.7rem; color:var(--accent); margin-top:4px;">' + window._manualUrlList.length + ' فایل = آلبوم</div>';
-                }
-                list.innerHTML = html;
-                updateManualMediaNotice();
-            };
-
-            window.updateManualCharCount = function() {
-                var el = document.getElementById('manual_message');
-                var counter = document.getElementById('manual_char_count');
-                if (el && counter) counter.textContent = el.value.length + ' کاراکتر';
-            };
-
-            window.toggleManualPreview = function() {
-                var preview = document.getElementById('manual_preview');
-                if (!preview) return;
-                if (preview.style.display === 'none') {
-                    var title = document.getElementById('manual_title').value;
-                    var msg = document.getElementById('manual_message').value;
-                    var tags = document.getElementById('manual_hashtags') ? document.getElementById('manual_hashtags').value : '';
-                    preview.textContent = title + '\n\n' + msg + (tags ? '\n\n' + tags : '');
-                    preview.style.display = 'block';
-                } else {
-                    preview.style.display = 'none';
-                }
-            };
-
-            window.toggleManualSchedule = function() {
-                var checked = document.getElementById('manual_schedule_toggle').checked;
-                var fields = document.getElementById('manual_schedule_fields');
-                var btn = document.getElementById('manual_send_btn');
-                if (fields) fields.style.display = checked ? 'block' : 'none';
-                if (btn) {
-                    btn.querySelector('.ssp-btn-text').textContent = checked ? 'زمان‌بندی ارسال' : 'افزودن به صف ارسال';
-                }
-            };
-
-            // ===== Manual Send Jalali Picker =====
-            // ===== Unified Jalali Calendar Picker =====
-            window._jalaliPickers = {};
-
-            window.openJalaliPicker = function(config) {
-                // config: { containerId, inputId, onConfirm, minDate? }
-                var state = { year: 0, month: 0, day: 0, hour: 9, minute: 0 };
-                var container = document.getElementById(config.containerId);
-                if (!container) return;
-
-                // Toggle if already rendered
-                if (container.querySelector('.jalali-picker-wrap')) {
-                    container.style.display = container.style.display === 'none' ? 'block' : 'none';
-                    if (container.style.display === 'none') return;
-                }
-
-                // Initialize state
-                if (config.minDate) {
-                    state.year = config.minDate.year; state.month = config.minDate.month;
-                    state.day = config.minDate.day; state.hour = config.minDate.hour;
-                    state.minute = config.minDate.minute;
-                } else {
-                    var now = new Date();
-                    var jd = gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
-                    state.year = jd[0]; state.month = jd[1]; state.day = 0;
-                    state.hour = now.getHours();
-                    state.minute = Math.ceil(now.getMinutes() / 5) * 5;
-                    if (state.minute >= 60) state.minute = 0;
-                }
-                window._jalaliPickers[config.containerId] = { state: state, config: config };
-
-                var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                var uid = config.containerId.replace(/[^a-zA-Z0-9]/g, '_');
-                var html = '<div class="jalali-picker-wrap" style="margin-top:8px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:10px;">';
-                html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">';
-                html += '<button type="button" class="ssp-btn-secondary" onclick="jalaliNavMonth(\'' + uid + '\', 1)" style="padding:3px 8px; font-size:1rem;">&#9655;</button>';
-                html += '<span id="jalali_ym_' + uid + '" style="font-weight:700; font-size:0.85rem; color:var(--text);">' + months[state.month - 1] + ' ' + state.year + '</span>';
-                html += '<button type="button" class="ssp-btn-secondary" onclick="jalaliNavMonth(\'' + uid + '\', -1)" style="padding:3px 8px; font-size:1rem;">&#9665;</button>';
-                html += '</div>';
-                html += '<div id="jalali_days_' + uid + '" style="display:grid; grid-template-columns:repeat(7,1fr); gap:2px; text-align:center; font-size:0.75rem; margin-bottom:8px;"></div>';
-                html += '<div style="display:flex; gap:4px; align-items:center; justify-content:center; margin-bottom:8px;">';
-                html += '<select id="jalali_min_' + uid + '" style="padding:3px 4px; border:1px solid var(--border); border-radius:4px; font-size:0.8rem; min-width:42px;">';
-                for (var m = 0; m < 60; m += 5) { var mv = (m < 10 ? '0' : '') + m; html += '<option value="' + mv + '"' + (m === state.minute ? ' selected' : '') + '>' + mv + '</option>'; }
-                html += '</select>:<select id="jalali_hour_' + uid + '" style="padding:3px 4px; border:1px solid var(--border); border-radius:4px; font-size:0.8rem; min-width:42px;">';
-                for (var h = 0; h < 24; h++) { var hv = (h < 10 ? '0' : '') + h; html += '<option value="' + hv + '"' + (h === state.hour ? ' selected' : '') + '>' + hv + '</option>'; }
-                html += '</select></div>';
-                html += '<div style="display:flex; gap:6px; justify-content:center;">';
-                html += '<button type="button" class="ssp-btn-primary" onclick="jalaliConfirmPick(\'' + uid + '\')" style="font-size:0.8rem; padding:5px 14px;">تایید</button>';
-                html += '<button type="button" class="ssp-btn-secondary" onclick="document.getElementById(\'' + config.containerId + '\').style.display=\'none\'" style="font-size:0.8rem; padding:5px 12px;">انصراف</button>';
-                html += '</div></div>';
-                container.innerHTML = html;
-                container.style.display = 'block';
-                jalaliRenderCal(uid);
-            };
-
-            window.jalaliNavMonth = function(uid, dir) {
-                var p = window._jalaliPickers[uid]; if (!p) return;
-                p.state.month += dir;
-                if (p.state.month > 12) { p.state.month = 1; p.state.year++; }
-                if (p.state.month < 1) { p.state.month = 12; p.state.year--; }
-                p.state.day = 0;
-                var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                var ym = document.getElementById('jalali_ym_' + uid);
-                if (ym) ym.textContent = months[p.state.month - 1] + ' ' + p.state.year;
-                jalaliRenderCal(uid);
-            };
-
-            window.jalaliRenderCal = function(uid) {
-                var p = window._jalaliPickers[uid]; if (!p) return;
-                var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                var ym = document.getElementById('jalali_ym_' + uid);
-                if (ym) ym.textContent = months[p.state.month - 1] + ' ' + p.state.year;
-                var daysInMonth = p.state.month <= 6 ? 31 : (p.state.month <= 11 ? 30 : 29);
-                var firstDayG = jalaliToGregorian(p.state.year, p.state.month, 1);
-                var d = new Date(firstDayG[0], firstDayG[1] - 1, firstDayG[2]);
-                var startDow = d.getDay();
-                var daysEl = document.getElementById('jalali_days_' + uid);
-                if (!daysEl) return;
-                var html = '';
-                var dayNames = ['ش','ی','د','س','چ','پ','ج'];
-                for (var i = 0; i < 7; i++) html += '<div style="font-weight:700; color:var(--text-muted); padding:3px 0;">' + dayNames[i] + '</div>';
-                for (var sp = 0; sp < startDow; sp++) html += '<div></div>';
-                var today = new Date();
-                var todayJ = gregorianToJalali(today.getFullYear(), today.getMonth() + 1, today.getDate());
-                var isTodayMonth = p.state.year === todayJ[0] && p.state.month === todayJ[1];
-                for (var dd = 1; dd <= daysInMonth; dd++) {
-                    var isToday = isTodayMonth && dd === todayJ[2];
-                    var isSelected = dd === p.state.day;
-                    var bg = isSelected ? 'var(--accent)' : (isToday ? 'var(--accent-soft)' : 'transparent');
-                    var clr = isSelected ? 'white' : (isToday ? 'var(--accent)' : 'var(--text)');
-                    html += '<div onclick="jalaliPickDay(\'' + uid + '\', ' + dd + ')" style="padding:4px 0; border-radius:6px; cursor:pointer; background:' + bg + '; color:' + clr + '; text-align:center; transition:all 0.15s;">' + dd + '</div>';
-                }
-                daysEl.innerHTML = html;
-            };
-
-            window.jalaliPickDay = function(uid, day) {
-                var p = window._jalaliPickers[uid]; if (!p) return;
-                p.state.day = day;
-                jalaliRenderCal(uid);
-            };
-
-            window.jalaliConfirmPick = function(uid) {
-                var p = window._jalaliPickers[uid]; if (!p) return;
-                if (!p.state.day) { showToast('روز را انتخاب کنید', 'warning'); return; }
-                var hourSel = document.getElementById('jalali_hour_' + uid);
-                var minSel = document.getElementById('jalali_min_' + uid);
-                var h = parseInt(hourSel ? hourSel.value : '9');
-                var mi = parseInt(minSel ? minSel.value : '0');
-                var g = jalaliToGregorian(p.state.year, p.state.month, p.state.day);
-                var dtStr = g[0] + '-' + (g[1] < 10 ? '0' : '') + g[1] + '-' + (g[2] < 10 ? '0' : '') + g[2] + ' ' + (h < 10 ? '0' : '') + h + ':' + (mi < 10 ? '0' : '') + mi;
-                if (p.config.inputId) {
-                    var input = document.getElementById(p.config.inputId);
-                    if (input) input.value = dtStr;
-                }
-                if (p.config.onConfirm) p.config.onConfirm(dtStr);
-                var container = document.getElementById(p.config.containerId);
-                if (container) container.style.display = 'none';
-            };
-
-            // Legacy wrappers for backward compatibility
-            window.manualOpenJalaliPicker = function() {
-                openJalaliPicker({ containerId: 'manual_jalali_picker', inputId: 'manual_schedule_datetime', onConfirm: function(dt) {
-                    var parts = dt.split(' ');
-                    var dateParts = parts[0].split('-');
-                    var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                    var m = parseInt(dateParts[1]); var d = parseInt(dateParts[2]);
-                    document.getElementById('manual_schedule_display').value = dateParts[0] + '/' + (m<10?'0':'') + m + '/' + (d<10?'0':'') + d + ' ' + months[m-1] + ' - ' + parts[1];
-                }});
-            };
-
-            window.schOpenJalaliPicker = function() {
-                openJalaliPicker({ containerId: 'sch_jalali_picker', inputId: 'sch_schedule_datetime' });
-            };
-
-            // pgOpenJalaliPicker uses dropdown selects (different UI) - keep as-is
-
-            window.schBatchOpenJalaliPicker = function() {
-                openJalaliPicker({ containerId: 'sch_batch_jalali_picker', inputId: 'sch_batch_datetime' });
-            };
-
-            // Batch send panel uses dynamic containers - keep separate but use unified functions
-            window.batchOpenPicker = function(idx) {
-                openJalaliPicker({ containerId: 'batch_sched_area_' + idx, inputId: 'batch_sched_date_' + idx });
-            };
-
-            // ===== Save Settings =====
-            window.saveAutoWpPosts = function() {
-                var val = document.getElementById('auto_wp_posts').checked ? 1 : 0;
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_settings');
-                fd.append('security', nonce);
-                fd.append('section', 'sources');
-                fd.append('auto_wp_posts', val);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showSaved('auto_wp_saved');
-                            setTimeout(function() { location.reload(); }, 800);
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.saveAiSettings = function(e) {
-                e.preventDefault();
-                var btn = document.getElementById('save_ai_btn');
-                btn.classList.add('loading');
-                try {
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_save_settings');
-                    fd.append('security', nonce);
-                    fd.append('section', 'ai');
-                    var el;
-                    el = document.getElementById('ai_provider');
-                    fd.append('ai_provider', el ? el.value : 'openai');
-                    el = document.getElementById('ai_api_key');
-                    fd.append('ai_api_key', el ? el.value : '');
-                    el = document.getElementById('ai_model');
-                    fd.append('ai_model', el ? el.value : 'gpt-4o-mini');
-                    el = document.getElementById('ai_rewrite');
-                    fd.append('ai_rewrite', el && el.checked ? 1 : 0);
-                    el = document.getElementById('ai_hashtags');
-                    fd.append('ai_hashtags', el && el.checked ? 1 : 0);
-                    var pr = document.querySelector('input[name="ai_prompt_mode"]:checked');
-                    fd.append('ai_prompt_mode', pr ? pr.value : 'simple');
-                    el = document.getElementById('ai_custom_prompt');
-                    fd.append('ai_custom_prompt', el ? el.value : '');
-                    el = document.getElementById('ssp_ai_mode');
-                    fd.append('ssp_ai_mode', el ? el.value : 'api');
-                    el = document.getElementById('ssp_ai_chatbot');
-                    fd.append('ssp_ai_chatbot', el ? el.value : 'deepseek');
-                } catch(err) {
-                    btn.classList.remove('loading');
-                    showToast('خطا در جمع‌آوری اطلاعات فرم', 'error');
-                    return;
-                }
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            showSaved('ai_saved');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.saveTemplate = function(e) {
-                e.preventDefault();
-                var btn = document.getElementById('save_template_btn');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_settings');
-                fd.append('security', nonce);
-                fd.append('section', 'template');
-                fd.append('msg_template', document.getElementById('msg_template').value);
-                fd.append('signature', document.getElementById('signature').value);
-                fd.append('hashtags', document.getElementById('hashtags').value);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            showSaved('template_saved');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.testAiConnection = function() {
-                var apiKey = document.getElementById('ai_api_key').value;
-                var provider = document.getElementById('ai_provider').value;
-                var model = document.getElementById('ai_model').value;
-                if (!apiKey) { showToast('API Key وارد نشده', 'warning'); return; }
-
-                var resEl = document.getElementById('ai_test_result');
-                var btn = document.getElementById('test_ai_btn');
-                btn.classList.add('loading');
-                btn.disabled = true;
-
-                var steps = [
-                    { id: 'validate_key', name: 'بررسی فرمت API Key', icon: '⊞' },
-                    { id: 'check_dns', name: 'تست اتصال به سرور', icon: '◎' },
-                    { id: 'send_test_request', name: 'ارسال درخواست تست به API', icon: '⊡' },
-                ];
-
-                var output = '';
-                output += '<div style="font-family:monospace; white-space:pre-wrap; direction:ltr; text-align:left; font-size:12px; line-height:1.8; max-height:500px; overflow-y:auto; padding:16px; background:#0F172A; color:#E2E8F0; border-radius:10px; border:1px solid #334155;">';
-                output += '╔══════════════════════════════════════════════════════════════╗\n';
-                output += '║  🧪 تست زنده اتصال AI                                       ║\n';
-                output += '╚══════════════════════════════════════════════════════════════╝\n\n';
-                output += '◉ پروایدر: ' + (provider || 'نامشخص') + '\n';
-                output += '🔧 مدل: ' + (model || 'پیش‌فرض') + '\n';
-                output += '⊞ API Key: ' + (apiKey ? apiKey.substring(0, 8) + '...' + apiKey.substring(apiKey.length - 4) : 'وارد نشده') + '\n\n';
-                output += '══════════════════════════════════════════════════════════════\n\n';
-                resEl.className = 'ssp-ai-test-result show';
-                resEl.innerHTML = output;
-
-                var currentStep = 0;
-                var allPassed = true;
-                var stepResults = [];
-
-                function runStep() {
-                    if (currentStep >= steps.length) {
-                        finishTest();
-                        return;
-                    }
-
-                    var step = steps[currentStep];
-                    output += '[' + (currentStep + 1) + '/' + steps.length + '] ' + step.icon + ' ' + step.name + '...\n';
-                    resEl.innerHTML = output;
-                    resEl.scrollTop = resEl.scrollHeight;
-
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_test_ai_live');
-                    fd.append('security', nonce);
-                    fd.append('step', step.id);
-                    fd.append('provider', provider);
-                    fd.append('api_key', apiKey);
-                    fd.append('model', model);
-
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            if (res.success) {
-                                stepResults.push({name: step.name, status: 'success', message: res.data.message});
-                                output += '   [✓] ' + res.data.message + '\n';
-                                if (res.data.elapsed) output += '   ⏱️  زمان: ' + res.data.elapsed + '\n';
-                                if (res.data.tokens_used) output += '   ▥ توکن مصرف شده: ' + res.data.tokens_used + '\n';
-                                if (step.id === 'send_test_request' && res.data.response) {
-                                    output += '   💬 پاسخ: "' + res.data.response + '"\n';
-                                }
-                                output += '\n';
-
-                                if (step.id === 'check_dns' && res.data.status_code >= 400) {
-                                    allPassed = false;
-                                }
-                            } else {
-                                stepResults.push({name: step.name, status: 'error', message: res.data.message, hint: res.data.hint});
-                                allPassed = false;
-                                output += '   [✗] ' + res.data.message + '\n';
-                                if (res.data.elapsed) output += '   ⏱️  زمان: ' + res.data.elapsed + '\n';
-                                if (res.data.hint) {
-                                    output += '   💡 راه‌حل: ' + res.data.hint + '\n';
-                                }
-                                output += '\n';
-
-                                if (step.id === 'check_dns') {
-                                    currentStep = steps.length;
-                                }
-                            }
-
-                            resEl.innerHTML = output;
-                            resEl.scrollTop = resEl.scrollHeight;
-                            currentStep++;
-                            setTimeout(runStep, 300);
-                        })
-                        .catch(function() {
-                            stepResults.push({name: step.name, status: 'error', message: 'خطای ارتباط'});
-                            allPassed = false;
-                            output += '   [✗] خطای ارتباط با سرور\n\n';
-                            resEl.innerHTML = output;
-                            resEl.scrollTop = resEl.scrollHeight;
-                            currentStep++;
-                            setTimeout(runStep, 300);
-                        });
-                }
-
-                function finishTest() {
-                    output += '\n══════════════════════════════════════════════════════════════\n';
-                    output += '┌────────────────────────────────────────────────────────────┐\n';
-                    output += '│  ▥ خلاصه نهایی                                          │\n';
-                    output += '└────────────────────────────────────────────────────────────┘\n\n';
-
-                    var passed = stepResults.filter(function(s) { return s.status === 'success'; }).length;
-                    var failed = stepResults.filter(function(s) { return s.status !== 'success'; }).length;
-
-                    output += '  [✓] مراحل موفق:    ' + passed + ' از ' + steps.length + '\n';
-                    if (failed > 0) output += '  [✗] مراحل ناموفق:  ' + failed + '\n';
-
-                    output += '\n';
-                    stepResults.forEach(function(s, i) {
-                        var icon = s.status === 'success' ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>' : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
-                        output += '  ' + icon + ' ' + (i + 1) + '. ' + s.name + '\n';
-                    });
-
-                    output += '\n';
-                    if (allPassed) {
-                        output += '🎉 اتصال AI با موفقیت برقرار شد!\n';
-                        output += '   می‌توانید از این پروایدر و مدل استفاده کنید.\n';
-                    } else {
-                        output += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;margin-right:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>  تست با خطا مواجه شد.\n';
-                        output += '   مشکلات بالا را بررسی و رفع کنید.\n';
-                    }
-
-                    output += '\n══════════════════════════════════════════════════════════════\n';
-                    output += '  ⏱️ تست در ' + new Date().toLocaleTimeString('fa-IR') + ' به پایان رسید\n';
-
-                    resEl.innerHTML = output;
-                    resEl.style.color = allPassed ? '#10B981' : '#F59E0B';
-                    resEl.scrollTop = resEl.scrollHeight;
-                    btn.classList.remove('loading');
-                    btn.disabled = false;
-                }
-
-                runStep();
-            };
-
-            window.testAiDns = function() {
-                var out = document.getElementById('ai_dns_test_result');
-                out.className = 'ssp-ai-test-result show';
-                out.style.fontFamily = 'monospace';
-                out.style.whiteSpace = 'pre';
-                out.style.direction = 'ltr';
-                out.style.textAlign = 'left';
-                out.style.fontSize = '12px';
-                out.style.lineHeight = '1.6';
-                out.style.maxHeight = '400px';
-                out.style.overflowY = 'auto';
-                out.style.padding = '12px';
-                out.style.background = '#0F172A';
-                out.style.color = '#E2E8F0';
-                out.style.borderRadius = '8px';
-                out.style.border = '1px solid #334155';
-                out.style.marginTop = '10px';
-
-                var output = '🔍 تست دسترسی به سرورهای هوش مصنوعی...\n\n';
-
-                var aiDomains = [
-                    {name: 'OpenAI (GPT)', domain: 'api.openai.com'},
-                    {name: 'Anthropic (Claude)', domain: 'api.anthropic.com'},
-                    {name: 'Google (Gemini)', domain: 'generativelanguage.googleapis.com'},
-                    {name: 'Groq', domain: 'api.groq.com'},
-                    {name: 'DeepSeek', domain: 'api.deepseek.com'},
-                    {name: 'OpenRouter', domain: 'openrouter.ai'}
-                ];
-
-                out.textContent = output;
-
-                var tested = 0;
-                var working = [];
-                var failed = [];
-
-                function testNext() {
-                    if (tested >= aiDomains.length) {
-                        showSummary();
-                        return;
-                    }
-
-                    var item = aiDomains[tested];
-                    output += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> تست ' + item.name + ' (' + item.domain + ')...\n';
-                    out.textContent = output;
-                    out.scrollTop = out.scrollHeight;
-
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_test_telegram_dns');
-                    fd.append('security', nonce);
-                    fd.append('server', 'cloudflare');
-
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            // Remove testing line
-                            output = output.replace('<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> تست ' + item.name + ' (' + item.domain + ')...\n', '');
-
-                            // Test the domain directly via DNS
-                            var testFd = new FormData();
-                            testFd.append('action', 'ssp_test_doh');
-                            testFd.append('security', nonce);
-                            testFd.append('doh_server', 'cloudflare');
-
-                            fetch(ajaxurl, {method: 'POST', body: testFd})
-                                .then(function(r) { return r.json(); })
-                                .then(function(dnsRes) {
-                                    // Since we can't test individual domains via DNS easily,
-                                    // we'll mark based on known patterns
-                                    var isWorking = dnsRes.success;
-                                    if (isWorking) {
-                                        output += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> ' + item.name + ': DNS قابل دسترسی\n';
-                                        working.push(item.name);
-                                    } else {
-                                        output += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> ' + item.name + ': DNS مسدود\n';
-                                        failed.push(item.name);
-                                    }
-                                    out.textContent = output;
-                                    out.scrollTop = out.scrollHeight;
-                                    tested++;
-                                    setTimeout(testNext, 50);
-                                })
-                                .catch(function() {
-                                    output = output.replace('<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> تست ' + item.name + ' (' + item.domain + ')...\n', '');
-                                    output += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> ' + item.name + ': خطا در تست\n';
-                                    failed.push(item.name);
-                                    out.textContent = output;
-                                    tested++;
-                                    setTimeout(testNext, 50);
-                                });
-                        })
-                        .catch(function() {
-                            output = output.replace('<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> تست ' + item.name + ' (' + item.domain + ')...\n', '');
-                            output += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--error);vertical-align:middle;margin-right:2px;"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg> ' + item.name + ': خطای ارتباط\n';
-                            failed.push(item.name);
-                            out.textContent = output;
-                            tested++;
-                            setTimeout(testNext, 50);
-                        });
-                }
-
-                function showSummary() {
-                    output += '\n═══════════════════════════════════════════════\n';
-                    output += '▥ خلاصه:\n';
-                    output += '   [✓] قابل دسترس: ' + working.length + '\n';
-                    output += '   [✗] مسدود: ' + failed.length + '\n\n';
-
-                    if (working.length > 0) {
-                        output += '◎ سرورهای کارآمد:\n';
-                        working.forEach(function(s) { output += '   • ' + s + '\n'; });
-                    }
-
-                    if (failed.length > 0) {
-                        output += '\n<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;margin-right:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> سرورهای مسدود:\n';
-                        failed.forEach(function(s) { output += '   • ' + s + '\n'; });
-                        output += '\n💡 برای دسترسی به سرورهای مسدود از پروکسی استفاده کنید.';
-                    }
-
-                    out.textContent = output;
-                    out.style.color = working.length > 0 ? '#10B981' : '#F59E0B';
-                    out.scrollTop = out.scrollHeight;
-                }
-
-                testNext();
-            };
-
-            window.generateContentNow = function() {
-                // In browser mode, show warning
-                if (document.getElementById('ssp_ai_mode') && document.getElementById('ssp_ai_mode').value === 'browser') {
-                    showToast('تولید خودکار در حالت مرورگر پشتیبانی نمی‌شود. از تب تولید محتوا استفاده کنید.', 'warning');
-                    return;
-                }
-                var resEl = document.getElementById('generation_result');
-                var btn = document.getElementById('gen_now_btn');
-                btn.classList.add('loading');
-                resEl.innerHTML = '<div class="ssp-card" style="text-align:center;"><div class="ssp-spinner" style="margin:20px auto;"></div><p>\u062F\u0631 \u062D\u0627\u0644 \u062A\u0648\u0644\u06CC\u062F \u0645\u062D\u062A\u0648\u0627 \u0628\u0627 AI...</p></div>';
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_now');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            resEl.innerHTML = '<div class="ssp-card" style="background:var(--success-soft); border-color:var(--success);">' +
-                                '<h3 style="color:var(--success);">' + escapeHtml(res.data.message) + '</h3>' +
-                                '<p><strong>\u0639\u0646\u0648\u0627\u0646:</strong> ' + escapeHtml(res.data.content.title) + '</p>' +
-                                '<p style="margin-top:8px;"><strong>\u0645\u062A\u0646:</strong> ' + escapeHtml(res.data.content.message.substring(0, 200)) + '...</p>' +
-                                '<p style="margin-top:12px; color:var(--text-muted); font-size:0.85rem;">\u0638\u0631\u0641 2 \u062F\u0642\u06CC\u0642\u0647 \u0622\u06CC\u0646\u062F\u0647 \u0628\u0647 \u0647\u0645\u0647 \u0645\u0642\u0627\u0635\u062F \u0627\u0631\u0633\u0627\u0644 \u0645\u06CC\u200C\u0634\u0648\u062F.</p>' +
-                                '<button class="ssp-btn-secondary" onclick="switchTab(\'reports\', document.querySelector(\'[data-tab=reports]\'))">\u0645\u0634\u0627\u0647\u062F\u0647 \u062F\u0631 \u06AF\u0632\u0627\u0631\u0627\u062A</button>' +
-                                '</div>';
-                        } else {
-                            resEl.innerHTML = '<div class="ssp-card" style="background:var(--error-soft); border-color:var(--error); color:var(--error);">' + escapeHtml(res.data.message) + '</div>';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); resEl.innerHTML = '<div class="ssp-card" style="background:var(--error-soft); border-color:var(--error); color:var(--error);">\u062E\u0637\u0627 \u062F\u0631 \u0627\u0631\u062A\u0628\u0627\u0637 \u0628\u0627 \u0633\u0631\u0648\u0631</div>'; });
-            };
-
-// ===== Batch Content Generation =====
-            // Clean DeepSeek citation markers from text
-            window.cleanCitations = function(text) {
-                if (!text) return '';
-                // Remove citation markers: dash (any type) + optional whitespace/newline + digits
-                // Handles: -3, -5, -1-2, –3, —5, and also:
-                // -\n3 (dash on one line, number on next)
-                // -\n1\n-\n4 (multiple citations split across lines)
-                return text.replace(/[\-\u2010\u2011\u2012\u2013\u2014]\s*\d+(?:\s*[\-\u2010\u2011\u2012\u2013\u2014]\s*\d+)*/g, ' ').replace(/\s{2,}/g, ' ').trim();
-            };
-
-            window._batchSelected = {};
-
-            window.toggleBatchItem = function(idx) {
-                var cb = document.getElementById('batch_cb_' + idx);
-                if (cb) {
-                    window._batchSelected[idx] = cb.checked;
-                    var card = document.getElementById('batch_item_' + idx);
-                    if (card) card.style.borderColor = cb.checked ? 'var(--accent)' : 'var(--border)';
-                }
-                updateBatchActions();
-            };
-
-            window.selectAllBatch = function() {
-                var checkboxes = document.querySelectorAll('[id^="batch_cb_"]');
-                var allChecked = checkboxes.length > 0 && Array.from(checkboxes).every(function(cb) { return cb.checked; });
-                checkboxes.forEach(function(cb) {
-                    cb.checked = !allChecked;
-                    var idx = cb.id.replace('batch_cb_', '');
-                    window._batchSelected[idx] = cb.checked;
-                    var card = document.getElementById('batch_item_' + idx);
-                    if (card) card.style.borderColor = cb.checked ? 'var(--accent)' : 'var(--border)';
-                });
-                updateBatchActions();
-            };
-
-            window.updateBatchActions = function() {
-                var selected = Object.values(window._batchSelected).filter(function(v) { return v; }).length;
-                var actionsEl = document.getElementById('batch_actions');
-                if (actionsEl) {
-                    actionsEl.style.display = selected > 0 ? 'flex' : 'none';
-                    var label = document.getElementById('batch_selected_count');
-                    if (label) label.textContent = selected + ' مورد انتخاب شده';
-                }
-            };
-
-            window.getSelectedBatchItems = function() {
-                var items = [];
-                Object.keys(window._batchSelected).forEach(function(idx) {
-                    if (window._batchSelected[idx] && window._batchData && window._batchData[idx]) {
-                        items.push(window._batchData[idx]);
-                    }
-                });
-                return items.length > 0 ? items : window._batchData;
-            };
-
-            window.sendBatchItem = function(idx) {
-                // Toggle send panel for this item
-                var panel = document.getElementById('batch_send_panel_' + idx);
-                if (panel) {
-                    panel.remove();
-                    return;
-                }
-                // Create send panel
-                panel = document.createElement('div');
-                panel.id = 'batch_send_panel_' + idx;
-                panel.style.cssText = 'margin-top:10px; padding:14px; background:var(--bg-alt); border-radius:10px; border:1px solid var(--border);';
-                var html = '<div style="font-size:0.85rem; font-weight:600; color:var(--text); margin-bottom:10px;">ارسال محتوا</div>';
-                // Messenger selection
-                html += '<div style="margin-bottom:12px;"><label style="font-size:0.8rem; color:var(--text-muted); margin-bottom:6px; display:block;">پیام‌رسان مقصد</label>';
-                html += '<div id="batch_msgr_list_' + idx + '" style="display:flex; flex-wrap:wrap; gap:6px;"></div></div>';
-                // Schedule
-                html += '<div style="display:flex; align-items:center; gap:8px; margin-bottom:10px;">';
-                html += '<label style="font-size:0.8rem; color:var(--text-muted); cursor:pointer; display:flex; align-items:center; gap:6px;">';
-                html += '<input type="checkbox" id="batch_sched_toggle_' + idx + '" onchange="toggleBatchSched(' + idx + ')" style="width:14px; height:14px; accent-color:var(--accent);">';
-                html += 'ارسال زمان‌بندی شده</label></div>';
-                html += '<div id="batch_sched_area_' + idx + '" style="display:none;">';
-                html += '<div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">';
-                html += '<input type="text" id="batch_sched_date_' + idx + '" class="ssp-input" readonly placeholder="تاریخ و ساعت" style="flex:1; font-size:0.8rem; cursor:pointer;" onclick="batchOpenPicker(' + idx + ')">';
-                html += '</div></div>';
-                // Buttons
-                html += '<div style="display:flex; gap:6px; flex-wrap:wrap;">';
-                html += '<button class="ssp-btn-primary" onclick="confirmSendBatchItem(' + idx + ')" style="font-size:0.75rem; padding:5px 14px;">تأیید ارسال</button>';
-                html += '<button class="ssp-btn-secondary" onclick="document.getElementById(\'batch_send_panel_' + idx + '\').remove()" style="font-size:0.75rem; padding:5px 12px;">انصراف</button>';
-                html += '</div>';
-                panel.innerHTML = html;
-                document.getElementById('batch_item_' + idx).appendChild(panel);
-                // Load messengers
-                loadBatchMessengers(idx);
-            };
-
-            window.loadBatchMessengers = function(idx) {
-                var listEl = document.getElementById('batch_msgr_list_' + idx);
-                if (!listEl) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_messengers');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data) {
-                            var html = '';
-                            res.data.forEach(function(m) {
-                                var colors = {telegram:'#0088cc',bale:'#39c551',eitaa:'#ff8800',rubika:'#7b4dba',instagram:'#e4405f',whatsapp:'#25d366'};
-                                var names = {telegram:'تلگرام',bale:'بله',eitaa:'ایتا',rubika:'روبیکا',instagram:'اینستاگرام',whatsapp:'واتساپ'};
-                                var c = colors[m.platform] || '#666';
-                                html += '<label style="display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--card); border-radius:8px; border:1px solid var(--border); cursor:pointer; font-size:0.78rem;">';
-                                html += '<input type="checkbox" value="' + m.id + '" class="batch_msgr_cb_' + idx + '" style="width:14px; height:14px; accent-color:var(--accent);">';
-                                html += '<span style="width:20px; height:20px; border-radius:6px; background:' + c + '20; display:inline-flex; align-items:center; justify-content:center; font-size:10px; color:' + c + ';">&#9679;</span>';
-                                html += '<span>' + (m.name || names[m.platform] || m.platform) + '</span>';
-                                html += '</label>';
-                            });
-                            listEl.innerHTML = html || '<span style="font-size:0.8rem; color:var(--text-muted);">پیام‌رسانی ثبت نشده</span>';
-                        }
-                    });
-            };
-
-            window.toggleBatchSched = function(idx) {
-                var area = document.getElementById('batch_sched_area_' + idx);
-                if (area) area.style.display = document.getElementById('batch_sched_toggle_' + idx).checked ? 'block' : 'none';
-            };
-
-            window.confirmSendBatchItem = function(idx) {
-                if (!window._batchData || !window._batchData[idx]) return;
-                var item = window._batchData[idx];
-                // Get selected messengers
-                var msgrs = [];
-                document.querySelectorAll('.batch_msgr_cb_' + idx + ':checked').forEach(function(cb) { msgrs.push(cb.value); });
-                if (msgrs.length === 0) { showToast('پیام‌رسانی انتخاب کنید', 'warning'); return; }
-                var isScheduled = document.getElementById('batch_sched_toggle_' + idx).checked;
-                if (isScheduled) {
-                    var schedVal = document.getElementById('batch_sched_date_' + idx).value;
-                    if (!schedVal) { showToast('تاریخ ارسال را انتخاب کنید', 'warning'); return; }
-                    // Schedule for each messenger
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_add_schedule');
-                    fd.append('security', nonce);
-                    fd.append('title', item.title);
-                    fd.append('message', item.message);
-                    fd.append('scheduled_at', schedVal);
-                    fd.append('recurring', '');
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            if (res.success) { showToast('پیام زمان‌بندی شد!', 'success'); document.getElementById('batch_send_panel_' + idx).remove(); }
-                            else showToast(res.data ? res.data.message : 'خطا', 'error');
-                        });
-                } else {
-                    // Send immediately
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_send_batch');
-                    fd.append('security', nonce);
-                    fd.append('items', JSON.stringify([item]));
-                    fd.append('messengers', msgrs.join(','));
-                    showToast('در حال ارسال...', 'info');
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) { showToast(res.data ? res.data.message : 'انجام شد', res.success ? 'success' : 'error'); document.getElementById('batch_send_panel_' + idx).remove(); })
-                        .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-                }
-            };
-
-            // Batch send panel calendar - uses unified openJalaliPicker (defined above)
-            // Old batch calendar functions removed - use openJalaliPicker({ containerId: 'batch_sched_area_' + idx, inputId: 'batch_sched_date_' + idx })
-
-            window.saveBatchItemAsDraft = function(idx) {
-                if (!window._batchData || !window._batchData[idx]) return;
-                var item = window._batchData[idx];
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_draft');
-                fd.append('security', nonce);
-                fd.append('title', item.title);
-                fd.append('content', item.message);
-                fd.append('hashtags', item.hashtags || '');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.success ? 'ذخیره شد' : 'خطا', res.success ? 'success' : 'error'); })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.renderBatchResults = function(items, resultEl) {
-                window._batchSelected = {};
-                var html = '<div style="margin-bottom:16px; display:flex; justify-content:space-between; align-items:center;">';
-                html += '<h3 style="margin:0; font-size:1rem; color:var(--text);">' + items.length + ' محتوا تولید شد</h3>';
-                html += '<div style="display:flex; align-items:center; gap:10px;">';
-                html += '<button class="ssp-btn-secondary" onclick="selectAllBatch()" style="font-size:0.75rem; padding:4px 10px;">انتخاب همه</button>';
-                html += '<span class="ssp-badge info">' + items.length + '</span>';
-                html += '</div>';
-                html += '</div>';
-                html += '<div style="display:flex; flex-direction:column; gap:12px;">';
-                items.forEach(function(item, i) {
-                    var title = cleanCitations(item.title || '');
-                    var message = cleanCitations(item.message || '');
-                    html += '<div class="ssp-card" id="batch_item_' + i + '" style="padding:14px; border-left:3px solid var(--border); transition: border-color 0.2s;">';
-                    // Controls row: checkbox + number + delete
-                    html += '<div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">';
-                    html += '<input type="checkbox" id="batch_cb_' + i + '" onchange="toggleBatchItem(' + i + ')" style="width:16px; height:16px; accent-color:var(--accent); cursor:pointer;">';
-                    html += '<span style="background:var(--accent); color:white; width:28px; height:28px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:0.8rem; font-weight:700; flex-shrink:0;">' + (i + 1) + '</span>';
-                    html += '<button class="ssp-btn-danger" onclick="document.getElementById(\'batch_item_' + i + '\').remove()" style="font-size:0.7rem; padding:3px 10px; margin-left:auto;">حذف</button>';
-                    html += '</div>';
-                    // Content: title + message as ONE piece
-                    html += '<div style="font-size:0.88rem; color:var(--text); line-height:1.8; white-space:pre-wrap;">';
-                    html += '<strong>' + escapeHtml(title) + '</strong>\n\n' + escapeHtml(message);
-                    html += '</div>';
-                    if (item.hashtags) html += '<div style="margin-top:8px; color:var(--accent); font-size:0.8rem;">' + escapeHtml(item.hashtags) + '</div>';
-                    // Action buttons
-                    html += '<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">';
-                    html += '<button class="ssp-btn-primary" onclick="sendBatchItem(' + i + ')" style="font-size:0.75rem; padding:5px 12px;">ارسال</button>';
-                    html += '<button class="ssp-btn-secondary" onclick="saveBatchItemAsDraft(' + i + ')" style="font-size:0.75rem; padding:5px 12px;">ذخیره به پیش‌نویس</button>';
-                    html += '</div>';
-                    html += '</div>';
-                });
-                html += '</div>';
-                html += '<div id="batch_actions" style="display:none; margin-top:16px; padding:12px; background:var(--bg-alt); border-radius:10px;">';
-                html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">';
-                html += '<span id="batch_selected_count" style="font-size:0.85rem; color:var(--text); font-weight:600;">0 مورد انتخاب شده</span>';
-                html += '</div>';
-                html += '<div style="display:flex; gap:8px; flex-wrap:wrap;">';
-                html += '<button class="ssp-btn-primary" onclick="var items=getSelectedBatchItems(); if(!items.length){showToast(\'موردی انتخاب نشده\',\'warning\');return;} window._batchData=items; sendBatch();" style="font-size:0.8rem;">ارسال انتخاب شده</button>';
-                html += '<button class="ssp-btn-secondary" onclick="var items=getSelectedBatchItems(); if(!items.length){showToast(\'موردی انتخاب نشده\',\'warning\');return;} window._batchData=items; saveBatchAsDrafts();" style="font-size:0.8rem;">ذخیره انتخاب شده به پیش‌نویس</button>';
-                html += '<button class="ssp-btn-secondary" onclick="var items=getSelectedBatchItems(); if(!items.length){showToast(\'موردی انتخاب نشده\',\'warning\');return;} window._batchData=items; showScheduleBatchModal();" style="font-size:0.8rem;">زمان‌بندی انتخاب شده</button>';
-                html += '</div>';
-                html += '</div>';
-                html += '<div style="margin-top:16px; display:flex; gap:10px; flex-wrap:wrap;">';
-                html += '<button class="ssp-btn-primary" onclick="window._batchData=getSelectedBatchItems(); sendBatch();">ارسال همه</button>';
-                html += '<button class="ssp-btn-secondary" onclick="window._batchData=getSelectedBatchItems(); saveBatchAsDrafts();">ذخیره همه به عنوان پیش‌نویس</button>';
-                html += '<button class="ssp-btn-secondary" onclick="window._batchData=getSelectedBatchItems(); showScheduleBatchModal();">زمان‌بندی ارسال</button>';
-                html += '</div>';
-                resultEl.innerHTML = html;
-                window._batchData = items;
-            };
-
-            window.batchGenerate = function() {
-                var isBrowser = document.getElementById('ssp_ai_mode') && document.getElementById('ssp_ai_mode').value === 'browser';
-                var count = document.getElementById('batch_count').value;
-                var style = document.getElementById('batch_style').value;
-                var topic = document.getElementById('batch_topic').value;
-                var tone = document.getElementById('batch_tone').value;
-
-                if (!topic) { showToast('موضوع را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('batch_gen_btn');
-                var resultEl = document.getElementById('batch_results');
-                var length = document.getElementById('batch_length').value;
-                btn.classList.add('loading');
-                resultEl.innerHTML = '<div style="text-align:center; padding:24px; color:var(--text-muted);">' +
-                    '<div style="width:48px; height:48px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; margin:0 auto 12px;"></div>' +
-                    '<div style="font-weight:600; margin-bottom:4px;">در حال تولید ' + count + ' محتوا</div>' +
-                    '<div style="font-size:0.8rem;">لطفاً صبر کنید تا هوش مصنوعی پاسخ تولید کند...</div>' +
-                    '</div>';
-
-                if (isBrowser) {
-                    var styleGuides = {general:'عمومی و متعادل',formal:'رسمی و حرفه‌ای',casual:'صمیمی و دوستانه',promotional:'تبلیغاتی با دعوت به اقدام',educational:'آموزشی با نکات عملی',news:'خبری و واقعی',story:'داستانی و روایتی',motivational:'انگیزشی و الهام‌بخش',humorous:'طنز و سرگرمی',technical:'فنی و تخصصی',review:'نقد و بررسی',comparison:'مقایسه‌ای',list:'لیستی و فهرستی',question:'سؤالی و تعاملی'};
-                    var toneGuides = {natural:'طبیعی و روان',enthusiastic:'پرانرژی و هیجانی',calm:'آرام و خونسرد',authoritative:'موثق و مطمئن',friendly:'صمیمانه و صمیمی',persuasive:'قانع‌کننده',emotional:'احساسی و عاطفی',analytical:'تحلیلی و منطقی'};
-                    var styleDesc = styleGuides[style] || 'متعادل';
-                    var toneDesc = toneGuides[tone] || 'طبیعی';
-                    var prompt = count + ' پست شبکه اجتماعی فارسی درباره «' + topic + '».\n';
-                    prompt += 'سبک محتوا: ' + styleDesc + '\n';
-                    prompt += 'لحن نوشتار: ' + toneDesc + '\n';
-                    prompt += 'هر پست باید:\n- عنوان جذاب ≤80 کاراکتر (شامل عدد یا سوال)\n- متن حدود ' + length + ' کاراکتر با نکات عملی و واقعی\n- لحن طبیعی، مثل یک آدم واقعی\n- زاویه متفاوت نسبت به بقیه\n- متن باید کاملاً ساده باشه. هیچ تگ HTML مثل <p> <br> <b> <strong> استفاده نکن\n- بولد رو با ** بنویس\n- فقط اطلاعات واقعی و تایید شده بنویس\n- هیچ هشتگی (#) در متن اضافه نکن\n';
-                    prompt += 'CRITICAL: Return ONLY a JSON array. No markdown, no text before or after the JSON.\n';
-                    prompt += '[{"title":"","message":""}]';
-
-                    window._bridgeCurrentTool = 'batchgen';
-                    window._bridgeCurrentToolFn = 'batchGenerate';
-                    window._bridgeCurrentContext = 'batchgen';
-                    window._bridgeCurrentPrompt = prompt;
-
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_bridge_create_task');
-                    fd.append('security', nonce);
-                    fd.append('prompt', prompt);
-                    fd.append('context_type', 'batchgen');
-
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            if (res.success) {
-                                localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                                showBridgeWaitingModal(res.data.task_id);
-                                openChatbotTab();
-                                var handler = function(e) {
-                                    window.removeEventListener('bridge-response', handler);
-                                    btn.classList.remove('loading');
-                                    var parsed = e.detail.parsed;
-                                    var raw = e.detail.raw;
-                                    var items = null;
-                                    if (Array.isArray(parsed)) items = parsed;
-                                    else if (parsed && Array.isArray(parsed.items)) items = parsed.items;
-                                    if (!items && raw) {
-                                        try {
-                                            var arrMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-                                            if (arrMatch) items = JSON.parse(arrMatch[0]);
-                                        } catch(pe) {}
-                                    }
-                                    if (items && items.length) {
-                                        renderBatchResults(items, resultEl);
-                                        showToast(count + ' محتوا تولید شد!', 'success');
-                                    } else {
-                                        resultEl.innerHTML = '<div style="color:var(--error);">پاسخ AI قابل تفسیر نیست. لطفاً دوباره تلاش کنید.</div>';
-                                    }
-                                };
-                                window.addEventListener('bridge-response', handler);
-                            } else {
-                                btn.classList.remove('loading');
-                                if (res.data && res.data.can_force) {
-                                    if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید و تسک جدید ایجاد کنید؟')) {
-                                        fd.append('force', '1');
-                                        fetch(ajaxurl, {method:'POST', body:fd}).then(function(r2){return r2.json()}).then(function(r2){
-                                            if(r2.success){localStorage.setItem('ssp_bridge_pending_task',r2.data.task_id);showBridgeWaitingModal(r2.data.task_id);openChatbotTab();}
-                                            else showToast(r2.data.message||'خطا','error');
-                                        });
-                                    }
-                                } else {
-                                    showToast(res.data.message || 'خطا', 'error');
-                                }
-                            }
-                        })
-                        .catch(function() { btn.classList.remove('loading'); resultEl.innerHTML = ''; showToast('خطا در ارتباط با سرور', 'error'); });
-                } else {
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_batch_generate');
-                    fd.append('security', nonce);
-                    fd.append('count', count);
-                    fd.append('style', style);
-                    fd.append('topic', topic);
-                    fd.append('length', length);
-                    fd.append('tone', tone);
-
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            btn.classList.remove('loading');
-                            if (res.success && res.data.items) {
-                                renderBatchResults(res.data.items, resultEl);
-                            } else {
-                                resultEl.innerHTML = '<div style="color:var(--error);">' + escapeHtml(res.data.message) + '</div>';
-                            }
-                        })
-                        .catch(function() { btn.classList.remove('loading'); resultEl.innerHTML = ''; showToast('خطا در ارتباط با سرور', 'error'); });
-                }
-            };
-
-            window.sendBatch = function() {
-                if (!window._batchData) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_send_batch');
-                fd.append('security', nonce);
-                fd.append('items', JSON.stringify(window._batchData));
-                showToast('در حال ارسال...', 'info');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.data ? res.data.message : 'انجام شد', res.success ? 'success' : 'error'); })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.saveBatchAsDrafts = function() {
-                if (!window._batchData) return;
-                var saved = 0;
-                var total = window._batchData.length;
-                window._batchData.forEach(function(item, i) {
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_save_draft');
-                    fd.append('security', nonce);
-                    fd.append('title', item.title);
-                    fd.append('content', item.message);
-                    fd.append('hashtags', item.hashtags || '');
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) { saved++; if (saved === total) showToast(saved + ' محتوا به پیش‌نویس ذخیره شد', 'success'); });
-                });
-            };
-
-            var _batchJalaliState = {year:0, month:0, day:0, hour:9, minute:0};
-
-            window.showScheduleBatchModal = function() {
-                if (!window._batchData || !window._batchData.length) return;
-                var existing = document.getElementById('schedule_batch_modal');
-                if (existing) existing.remove();
-                // Initialize Jalali state to now
-                var now = new Date();
-                var jd = gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
-                _batchJalaliState = {year: jd[0], month: jd[1], day: jd[2], hour: now.getHours(), minute: Math.ceil(now.getMinutes() / 5) * 5};
-                if (_batchJalaliState.minute >= 60) _batchJalaliState.minute = 0;
-
-                var html = '<div id="schedule_batch_modal" style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;">';
-                html += '<div class="ssp-card" style="width:440px;max-width:90vw;max-height:80vh;overflow-y:auto;">';
-                html += '<h3 style="margin:0 0 16px;">زمان‌بندی ارسال ' + window._batchData.length + ' محتوا</h3>';
-                // Jalali date display + hidden gregorian value
-                html += '<div class="ssp-form-group"><label class="ssp-label">تاریخ شروع</label>';
-                html += '<input type="hidden" id="sch_batch_datetime">';
-                html += '<input type="text" id="sch_batch_date_display" class="ssp-input" readonly placeholder="تاریخ را انتخاب کنید" style="cursor:pointer;" onclick="schBatchOpenJalaliPicker()"></div>';
-                // Jalali picker container
-                html += '<div id="sch_batch_jalali_picker" style="display:none; margin-bottom:12px; padding:12px; background:var(--card); border:1px solid var(--border); border-radius:8px;"></div>';
-                // Interval
-                html += '<div class="ssp-form-group"><label class="ssp-label">فاصله بین هر ارسال (دقیقه)</label>';
-                html += '<input type="number" id="sch_batch_interval" class="ssp-input" value="60" min="5" max="1440"></div>';
-                // Target
-                html += '<div class="ssp-form-group"><label class="ssp-label">ارسال به</label>';
-                html += '<select id="sch_batch_target" class="ssp-select">';
-                html += '<option value="queue">صف ارسال</option>';
-                html += '<option value="drafts">پیش‌نویس</option>';
-                html += '</select></div>';
-                html += '<div style="display:flex;gap:10px;margin-top:16px;">';
-                html += '<button class="ssp-btn-primary" onclick="confirmScheduleBatch()">تأیید و زمان‌بندی</button>';
-                html += '<button class="ssp-btn-secondary" onclick="document.getElementById(\'schedule_batch_modal\').remove()">انصراف</button>';
-                html += '</div></div></div>';
-                document.body.insertAdjacentHTML('beforeend', html);
-            };
-
-            // Batch schedule modal calendar - uses unified openJalaliPicker (defined above)
-
-            window.confirmScheduleBatch = function() {
-                var datetime = document.getElementById('sch_batch_datetime').value;
-                var interval = parseInt(document.getElementById('sch_batch_interval').value) || 60;
-                var target = document.getElementById('sch_batch_target').value;
-                if (!datetime) { showToast('تاریخ و ساعت را انتخاب کنید', 'warning'); return; }
-                document.getElementById('schedule_batch_modal').remove();
-                var fd = new FormData();
-                fd.append('action', 'ssp_schedule_batch');
-                fd.append('security', nonce);
-                fd.append('items', JSON.stringify(window._batchData));
-                fd.append('start_datetime', datetime);
-                fd.append('interval', interval);
-                fd.append('target', target);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message || 'زمان‌بندی انجام شد', 'success');
-                        } else {
-                            showToast(res.data.message || 'خطا', 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.manualSend = function(e) {
-                e.preventDefault();
-                var btn = document.getElementById('manual_send_btn');
-                var isScheduled = document.getElementById('manual_schedule_toggle') && document.getElementById('manual_schedule_toggle').checked;
-
-                if (isScheduled) {
-                    var schedDt = document.getElementById('manual_schedule_datetime');
-                    if (!schedDt || !schedDt.value) {
-                        showToast('تاریخ و ساعت ارسال را انتخاب کنید', 'warning');
-                        return;
-                    }
-                    btn.classList.add('loading');
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_add_schedule');
-                    fd.append('security', nonce);
-                    fd.append('title', document.getElementById('manual_title').value);
-                    fd.append('message', document.getElementById('manual_message').value);
-                    fd.append('scheduled_at', schedDt.value.replace('T', ' '));
-                    fd.append('recurring', document.getElementById('manual_schedule_recurring') ? document.getElementById('manual_schedule_recurring').value : '');
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            btn.classList.remove('loading');
-                            if (res.success) {
-                                showToast('پیام زمان‌بندی شد!', 'success');
-                                showSaved('manual_saved');
-                                document.getElementById('manual_title').value = '';
-                                document.getElementById('manual_message').value = '';
-                                document.getElementById('manual_schedule_toggle').checked = false;
-                                toggleManualSchedule();
-                                if (document.getElementById('manual_hashtags')) document.getElementById('manual_hashtags').value = '';
-                                if (document.getElementById('manual_image_url')) document.getElementById('manual_image_url').value = '';
-                            } else {
-                                showToast(res.data ? res.data.message : 'خطا', 'error');
-                            }
-                        })
-                        .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-                    return;
-                }
-
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_manual_send');
-                fd.append('security', nonce);
-                addImpersonate(fd);
-                var mTitle = document.getElementById('manual_title').value;
-                var mMessage = document.getElementById('manual_message').value;
-                var mImageUrl = document.getElementById('manual_image_url') ? document.getElementById('manual_image_url').value : '';
-                // Caption length check for media posts
-                var mFullMsg = (mTitle ? mTitle + '\n\n' : '') + mMessage;
-                if (mImageUrl && mFullMsg.length > 1024) {
-                    btn.classList.remove('loading');
-                    showToast('محتوا برای پست به همراه تصویر/ویدیو خیلی طولانی است (حداکثر ۱۰۲۴ کاراکتر). لطفاً محتوا را کوتاه‌تر کنید.', 'warning');
-                    return;
-                }
-                fd.append('title', mTitle);
-                fd.append('message', mMessage);
-                fd.append('hashtags', document.getElementById('manual_hashtags') ? document.getElementById('manual_hashtags').value : '');
-                fd.append('image_url', mImageUrl);
-                var checkedM = [];
-                document.querySelectorAll('input[name="manual_messengers[]"]:checked').forEach(function(cb) { checkedM.push(cb.value); });
-                fd.append('messengers', checkedM.join(','));
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            showSaved('manual_saved');
-                            document.getElementById('manual_title').value = '';
-                            document.getElementById('manual_message').value = '';
-                            if (document.getElementById('manual_hashtags')) document.getElementById('manual_hashtags').value = '';
-                            if (document.getElementById('manual_image_url')) document.getElementById('manual_image_url').value = '';
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Draft Functions =====
-            window.saveDraft = function() {
-                var title = document.getElementById('draft_title').value;
-                var content = document.getElementById('draft_content').value;
-                var hashtags = document.getElementById('draft_hashtags').value;
-
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('save_draft_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_draft');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('hashtags', hashtags);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            showSaved('draft_saved');
-                            document.getElementById('draft_title').value = '';
-                            document.getElementById('draft_content').value = '';
-                            document.getElementById('draft_hashtags').value = '';
-                            loadDrafts();
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.saveDraftFromManual = function() {
-                var title = document.getElementById('manual_title').value;
-                var content = document.getElementById('manual_message').value;
-
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_draft');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('به عنوان پیش‌نویس ذخیره شد', 'success');
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.loadDrafts = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_drafts');
-                fd.append('security', nonce);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var list = document.getElementById('drafts_list');
-                            if (res.data.drafts.length === 0) {
-                                list.innerHTML = '<div class="ssp-empty"><div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></div><p>هنوز پیش‌نویسی ندارید.</p></div>';
-                            } else {
-                                var html = '';
-                                res.data.drafts.forEach(function(d) {
-                                    var typeBadge = '';
-                                    if (d.draft_type === 'post') typeBadge = ' <span class="ssp-badge info" style="font-size:0.65rem;">□ پست</span>';
-                                    else if (d.draft_type === 'article') typeBadge = ' <span class="ssp-badge success" style="font-size:0.65rem;">□ مقاله</span>';
-                                    html += '<div class="ssp-item-card" data-id="' + d.id + '">' +
-                                        '<div class="ssp-item-card-head"><div>' +
-                                        '<div class="ssp-item-card-title"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> ' + escapeHtml(d.title || 'بدون عنوان') + typeBadge + '</div>' +
-                                        '<div class="ssp-item-card-meta">' + escapeHtml((d.content || '').substring(0, 80)) + '...</div>' +
-                                        '</div><div style="display:flex; gap:6px;">' +
-                                        '<button class="ssp-btn-primary btn-use-draft" data-id="' + d.id + '" style="padding:6px 12px; font-size:0.75rem;">استفاده</button>' +
-                                        '<button class="ssp-btn-danger btn-delete-draft" data-id="' + d.id + '" style="padding:6px 12px; font-size:0.75rem;">حذف</button>' +
-                                        '</div></div></div>';
-                                });
-                                list.innerHTML = html;
-                            }
-                        }
-                    })
-                    .catch(function() { showToast('خطا در بارگذاری پیش‌نویس‌ها', 'error'); });
-            };
-
-            window.deleteDraft = function(id) {
-                if (!confirm('آیا از حذف این پیش‌نویس مطمئن هستید؟')) return;
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_draft');
-                fd.append('security', nonce);
-                fd.append('draft_id', id);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            loadDrafts();
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.useDraft = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_drafts');
-                fd.append('security', nonce);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var draft = res.data.drafts.find(function(d) { return d.id === id; });
-                            if (draft) {
-                                var dtype = draft.draft_type || '';
-                                if (dtype === 'post' || dtype === 'article') {
-                                    // Brainstorm idea → route to correct tool
-                                    if (dtype === 'post') {
-                                        switchTab('postgen', document.querySelector('[data-tab=postgen]'));
-                                        var topicEl = document.getElementById('pg_topic');
-                                        var detailsEl = document.getElementById('pg_details');
-                                        if (topicEl) topicEl.value = draft.title || '';
-                                        if (detailsEl) detailsEl.value = (draft.content || '') + (draft.meta_description ? '\nمخاطب: ' + draft.meta_description : '') + (draft.hashtags ? '\nکلمات کلیدی: ' + draft.hashtags : '');
-                                        showToast('پیش‌نویس به تولید پست منتقل شد. روی تولید کلیک کنید.', 'success');
-                                    } else {
-                                        switchTab('contentgen', document.querySelector('[data-tab=contentgen]'));
-                                        var nameEl = document.getElementById('cg_ai_name');
-                                        var briefEl = document.getElementById('cg_ai_brief');
-                                        if (nameEl) nameEl.value = draft.title || '';
-                                        if (briefEl) briefEl.value = (draft.content || '') + (draft.meta_description ? '\nمخاطب: ' + draft.meta_description : '') + (draft.hashtags ? '\nکلمات کلیدی: ' + draft.hashtags : '');
-                                        showToast('پیش‌نویس به تولید مقاله منتقل شد. روی تولید کلیک کنید.', 'success');
-                                    }
-                                } else {
-                                    // General draft → quick send
-                                    document.getElementById('manual_title').value = draft.title || '';
-                                    document.getElementById('manual_message').value = draft.content || '';
-                                    switchTab('manual', document.querySelector('[data-tab=manual]'));
-                                    showToast('پیش‌نویس بارگذاری شد', 'success');
-                                }
-                            }
-                        }
-                    })
-                    .catch(function() { showToast('خطا در بارگذاری', 'error'); });
-            };
-
-            // Event delegation for draft buttons
-            document.getElementById('drafts_list').addEventListener('click', function(e) {
-                var btn = e.target.closest('[data-id]');
-                if (!btn) return;
-                var id = parseInt(btn.dataset.id);
-                if (btn.classList.contains('btn-delete-draft')) deleteDraft(id);
-                else if (btn.classList.contains('btn-use-draft')) useDraft(id);
-            });
-
-            // ===== Calendar Functions (Shamsi) =====
-            <?php
-            $now_j = $this->gregorian_to_jalali((int)current_time('Y'), (int)current_time('n'), (int)current_time('j'));
-            $jalali_month_names = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-            $jalali_day_names = ['ش','ی','د','س','چ','پ','ج'];
-            ?>
-            var calendarMonth = <?php echo $now_j[1]; ?>;
-            var calendarYear = <?php echo $now_j[0]; ?>;
-            var _jalaliMonths = <?php echo json_encode($jalali_month_names); ?>;
-            var _dayNamesShort = <?php echo json_encode($jalali_day_names); ?>;
-
-            window.calendarPrevMonth = function() {
-                calendarMonth--;
-                if (calendarMonth < 1) { calendarMonth = 12; calendarYear--; }
-                loadCalendar();
-            };
-            window.calendarNextMonth = function() {
-                calendarMonth++;
-                if (calendarMonth > 12) { calendarMonth = 1; calendarYear++; }
-                loadCalendar();
-            };
-
-            window.loadCalendar = function() {
-                var params = new URLSearchParams({action: 'ssp_get_calendar', security: nonce, month: calendarMonth, year: calendarYear});
-                console.log('[SSP Calendar] Loading:', ajaxurl + '?' + params.toString());
-                fetch(ajaxurl + '?' + params.toString())
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        console.log('[SSP Calendar] Response:', JSON.stringify(res));
-                        if (res.success) renderCalendar(res.data);
-                    })
-                    .catch(function(err) {
-                        console.error('[SSP Calendar] Fetch error:', err);
-                        showToast('\u062E\u0637\u0627 \u062F\u0631 \u0628\u0627\u0631\u06AF\u0630\u0627\u0631\u06CC \u062A\u0642\u0648\u06CC\u0645', 'error');
-                    });
-            };
-
-            function renderCalendar(data) {
-                try {
-                console.log('[SSP Calendar] renderCalendar data:', JSON.stringify(data));
-                var calYear = parseInt(data.year), calMonth = parseInt(data.month);
-                if (!calYear || !calMonth || calMonth < 1 || calMonth > 12) {
-                    document.getElementById('content_calendar').innerHTML = '<div style="grid-column:1/-1; text-align:center; padding:20px; color:var(--text-muted);">داده تقویم نامعتبر است</div>';
-                    return;
-                }
-                document.getElementById('calendar_month_label').textContent = _jalaliMonths[calMonth - 1] + ' ' + calYear;
-                var daysInMonth = calMonth <= 6 ? 31 : (calMonth <= 11 ? 30 : 29);
-                var firstG = jalaliToGregorian(calYear, calMonth, 1);
-                var firstDow = new Date(firstG[0], firstG[1]-1, firstG[2]).getDay();
-                var todayG = new Date();
-                var todayJ = gregorianToJalali(todayG.getFullYear(), todayG.getMonth()+1, todayG.getDate());
-                var isCurrentMonth = calYear === todayJ[0] && calMonth === todayJ[1];
-
-                var html = '';
-                for (var i = 0; i < 7; i++) {
-                    html += '<div style="padding:6px; text-align:center; font-weight:700; color:var(--text-muted); font-size:0.75rem;">' + _dayNamesShort[i] + '</div>';
-                }
-                for (var sp = 0; sp < firstDow; sp++) html += '<div style="min-height:20px;"></div>';
-
-                for (var day = 1; day <= daysInMonth; day++) {
-                    var g = jalaliToGregorian(calYear, calMonth, day);
-                    var dateStr = g[0] + '-' + (g[1]<10?'0':'') + g[1] + '-' + (g[2]<10?'0':'') + g[2];
-                    var isToday = isCurrentMonth && day === todayJ[2];
-                    var items = (data.calendar && data.calendar[dateStr]) ? data.calendar[dateStr] : [];
-                    var hasScheduled = items.some(function(it) { return it.status === 'pending'; });
-                    var hasSent = items.some(function(it) { return it.status !== 'pending'; });
-                    var bg = isToday ? 'var(--accent-soft)' : (hasScheduled ? 'rgba(79,70,229,0.05)' : (hasSent ? 'rgba(16,185,129,0.05)' : 'var(--bg-alt)'));
-                    var border = isToday ? 'var(--accent)' : (hasScheduled ? 'var(--accent)' : (hasSent ? 'var(--success)' : 'var(--border)'));
-
-                    html += '<div onclick="schCalendarClick(' + calYear + ',' + calMonth + ',' + day + ')" style="padding:6px; background:' + bg + '; border:1px solid ' + border + '; border-radius:8px; min-height:65px; cursor:pointer;">';
-                    html += '<div style="display:flex; justify-content:space-between; align-items:center;">';
-                    html += '<span style="font-weight:700; font-size:0.85rem;">' + day + '</span>';
-                    if (hasSent) html += '<span style="font-size:0.7rem; color:var(--success);">&#10003;</span>';
-                    html += '</div>';
-                    if (items.length > 0) {
-                        items.forEach(function(item) {
-                            var icon = item.status === 'pending' ? '&#9203;' : '&#10004;';
-                            html += '<div style="font-size:0.65rem; padding:2px 4px; background:var(--card); border-radius:4px; margin:2px 0; border:1px solid var(--border); overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">' + icon + ' ' + item.time + ' ' + escapeHtml((item.title||'').substring(0,10)) + '</div>';
-                        });
-                    }
-                    html += '</div>';
-                }
-                document.getElementById('content_calendar').innerHTML = html;
-                } catch(e) {
-                    console.error('[SSP Calendar] renderCalendar error:', e);
-                    document.getElementById('content_calendar').innerHTML = '<div style="grid-column:1/-1; text-align:center; padding:20px; color:var(--error);">خطای رندر تقویم: ' + e.message + '</div>';
-                }
-            }
-
-            window.schCalendarClick = function(y, m, d) {
-                var g = jalaliToGregorian(y, m, d);
-                var dateStr = g[0] + '-' + (g[1]<10?'0':'') + g[1] + '-' + (g[2]<10?'0':'') + g[2];
-                var params = new URLSearchParams({action: 'ssp_get_calendar', security: nonce, month: m, year: y});
-                fetch(ajaxurl + '?' + params.toString())
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var items = res.data.calendar[dateStr] || [];
-                        var title = _jalaliMonths[m-1] + ' ' + d + ' ' + y;
-                        var body = '';
-                        if (items.length === 0) {
-                            body = '<p style="color:var(--text-muted); text-align:center;">ارسالی برای این روز زمانبندی نشده است.</p>';
-                        } else {
-                            items.forEach(function(item) {
-                                var icon = item.status === 'pending' ? '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' : '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>';
-                                var statusLabel = item.status === 'pending' ? 'در انتظار' : 'انجام شده';
-                                var borderC = item.status === 'pending' ? 'var(--accent)' : 'var(--success)';
-                                body += '<div onclick="document.querySelector(\'.ssp-modal-overlay\').remove(); switchTab(\'schedules\', document.querySelector(\'[data-tab=schedules]\'));" style="padding:10px; background:var(--bg-alt); border-radius:8px; margin-bottom:8px; border-right:3px solid ' + borderC + '; cursor:pointer; transition:transform 0.15s;" onmouseover="this.style.transform=\'scale(1.02)\'" onmouseout="this.style.transform=\'scale(1)\'">';
-                                body += '<div style="display:flex; justify-content:space-between; align-items:center;">';
-                                body += '<strong>' + icon + ' ' + escapeHtml(item.title) + '</strong>';
-                                body += '<span class="ssp-badge ' + (item.status === 'pending' ? 'info' : 'success') + '">' + statusLabel + '</span>';
-                                body += '</div>';
-                                body += '<div style="font-size:0.8rem; color:var(--text-muted); margin-top:4px; display:flex; align-items:center; gap:4px;"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> ' + item.time + '</div>';
-                                body += '<div style="font-size:0.7rem; color:var(--accent); margin-top:4px;">➡️ انتقال به زمانبندی</div>';
-                                body += '</div>';
-                            });
-                        }
-                        var modal = document.createElement('div');
-                        modal.className = 'ssp-modal-overlay';
-                        modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
-                        modal.innerHTML = '<div class="ssp-modal" style="max-width:400px;"><div class="ssp-modal-header"><h3>' + title + '</h3><button onclick="this.closest(\'.ssp-modal-overlay\').remove()">&times;</button></div><div class="ssp-modal-body">' + body + '</div></div>';
-                        document.body.appendChild(modal);
-                    });
-            };
-
-            // ===== Template Library Functions =====
-            window._templateData = [];
-            window._currentTemplateFilter = 'all';
-
-            // --- Template Modal Functions ---
-            window.openTemplateCreateModal = function() {
-                document.getElementById('tpl_edit_id').value = '';
-                document.getElementById('tpl_edit_name').value = '';
-                document.getElementById('tpl_edit_category').value = 'general';
-                document.getElementById('tpl_edit_content').value = '';
-                document.getElementById('tpl_edit_hashtags').value = '';
-                document.getElementById('tpl_edit_signature').value = '';
-                document.getElementById('tpl_modal_title').textContent = 'قالب جدید';
-                document.getElementById('modal_template_edit').classList.add('active');
-            };
-
-            window.openTemplateEditModal = function(id) {
-                var tpl = window._templateData.find(function(t) { return t.id === id; });
-                if (!tpl) return;
-                document.getElementById('tpl_edit_id').value = tpl.id;
-                document.getElementById('tpl_edit_name').value = tpl.name || '';
-                document.getElementById('tpl_edit_category').value = tpl.category || 'general';
-                document.getElementById('tpl_edit_content').value = tpl.content || '';
-                document.getElementById('tpl_edit_hashtags').value = tpl.hashtags || '';
-                document.getElementById('tpl_edit_signature').value = tpl.signature || '';
-                document.getElementById('tpl_modal_title').textContent = 'ویرایش قالب';
-                document.getElementById('modal_template_edit').classList.add('active');
-            };
-
-            window.closeTemplateModal = function() {
-                document.getElementById('modal_template_edit').classList.remove('active');
-            };
-
-            window.saveTemplateFromModal = function() {
-                var name = document.getElementById('tpl_edit_name').value.trim();
-                var content = document.getElementById('tpl_edit_content').value.trim();
-                if (!name || !content) { showToast('نام و محتوا را وارد کنید', 'warning'); return; }
-
-                var editId = document.getElementById('tpl_edit_id').value;
-                var btn = document.getElementById('tpl_modal_save_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_template_item');
-                fd.append('security', nonce);
-                if (editId) fd.append('template_id', editId);
-                fd.append('name', name);
-                fd.append('category', document.getElementById('tpl_edit_category').value);
-                fd.append('content', content);
-                fd.append('hashtags', document.getElementById('tpl_edit_hashtags').value);
-                fd.append('signature', document.getElementById('tpl_edit_signature').value);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeTemplateModal();
-                            loadTemplates();
-                            loadManualTemplateSelect();
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // --- Template Filter ---
-            window.filterTemplates = function(category, btn) {
-                document.querySelectorAll('.tpl-filter').forEach(function(b) { b.classList.remove('active'); });
-                btn.classList.add('active');
-                window._currentTemplateFilter = category;
-                var filtered = category === 'all' ? window._templateData : window._templateData.filter(function(t) { return t.category === category; });
-                renderTemplateCards(filtered);
-            };
-
-            // --- Template Card Renderer ---
-            window.renderTemplateCards = function(templates) {
-                var list = document.getElementById('template_library_list');
-                if (!list) return;
-                if (templates.length === 0) {
-                    list.innerHTML = '<div class="ssp-empty"><div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div><p>هنوز قالبی ذخیره نکرده‌اید.</p></div>';
-                    return;
-                }
-                var categoryLabels = {general:'عمومی', news:'اخبار', promotion:'تبلیغات', educational:'آموزشی'};
-                var html = '';
-                templates.forEach(function(t) {
-                    var isDefault = (window._defaultTemplateId == t.id);
-                    html += '<div class="ssp-item-card" data-id="' + t.id + '">' +
-                        '<div class="ssp-item-card-head"><div style="flex:1; min-width:0;">' +
-                        '<div class="ssp-item-card-title">📋 ' + escapeHtml(t.name) +
-                        ' <span class="ssp-badge info">' + (categoryLabels[t.category] || t.category) + '</span>' +
-                        (isDefault ? ' <span class="ssp-badge" style="background:var(--accent);color:#fff;">پیش‌فرض</span>' : '') +
-                        '</div>' +
-                        '<div class="ssp-item-card-meta">' + escapeHtml((t.content || '').substring(0, 120)) + ((t.content || '').length > 120 ? '...' : '') + '</div>' +
-                        (t.hashtags ? '<div class="ssp-item-card-meta" style="color:var(--accent);">' + escapeHtml(t.hashtags) + '</div>' : '') +
-                        (t.signature ? '<div class="ssp-item-card-meta" style="color:var(--text-secondary);">✍ ' + escapeHtml(t.signature) + '</div>' : '') +
-                        '<div class="ssp-item-card-meta">استفاده: ' + (t.usage_count || 0) + ' بار</div>' +
-                        '</div><div style="display:flex; gap:6px; flex-wrap:wrap; align-items:flex-start;">' +
-                        '<button class="ssp-btn-secondary btn-edit-template" data-id="' + t.id + '" style="padding:6px 12px; font-size:0.75rem;">ویرایش</button>' +
-                        '<button class="ssp-btn-primary btn-use-template" data-id="' + t.id + '" data-target="manual" style="padding:6px 12px; font-size:0.75rem;">ارسال پیام</button>' +
-                        '<button class="ssp-btn-secondary btn-set-default-template" data-id="' + t.id + '" style="padding:6px 12px; font-size:0.75rem;">' + (isDefault ? 'پیش‌فرض ✓' : 'پیش‌فرض') + '</button>' +
-                        '<button class="ssp-btn-danger btn-delete-template" data-id="' + t.id + '" style="padding:6px 12px; font-size:0.75rem;">حذف</button>' +
-                        '</div></div></div>';
-                });
-                list.innerHTML = html;
-            };
-
-            // --- Load Templates (profile-scoped) ---
-            window.loadTemplates = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_templates');
-                fd.append('security', nonce);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            window._templateData = res.data.templates;
-                            var filtered = window._currentTemplateFilter === 'all' ? res.data.templates : res.data.templates.filter(function(t) { return t.category === window._currentTemplateFilter; });
-                            renderTemplateCards(filtered);
-                            loadManualTemplateSelect();
-                        }
-                    })
-                    .catch(function() { showToast('خطا در بارگذاری قالب‌ها', 'error'); });
-            };
-
-            // --- Event delegation for template buttons ---
-            document.addEventListener('click', function(e) {
-                var btn = e.target.closest('.btn-use-template, .btn-delete-template, .btn-edit-template, .btn-set-default-template');
-                if (!btn) return;
-                var card = btn.closest('[data-id]');
-                if (!card) return;
-                var id = parseInt(card.dataset.id);
-                if (btn.classList.contains('btn-delete-template')) deleteTemplateItem(id);
-                else if (btn.classList.contains('btn-use-template')) useTemplateItem(id, btn.dataset.target || 'manual');
-                else if (btn.classList.contains('btn-edit-template')) openTemplateEditModal(id);
-                else if (btn.classList.contains('btn-set-default-template')) setDefaultTemplate(id);
-            });
-
-            // --- Increment template usage count ---
-            window._incrementTemplateUsage = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_increment_template_usage');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd});
-            };
-
-            // --- Use Template (fills all fields) ---
-            window.useTemplateItem = function(id, target) {
-                var tpl = window._templateData.find(function(t) { return t.id === id; });
-                if (!tpl) return;
-                var sidebarBtn = document.querySelector('.ssp-sidebar [data-tab="manual"]');
-                switchTab('manual', sidebarBtn);
-                setTimeout(function() {
-                    document.getElementById('manual_title').value = tpl.name || '';
-                    document.getElementById('manual_message').value = tpl.content || '';
-                    var hashtagsEl = document.getElementById('manual_hashtags');
-                    if (hashtagsEl && tpl.hashtags) hashtagsEl.value = tpl.hashtags;
-                    showToast('قالب "' + escapeHtml(tpl.name || '') + '" بارگذاری شد', 'success');
-                }, 100);
-                window._incrementTemplateUsage(id);
-            };
-
-            // --- Delete Template ---
-            window.deleteTemplateItem = function(id) {
-                if (!confirm('آیا از حذف این قالب مطمئن هستید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_template_item');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            loadTemplates();
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // --- Set Default Template ---
-            window.setDefaultTemplate = function(id) {
-                window._defaultTemplateId = id;
-                var fd = new FormData();
-                fd.append('action', 'ssp_set_template_default');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('قالب پیش‌فرض تنظیم شد', 'success');
-                            loadTemplates();
-                            loadManualTemplateSelect();
-                        }
-                    });
-            };
-
-            // --- Manual Send: Template Selector ---
-            window.loadManualTemplateSelect = function() {
-                var sel = document.getElementById('manual_template_select');
-                var wrap = document.getElementById('manual_template_selector');
-                if (!sel || !wrap) return;
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_templates');
-                fd.append('security', nonce);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var templates = res.data.templates;
-                        wrap.style.display = templates.length > 0 ? '' : 'none';
-
-                        var categoryLabels = {general:'عمومی', news:'اخبار', promotion:'تبلیغات', educational:'آموزشی'};
-                        var html = '<option value="">— انتخاب قالب —</option>';
-                        templates.forEach(function(t) {
-                            var label = escapeHtml(t.name) + ' [' + (categoryLabels[t.category] || '') + ']';
-                            if (window._defaultTemplateId == t.id) label += ' ★';
-                            html += '<option value="' + t.id + '">' + label + '</option>';
-                        });
-                        sel.innerHTML = html;
-
-                        if (window._defaultTemplateId) {
-                            sel.value = window._defaultTemplateId;
-                        }
-                    });
-            };
-
-            window.onManualTemplateSelect = function() {
-                var sel = document.getElementById('manual_template_select');
-                var id = parseInt(sel.value);
-                if (!id) return;
-                var tpl = window._templateData.find(function(t) { return t.id === id; });
-                if (!tpl) return;
-
-                document.getElementById('manual_title').value = tpl.name || '';
-                document.getElementById('manual_message').value = tpl.content || '';
-                var hashtagsEl = document.getElementById('manual_hashtags');
-                if (hashtagsEl && tpl.hashtags) hashtagsEl.value = tpl.hashtags;
-                showToast('قالب "' + escapeHtml(tpl.name || '') + '" بارگذاری شد', 'success');
-                window._incrementTemplateUsage(id);
-            };
-
-            window.onManualTemplateDefaultToggle = function() {
-                var sel = document.getElementById('manual_template_select');
-                var id = parseInt(sel.value) || 0;
-                if (!id) { showToast('ابتدا یک قالب انتخاب کنید', 'warning'); return; }
-                var fd = new FormData();
-                fd.append('action', 'ssp_set_template_default');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            window._defaultTemplateId = id;
-                            showToast('قالب پیش‌فرض ذخیره شد', 'success');
-                            loadTemplates();
-                            loadManualTemplateSelect();
-                        }
-                    });
-            };
-
-            // ===== SEO Sub-tab Switcher =====
-            window.switchSeoSubtab = function(tabId, btn) {
-                // Hide all sub-tab contents
-                var contents = document.querySelectorAll('.seo-subtab-content');
-                for (var i = 0; i < contents.length; i++) {
-                    contents[i].style.display = 'none';
-                }
-                // Deactivate all sub-tab buttons
-                var buttons = document.querySelectorAll('.ssp-seo-subtab');
-                for (var i = 0; i < buttons.length; i++) {
-                    buttons[i].classList.remove('active');
-                }
-                // Show selected content
-                var target = document.getElementById('seo-subtab-' + tabId);
-                if (target) target.style.display = 'block';
-                // Activate clicked button
-                if (btn) btn.classList.add('active');
-
-                // Show/hide browser mode button for site-audit tab
-                if (tabId === 'site-audit') {
-                    var browserBtn = document.getElementById('site_audit_browser_btn');
-                    if (browserBtn) {
-                        var aiMode = document.getElementById('ssp_ai_mode');
-                        browserBtn.style.display = (aiMode && aiMode.value === 'browser') ? 'inline-flex' : 'none';
-                    }
-                }
-            };
-
-            // ===== AI Prompt Mode Functions =====
-            function getPromptModePrefix(mode) {
-                var modes = {
-                    'human': 'Apply /human mode: Rewrite and analyze as if written by an experienced human writer. Avoid AI clichés, repetitive sentence patterns, and robotic phrasing. Use natural transitions, varied sentence lengths, opinions, and conversational language.',
-                    'redteam': 'Apply /redteam mode: Act as a critical reviewer. Challenge assumptions, identify weaknesses, hidden risks, logical flaws, SEO problems, and alternative viewpoints. Be harsh but constructive.',
-                    'x10think': 'Apply /x10think mode: Think 10 times deeper than normal. Consider edge cases, second-order effects, long-term consequences, and hidden assumptions. Analyze from multiple angles.',
-                    'socrates': 'Apply /socrates mode: Do not answer immediately. Ask one question at a time until enough information is gathered. Guide toward discovering the answer through questioning.',
-                    'truth': 'Apply /truth mode: Present facts, uncertainty levels, counterarguments and confidence estimates. State what is known, unknown, and disputed. Be transparent about limitations.',
-                    'meta': 'Apply /meta mode: Explain your assumptions, reasoning strategy, limitations, and possible failure modes. Show your thinking process.',
-                    'predict': 'Apply /predict mode: Generate multiple future scenarios. Include probabilities, assumptions, and possible disruptions. Predict trends and risks.',
-                    'ooda': 'Apply /ooda mode: Use the Observe-Orient-Decide-Act framework. First observe all facts, then orient by analyzing context, decide on possible actions, and recommend execution steps.',
-                    'eli10': 'Apply /eli10 mode: Explain this topic as if speaking to a smart 10-year-old child. Use examples and analogies. Avoid technical jargon. Make it simple and clear.',
-                    'alt3': 'Apply /alt3 mode: Generate 3 completely different approaches, strategies, or perspectives. Compare pros and cons of each. Provide diverse viewpoints.'
-                };
-                return modes[mode] || '';
-            }
-
-            window.updateSeoPromptMode = function() {
-                var mode = document.getElementById('seo_prompt_mode').value;
-                var hint = document.getElementById('seo_prompt_mode_hint');
-                var descriptions = {
-                    'human': 'متن را انسانی‌تر و طبیعی‌تر تحلیل می‌کند',
-                    'redteam': 'تحلیل انتقادی نقاط ضعف و ریسک‌ها',
-                    'x10think': 'تفکر عمیق‌تر و تحلیل لایه‌ای',
-                    'socrates': 'پرسش‌گری هوشمند قبل از تحلیل',
-                    'truth': 'بیان واقعیت‌ها با سطح اطمینان',
-                    'meta': 'تحلیل فرآیند فکر و استدلال',
-                    'predict': 'پیش‌بینی سناریوهای آینده',
-                    'ooda': 'چرخه مشاهده-جهت‌گیری-تصمیم-عمل',
-                    'eli10': 'توضیح ساده برای کودک ۱۰ ساله',
-                    'alt3': 'ارائه ۳ دیدگاه و استراتژی مختلف'
-                };
-                if (mode && descriptions[mode]) {
-                    hint.textContent = descriptions[mode];
-                    hint.style.display = 'block';
-                } else {
-                    hint.style.display = 'none';
-                }
-            };
-
-            window.seoResetPromptMode = function() {
-                document.getElementById('seo_prompt_mode').value = '';
-                updateSeoPromptMode();
-                showToast('حالت پرامپت به پیش‌فرض بازگردانی شد', 'success');
-            };
-
-            window.updateSiteAuditPromptMode = function() {
-                var mode = document.getElementById('site_audit_prompt_mode').value;
-                var hint = document.getElementById('site_audit_prompt_mode_hint');
-                var descriptions = {
-                    'human': 'متن را انسانی‌تر و طبیعی‌تر تحلیل می‌کند',
-                    'redteam': 'تحلیل انتقادی نقاط ضعف و ریسک‌ها',
-                    'x10think': 'تفکر عمیق‌تر و تحلیل لایه‌ای',
-                    'socrates': 'پرسش‌گری هوشمند قبل از تحلیل',
-                    'truth': 'بیان واقعیت‌ها با سطح اطمینان',
-                    'meta': 'تحلیل فرآیند فکر و استدلال',
-                    'predict': 'پیش‌بینی سناریوهای آینده',
-                    'ooda': 'چرخه مشاهده-جهت‌گیری-تصمیم-عمل',
-                    'eli10': 'توضیح ساده برای کودک ۱۰ ساله',
-                    'alt3': 'ارائه ۳ دیدگاه و استراتژی مختلف'
-                };
-                if (mode && descriptions[mode]) {
-                    hint.textContent = descriptions[mode];
-                    hint.style.display = 'block';
-                } else {
-                    hint.style.display = 'none';
-                }
-            };
-
-            window.siteAuditResetPromptMode = function() {
-                document.getElementById('site_audit_prompt_mode').value = '';
-                updateSiteAuditPromptMode();
-                showToast('حالت پرامپت به پیش‌فرض بازگردانی شد', 'success');
-            };
-
-            // ===== SEO Functions =====
-            window.updateSeoCharCount = function(type) {
-                if (type === 'title') {
-                    var el = document.getElementById('seo_title');
-                    var counter = document.getElementById('seo_title_count');
-                    if (el && counter) counter.textContent = el.value.length + ' کاراکتر';
-                } else {
-                    var el = document.getElementById('seo_content');
-                    var counter = document.getElementById('seo_content_count');
-                    if (el && counter) {
-                        var words = el.value.trim() ? el.value.trim().split(/\s+/).length : 0;
-                        counter.textContent = el.value.length + ' کاراکتر • ' + words + ' کلمه';
-                    }
-                }
-            };
-
-            window.updateSeoHashtagCount = function() {
-                var el = document.getElementById('seo_hashtags');
-                var counter = document.getElementById('seo_hashtag_count');
-                if (el && counter) {
-                    var tags = el.value.trim() ? el.value.trim().split(/\s+/).filter(function(t) { return t.startsWith('#'); }).length : 0;
-                    counter.textContent = tags + ' هشتگ';
-                }
-            };
-
-            window.showPlatformTips = function() {
-                var platform = document.getElementById('seo_platform').value;
-                var tipsEl = document.getElementById('platform_tips');
-                var tips = {
-                    general: '<strong>عمومی:</strong> محتوای کوتاه و جذاب بنویسید. از ایموجی استفاده کنید. CTA واضح داشته باشید.',
-                    website: '<strong>وبسایت:</strong> عنوان 30-60 کاراکتر. توضیحات meta حداقل 70 کاراکتر. از تگ‌های H2/H3 استفاده کنید. تصاویر alt داشته باشند. Schema Markup اضافه کنید.',
-                    telegram: '<strong>تلگرام:</strong> حداکثر 4096 کاراکتر. پشتیبانی از HTML. لینک‌ها کلیک‌هستند.',
-                    instagram: '<strong>اینستاگرام:</strong> حداکثر 2200 کاراکتر. خط اول مهم‌ترین است. ایموجی تعامل را افزایش می‌دهد.',
-                    twitter: '<strong>توییتر/X:</strong> حداکثر 280 کاراکتر. زمان‌بندی ارسال مهم است.',
-                    whatsapp: '<strong>واتساپ:</strong> حداکثر 65536 کاراکتر. پشتیبانی از *بولد* و _ایتالیک_.'
-                };
-                if (platform === 'general') { tipsEl.style.display = 'none'; return; }
-                tipsEl.innerHTML = tips[platform] || tips.general;
-                tipsEl.style.display = 'block';
-            };
-
-            window.analyzeSeoWithAi = function() {
-                // In browser mode, redirect to browser generation
-                if (document.getElementById('ssp_ai_mode') && document.getElementById('ssp_ai_mode').value === 'browser') {
-                    seoAnalyzeViaBrowser();
-                    return;
-                }
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                var hashtags = document.getElementById('seo_hashtags').value;
-                var platform = document.getElementById('seo_platform').value;
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('seo_ai_btn');
-                btn.classList.add('loading');
-                var resultsEl = document.getElementById('seo_results');
-                resultsEl.innerHTML = '<div class="ssp-card" style="text-align:center;">در حال تحلیل با هوش مصنوعی...</div>';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_analyze_seo_ai');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('hashtags', hashtags);
-                fd.append('platform', platform);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data;
-                            var scoreColor = d.score >= 70 ? 'var(--success)' : d.score >= 40 ? 'var(--warning)' : 'var(--error)';
-                            var html = '<div class="ssp-card">';
-                            html += '<div style="text-align:center; margin-bottom:20px;">';
-                            html += '<div style="font-size:3rem; font-weight:700; color:' + scoreColor + ';">' + d.score + '/100</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز SEO</div>';
-                            html += '<div style="color:var(--text); margin-top:8px;">' + escapeHtml(d.summary || '') + '</div>';
-                            html += '</div>';
-                            if (d.strengths && d.strengths.length) {
-                                html += '<div style="margin-bottom:16px;"><strong style="color:var(--success);">نقاط قوت:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.strengths.forEach(function(s) { html += '<li style="color:var(--text-muted); margin:4px 0;">' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-                            if (d.weaknesses && d.weaknesses.length) {
-                                html += '<div style="margin-bottom:16px;"><strong style="color:var(--error);">نقاط ضعف:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.weaknesses.forEach(function(s) { html += '<li style="color:var(--text-muted); margin:4px 0;">' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-                            if (d.improvements && d.improvements.length) {
-                                html += '<div style="margin-bottom:16px;"><strong style="color:var(--info);">پیشنهادات بهبود:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.improvements.forEach(function(s) { html += '<li style="color:var(--text-muted); margin:4px 0;">' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-                            if (d.optimized_title || d.optimized_content) {
-                                html += '<div style="background:var(--bg-alt); padding:16px; border-radius:10px; margin-top:16px;">';
-                                html += '<strong style="color:var(--accent);">نسخه بهینه‌شده:</strong>';
-                                if (d.optimized_title) html += '<div style="margin-top:8px;"><strong>عنوان:</strong> ' + escapeHtml(d.optimized_title) + '</div>';
-                                if (d.optimized_content) html += '<div style="margin-top:8px;"><strong>محتوا:</strong> ' + escapeHtml(d.optimized_content) + '</div>';
-                                if (d.suggested_hashtags) html += '<div style="margin-top:8px;"><strong>هشتگ‌ها:</strong> ' + escapeHtml(d.suggested_hashtags) + '</div>';
-                                html += '</div>';
-                            }
-                            html += '</div>';
-                            resultsEl.innerHTML = html;
-                        } else {
-                            resultsEl.innerHTML = '<div class="ssp-card" style="color:var(--error);">' + escapeHtml(res.data.message) + '</div>';
-                        }
-                    })
-                    .catch(function(err) { btn.classList.remove('loading'); resultsEl.innerHTML = ''; showToast('خطا: ' + (err.message || 'ارتباط با سرور برقرار نشد'), 'error'); });
-            };
-
-            window.analyzeSeo = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                var hashtags = document.getElementById('seo_hashtags').value;
-                var platform = document.getElementById('seo_platform').value;
-
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('seo_analyze_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_analyze_seo');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('hashtags', hashtags);
-                fd.append('platform', platform);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data;
-                            var scoreColor = d.score >= 70 ? 'var(--success)' : (d.score >= 40 ? 'var(--warning)' : 'var(--error)');
-                            var html = '<div class="ssp-card">';
-
-                            // Score
-                            html += '<div style="text-align:center; margin-bottom:20px;">';
-                            html += '<div style="font-size:3rem; font-weight:700; color:' + scoreColor + ';">' + d.score + '</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز SEO از 100</div>';
-                            if (d.platform && d.platform !== 'general') {
-                                html += '<div style="color:var(--text-subtle); font-size:0.8rem; margin-top:4px;">پلتفرم: ' + d.platform + ' | محدودیت: ' + d.platform_limit + ' کاراکتر</div>';
-                            }
-                            html += '</div>';
-
-                            // Score Breakdown
-                            if (d.score_breakdown) {
-                                html += '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(120px, 1fr)); gap:8px; margin-bottom:16px;">';
-                                var labels = {title:'عنوان', content:'محتوا', structure:'ساختار', engagement:'تعامل', hashtag:'هشتگ', quality:'کیفیت'};
-                                var maxes = {title:25, content:25, structure:15, engagement:15, hashtag:10, quality:10};
-                                for (var key in d.score_breakdown) {
-                                    var val = d.score_breakdown[key];
-                                    var mx = maxes[key] || 10;
-                                    var pct = Math.round((val / mx) * 100);
-                                    var c = pct >= 70 ? 'var(--success)' : (pct >= 40 ? 'var(--warning)' : 'var(--error)');
-                                    html += '<div style="text-align:center; padding:8px; background:var(--bg-alt); border-radius:8px;">';
-                                    html += '<div style="font-size:1.1rem; font-weight:700; color:' + c + ';">' + val + '/' + mx + '</div>';
-                                    html += '<div style="font-size:0.75rem; color:var(--text-muted);">' + (labels[key] || key) + '</div>';
-                                    html += '</div>';
-                                }
-                                html += '</div>';
-                            }
-
-                            // Readability
-                            if (d.readability) {
-                                var rColor = d.readability.score >= 60 ? 'var(--success)' : (d.readability.score >= 40 ? 'var(--warning)' : 'var(--error)');
-                                html += '<div style="padding:12px; background:var(--bg-alt); border-radius:10px; margin-bottom:16px;">';
-                                html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">';
-                                html += '<strong>خوانایی:</strong> <span style="color:' + rColor + '; font-weight:600;">' + d.readability.level + '</span>';
-                                html += '<span style="color:var(--text-subtle); font-size:0.8rem;">Flesch: ' + (d.readability.flesch_score || d.readability.score) + '/100 | Grade: ' + (d.readability.grade_level || '-') + '</span>';
-                                html += '</div>';
-                                html += '<div style="color:var(--text-muted); font-size:0.8rem;">' + d.readability.description + '</div>';
-                                if (d.readability.complex_ratio) html += '<div style="color:var(--text-subtle); font-size:0.75rem; margin-top:4px;">کلمات پیچیده: ' + d.readability.complex_ratio + '% | میانگین کلمات/جمله: ' + d.readability.avg_words_per_sentence + '</div>';
-                                html += '</div>';
-                            }
-
-                            // Keywords
-                            if (d.keywords && d.keywords.length > 0) {
-                                html += '<div style="margin-bottom:16px;"><strong>کلمات کلیدی:</strong><div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;">';
-                                d.keywords.forEach(function(k) {
-                                    html += '<span style="padding:4px 10px; background:var(--bg-alt); border-radius:20px; font-size:0.8rem;">' + escapeHtml(k.word) + ' <span style="color:var(--accent);">' + k.density + '%</span></span>';
-                                });
-                                html += '</div></div>';
-                            }
-
-                            // Strengths
-                            if (d.strengths && d.strengths.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--success);">نقاط قوت:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.strengths.forEach(function(s) { html += '<li style="color:var(--success); margin:4px 0;">✓ ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            // Issues
-                            if (d.issues && d.issues.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--error);">مشکلات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.issues.forEach(function(s) { html += '<li style="color:var(--error); margin:4px 0;">✗ ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            // Suggestions
-                            if (d.suggestions && d.suggestions.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--info);">پیشنهادات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.suggestions.forEach(function(s) { html += '<li style="color:var(--info); margin:4px 0;">💡 ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            // Stats
-                            html += '<div style="margin-top:16px; padding:12px; background:var(--bg-alt); border-radius:8px; font-size:0.85rem;">';
-                            html += '<strong>آمار:</strong> ';
-                            html += 'عنوان: ' + d.stats.title_length + ' کاراکتر | ';
-                            html += 'کلمات: ' + d.stats.word_count + ' | ';
-                            html += 'کاراکتر: ' + d.stats.char_count + ' | ';
-                            html += 'جملات: ' + d.stats.sentence_count + ' | ';
-                            html += 'پاراگراف: ' + d.stats.paragraph_count + ' | ';
-                            html += 'زمان خواندن: ' + d.stats.reading_time + ' دقیقه';
-                            html += '</div>';
-
-                            html += '</div>';
-                            document.getElementById('seo_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.suggestSeoTitle = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                var platform = document.getElementById('seo_platform').value;
-
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_seo_suggest_title');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('platform', platform);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.suggestions.length) {
-                            var html = '<div class="ssp-card"><h3>پیشنهادات عنوان</h3>';
-                            res.data.suggestions.forEach(function(s, i) {
-                                html += '<div style="padding:10px; margin:8px 0; background:var(--bg-alt); border-radius:8px; cursor:pointer; display:flex; justify-content:space-between; align-items:center;" onclick="document.getElementById(\'seo_title\').value=\'' + s.replace(/'/g, "\\'") + '\'; showToast(\'عنوان اعمال شد\', \'success\');">';
-                                html += '<span>' + escapeHtml(s) + '</span>';
-                                html += '<span style="color:var(--accent); font-size:0.8rem;">انتخاب</span>';
-                                html += '</div>';
-                            });
-                            html += '</div>';
-                            document.getElementById('seo_results').innerHTML = html;
-                        } else {
-                            showToast('پیشنهادی یافت نشد', 'warning');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.generateMetaDesc = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_meta_desc');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            document.getElementById('meta_desc_result').innerHTML = '<div class="ssp-card"><h3>متا دیسکریپشن</h3><p style="margin:8px 0; padding:12px; background:var(--bg-alt); border-radius:8px;">' + escapeHtml(res.data.meta_description) + '</p><button class="ssp-btn-secondary" onclick="navigator.clipboard.writeText(\'' + res.data.meta_description.replace(/'/g, "\\'") + '\').then(function(){showToast(\'کپی شد\', \'success\')})">کپی</button></div>';
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Content Gap Analysis =====
-            window.analyzeContentGap = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                var keywords = document.getElementById('gap_keywords').value;
-
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-                if (!keywords) { showToast('کلمات کلیدی را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_content_gap');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('keywords', keywords);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var d = res.data;
-                            var html = '<div class="ssp-card">';
-                            html += '<div style="text-align:center; margin-bottom:16px;">';
-                            html += '<div style="font-size:2rem; font-weight:700; color:' + (d.coverage >= 70 ? 'var(--success)' : (d.coverage >= 40 ? 'var(--warning)' : 'var(--error)')) + ';">' + d.coverage + '%</div>';
-                            html += '<div style="color:var(--text-muted);">پوشش کلمات کلیدی</div>';
-                            html += '<div style="font-size:0.8rem; color:var(--text-subtle);">' + d.found + '/' + d.total_keywords + ' کلمه یافت شد</div>';
-                            html += '</div>';
-
-                            // Keywords table
-                            html += '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.85rem;">';
-                            html += '<tr style="border-bottom:1px solid var(--border);"><th style="text-align:right; padding:8px;">کلمه</th><th style="padding:8px;">وضعیت</th><th style="padding:8px;">تعداد</th></tr>';
-                            d.keywords.forEach(function(kw) {
-                                var icon = kw.found ? '✓' : '✗';
-                                var color = kw.found ? 'var(--success)' : 'var(--error)';
-                                html += '<tr style="border-bottom:1px solid var(--border-light);">';
-                                html += '<td style="padding:8px;">' + escapeHtml(kw.keyword) + '</td>';
-                                html += '<td style="padding:8px; text-align:center; color:' + color + ';">' + icon + '</td>';
-                                html += '<td style="padding:8px; text-align:center;">' + kw.count + '</td>';
-                                html += '</tr>';
-                            });
-                            html += '</table></div>';
-
-                            if (d.suggestions.length > 0) {
-                                html += '<div style="margin-top:12px;"><strong style="color:var(--info);">پیشنهادات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.suggestions.forEach(function(s) { html += '<li style="color:var(--info); margin:4px 0;">💡 ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('gap_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Topic Clustering =====
-            window.analyzeTopicCluster = function() {
-                var content = document.getElementById('seo_content').value;
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_topic_cluster');
-                fd.append('security', nonce);
-                fd.append('content', content);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var d = res.data;
-                            var html = '<div class="ssp-card">';
-                            html += '<div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:16px;">';
-                            html += '<div style="text-align:center; padding:12px; background:var(--bg-alt); border-radius:8px;"><div style="font-size:1.5rem; font-weight:700; color:var(--accent);">' + d.total_topics + '</div><div style="font-size:0.8rem; color:var(--text-muted);">موضوع کل</div></div>';
-                            html += '<div style="text-align:center; padding:12px; background:var(--bg-alt); border-radius:8px;"><div style="font-size:1.5rem; font-weight:700; color:var(--success);">' + d.strong_topics + '</div><div style="font-size:0.8rem; color:var(--text-muted);">موضوع قوی</div></div>';
-                            html += '<div style="text-align:center; padding:12px; background:var(--bg-alt); border-radius:8px;"><div style="font-size:1.5rem; font-weight:700; color:var(--info);">' + d.depth_score + '%</div><div style="font-size:0.8rem; color:var(--text-muted);">عمق محتوا</div></div>';
-                            html += '</div>';
-
-                            // Top words
-                            if (d.top_words && d.top_words.length) {
-                                html += '<h4 style="margin:0 0 8px;">کلمات کلیدی برتر</h4>';
-                                html += '<div style="display:flex; flex-wrap:wrap; gap:6px;">';
-                                d.top_words.forEach(function(kw) {
-                                    html += '<span style="padding:4px 10px; background:var(--bg-alt); border-radius:20px; font-size:0.8rem;">' + escapeHtml(kw.word) + ' <span style="color:var(--accent);">' + kw.count + 'x</span></span>';
-                                });
-                                html += '</div>';
-                            }
-
-                            // Clusters
-                            if (d.clusters && d.clusters.length) {
-                                html += '<h4 style="margin:16px 0 8px;">خوشه‌های موضوعی</h4>';
-                                d.clusters.forEach(function(c) {
-                                    html += '<div style="padding:10px; margin:8px 0; background:var(--bg-alt); border-radius:8px; border-right:3px solid var(--accent);">';
-                                    html += '<strong>' + escapeHtml(c.word) + '</strong> <span style="color:var(--accent);">(' + c.frequency + 'x)</span>';
-                                    if (c.related && c.related.length) {
-                                        html += '<div style="margin-top:4px; font-size:0.8rem; color:var(--text-muted);">مرتبط با: ' + c.related.map(function(r) { return escapeHtml(r); }).join(', ') + '</div>';
-                                    }
-                                    html += '</div>';
-                                });
-                            }
-
-                            html += '</div>';
-                            document.getElementById('cluster_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Featured Snippet =====
-            window.analyzeFeaturedSnippet = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_featured_snippet');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var d = res.data;
-                            var html = '<div class="ssp-card">';
-                            html += '<h3 style="margin:0 0 12px;">نتیجه تحلیل Featured Snippet</h3>';
-
-                            html += '<div style="margin-bottom:12px;"><strong>طول snippet:</strong> ' + d.snippet_length + ' کاراکتر <span style="color:var(--text-muted);">(بهینه: 150-300)</span></div>';
-
-                            // Formats
-                            if (d.formats && d.formats.length) {
-                                html += '<h4 style="margin:0 0 8px;">فرمت‌های محتوا:</h4>';
-                                d.formats.forEach(function(f) {
-                                    var icon = f.passed ? '✓' : '✗';
-                                    var color = f.passed ? 'var(--success)' : 'var(--error)';
-                                    html += '<div style="padding:6px 12px; margin:4px 0; background:var(--bg-alt); border-radius:6px; border-right:3px solid ' + color + ';">';
-                                    html += '<span style="color:' + color + ';">' + icon + '</span> ' + f.type;
-                                    if (f.suggestion) html += '<div style="font-size:0.8rem; color:var(--text-muted); margin-top:4px;">' + escapeHtml(f.suggestion) + '</div>';
-                                    html += '</div>';
-                                });
-                            }
-
-                            if (d.passed_formats < d.total_formats) {
-                                html += '<div style="margin-top:12px; padding:10px; background:var(--warning-soft); border-radius:8px; font-size:0.85rem; color:var(--warning);">';
-                                html += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;margin-right:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> ' + (d.total_formats - d.passed_formats) + ' فرمت برای بهینه‌سازی Featured Snippet نیاز به اصلاح دارد';
-                                html += '</div>';
-                            } else {
-                                html += '<div style="margin-top:12px; padding:10px; background:var(--success-soft); border-radius:8px; font-size:0.85rem; color:var(--success);">';
-                                html += '✓ محتوا برای Featured Snippet بهینه است';
-                                html += '</div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('snippet_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Voice Search =====
-            window.analyzeVoiceSearch = function() {
-                var content = document.getElementById('seo_content').value;
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_voice_search');
-                fd.append('security', nonce);
-                fd.append('content', content);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var d = res.data;
-                            var scoreColor = d.score >= 60 ? 'var(--success)' : (d.score >= 40 ? 'var(--warning)' : 'var(--error)');
-                            var html = '<div class="ssp-card">';
-                            html += '<div style="text-align:center; margin-bottom:16px;">';
-                            html += '<div style="font-size:2rem; font-weight:700; color:' + scoreColor + ';">' + d.score + '/100</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز بهینه‌سازی جستجوی صوتی</div>';
-                            html += '</div>';
-
-                            // Checks
-                            if (d.checks) {
-                                html += '<div style="margin-bottom:16px;">';
-                                var checks = [
-                                    {key: 'conversational', label: 'زبان محاوره‌ای'},
-                                    {key: 'questions', label: 'سوالات کافی'},
-                                    {key: 'howto', label: 'فرمت آموزشی'},
-                                    {key: 'short_answers', label: 'پاسخ‌های کوتاه'},
-                                    {key: 'natural_language', label: 'زبان طبیعی'},
-                                ];
-                                checks.forEach(function(c) {
-                                    var icon = d.checks[c.key] ? '✓' : '✗';
-                                    var color = d.checks[c.key] ? 'var(--success)' : 'var(--error)';
-                                    html += '<div style="padding:6px 12px; margin:4px 0; background:var(--bg-alt); border-radius:6px; border-right:3px solid ' + color + ';">';
-                                    html += '<span style="color:' + color + ';">' + icon + '</span> ' + c.label;
-                                    html += '</div>';
-                                });
-                                html += '</div>';
-                            }
-
-                            if (d.suggestions && d.suggestions.length) {
-                                html += '<div><strong>پیشنهادات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.suggestions.forEach(function(s) { html += '<li style="color:var(--info); margin:4px 0;">💡 ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('voice_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== SEO Checklist =====
-            window.generateSeoChecklist = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                var hashtags = document.getElementById('seo_hashtags').value;
-                var platform = document.getElementById('seo_platform').value;
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_seo_checklist');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('meta_desc', document.getElementById('meta_desc_result') ? document.getElementById('meta_desc_result').textContent : '');
-                fd.append('platform', platform);
-                fd.append('hashtags', hashtags);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var d = res.data;
-                            var html = '<div class="ssp-card">';
-                            html += '<div style="text-align:center; margin-bottom:16px;">';
-                            var scoreColor = d.score >= 70 ? 'var(--success)' : (d.score >= 40 ? 'var(--warning)' : 'var(--error)');
-                            html += '<div style="font-size:2rem; font-weight:700; color:' + scoreColor + ';">' + d.score + '%</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز چک‌لیست SEO</div>';
-                            html += '<div style="font-size:0.8rem; color:var(--text-subtle);">' + d.passed + '/' + d.total + ' مورد گذشت</div>';
-                            html += '</div>';
-
-                            // Group by category
-                            var categories = {};
-                            d.checklist.forEach(function(item) {
-                                if (!categories[item.category]) categories[item.category] = [];
-                                categories[item.category].push(item);
-                            });
-
-                            for (var cat in categories) {
-                                html += '<h4 style="margin:12px 0 8px;">' + escapeHtml(cat) + '</h4>';
-                                categories[cat].forEach(function(item) {
-                                    var icon = item.passed ? '✓' : '✗';
-                                    var color = item.passed ? 'var(--success)' : (item.critical ? 'var(--error)' : 'var(--warning)');
-                                    var bg = item.passed ? 'var(--success-soft)' : 'transparent';
-                                    html += '<div style="padding:6px 12px; margin:4px 0; background:' + bg + '; border-radius:6px; border-right:3px solid ' + color + ';">';
-                                    html += '<span style="color:' + color + '; font-weight:600;">' + icon + '</span> ' + escapeHtml(item.item);
-                                    if (item.critical && !item.passed) html += ' <span style="color:var(--error); font-size:0.75rem;">(ضروری)</span>';
-                                    html += '</div>';
-                                });
-                            }
-
-                            html += '</div>';
-                            document.getElementById('checklist_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Keyword Analyzer =====
-            window.importToKeywordAnalyzer = function() {
-                var content = document.getElementById('seo_content').value;
-                var title = document.getElementById('seo_title').value;
-                if (content) {
-                    document.getElementById('kw_content').value = content;
-                    if (title) document.getElementById('kw_focus').value = title;
-                    showToast('محتوا از فرم بالا وارد شد', 'success');
-                } else {
-                    showToast('محتوایی برای دریافت وجود ندارد', 'warning');
-                }
-            };
-
-            window.analyzeKeywords = function() {
-                var content = document.getElementById('kw_content').value;
-                var focus = document.getElementById('kw_focus').value;
-                var title = document.getElementById('seo_title') ? document.getElementById('seo_title').value : '';
-
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('kw_analyze_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_keyword_analyzer');
-                fd.append('security', nonce);
-                fd.append('content', content);
-                fd.append('focus_keyword', focus);
-                fd.append('title', title);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data;
-                            var html = '<div class="ssp-card">';
-
-                            // Stats
-                            html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">';
-                            html += '<div style="padding:12px; background:var(--bg-alt); border-radius:8px; text-align:center;"><div style="font-size:1.5rem; font-weight:700; color:var(--accent);">' + d.total_words + '</div><div style="font-size:0.8rem; color:var(--text-muted);">کلمه کل</div></div>';
-                            html += '<div style="padding:12px; background:var(--bg-alt); border-radius:8px; text-align:center;"><div style="font-size:1.5rem; font-weight:700; color:var(--accent);">' + d.unique_words + '</div><div style="font-size:0.8rem; color:var(--text-muted);">کلمه یکتا</div></div>';
-                            html += '</div>';
-
-                            // Focus keyword
-                            if (d.focus_keyword) {
-                                var fk = d.focus_keyword;
-                                html += '<div style="margin-bottom:16px; padding:12px; border:1px solid var(--border); border-radius:8px;">';
-                                html += '<strong>کلمه کلیدی اصلی:</strong> <span style="color:var(--accent);">' + escapeHtml(fk.keyword) + '</span>';
-                                html += '<div style="margin-top:8px; font-size:0.85rem;">';
-                                html += 'تعداد: ' + fk.count + ' | تراکم: ' + fk.density + '% | ';
-                                html += 'در عنوان: ' + (fk.in_title ? '✓ بله' : '✗ خیر') + ' | ';
-                                html += 'در 100 کاراکتر اول: ' + (fk.in_first_100 ? '✓ بله' : '✗ خیر');
-                                html += '</div>';
-                                if (fk.recommendations && fk.recommendations.length) {
-                                    html += '<div style="margin-top:8px; font-size:0.85rem; color:var(--info);">';
-                                    fk.recommendations.forEach(function(r) { html += '💡 ' + escapeHtml(r) + '<br>'; });
-                                    html += '</div>';
-                                }
-                                html += '</div>';
-                            }
-
-                            // Top keywords
-                            html += '<h4 style="margin:0 0 8px;">کلمات کلیدی برتر</h4>';
-                            html += '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.85rem;">';
-                            html += '<tr style="border-bottom:1px solid var(--border);"><th style="text-align:right; padding:8px;">کلمه</th><th style="padding:8px;">تعداد</th><th style="padding:8px;">تراکم</th><th style="padding:8px; min-width:120px;">نمودار</th></tr>';
-                            d.top_words.forEach(function(kw) {
-                                html += '<tr style="border-bottom:1px solid var(--border-light);">';
-                                html += '<td style="padding:8px; font-weight:600;">' + escapeHtml(kw.keyword) + '</td>';
-                                html += '<td style="padding:8px; text-align:center;">' + kw.count + '</td>';
-                                html += '<td style="padding:8px; text-align:center; color:var(--accent);">' + kw.density + '%</td>';
-                                html += '<td style="padding:8px;"><div style="background:var(--bg-alt); border-radius:4px; height:8px;"><div style="background:var(--accent); height:100%; border-radius:4px; width:' + Math.min(100, kw.density * 20) + '%;"></div></div></td>';
-                                html += '</tr>';
-                            });
-                            html += '</table></div>';
-
-                            // Phrases
-                            if (d.top_bigrams && d.top_bigrams.length > 0) {
-                                html += '<h4 style="margin:16px 0 8px;">عبارات کلیدی (2 کلمه‌ای)</h4>';
-                                html += '<div style="display:flex; flex-wrap:wrap; gap:6px;">';
-                                d.top_bigrams.forEach(function(bg) {
-                                    html += '<span style="padding:4px 10px; background:var(--bg-alt); border-radius:20px; font-size:0.8rem;">' + escapeHtml(bg.keyword) + ' <span style="color:var(--accent);">' + bg.count + 'x</span></span>';
-                                });
-                                html += '</div>';
-                            }
-
-                            if (d.top_trigrams && d.top_trigrams.length > 0) {
-                                html += '<h4 style="margin:16px 0 8px;">عبارات بلند (3 کلمه‌ای)</h4>';
-                                html += '<div style="display:flex; flex-wrap:wrap; gap:6px;">';
-                                d.top_trigrams.forEach(function(tg) {
-                                    html += '<span style="padding:4px 10px; background:var(--bg-alt); border-radius:20px; font-size:0.8rem;">' + escapeHtml(tg.keyword) + ' <span style="color:var(--accent);">' + tg.count + 'x</span></span>';
-                                });
-                                html += '</div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('kw_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== SERP Preview =====
-            window.importToSerpPreview = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                if (title || content) {
-                    if (title) document.getElementById('serp_title').value = title;
-                    if (content) {
-                        var meta = content.length > 155 ? content.substring(0, 152) + '...' : content;
-                        document.getElementById('serp_desc').value = meta;
-                    }
-                    updateSerpPreview();
-                    showToast('اطلاعات از فرم بالا وارد شد', 'success');
-                } else {
-                    showToast('اطلاعاتی برای دریافت وجود ندارد', 'warning');
-                }
-            };
-
-            window.updateSerpPreview = function() {
-                var title = document.getElementById('serp_title').value;
-                var url = document.getElementById('serp_url').value;
-                var desc = document.getElementById('serp_desc').value;
-
-                var displayTitle = title.length > 60 ? title.substring(0, 57) + '...' : (title || 'عنوان صفحه');
-                var displayUrl = url ? url.replace(/^https?:\/\//, '').replace(/\/$/, '') : 'example.com/page';
-                var displayDesc = desc.length > 155 ? desc.substring(0, 152) + '...' : (desc || 'توضیحات صفحه در اینجا نمایش داده می‌شود...');
-
-                document.getElementById('serp_display_title').textContent = displayTitle;
-                document.getElementById('serp_display_url').textContent = displayUrl;
-                document.getElementById('serp_display_desc').textContent = displayDesc;
-                document.getElementById('serp_desc_count').textContent = desc.length + '/155';
-
-                // Analysis
-                var issues = [];
-                if (title.length > 60) issues.push('عنوان بیشتر از 60 کاراکتر است');
-                if (title.length > 0 && title.length < 30) issues.push('عنوان خیلی کوتاه است');
-                if (desc.length > 155) issues.push('توضیحات بیشتر از 155 کاراکتر است');
-                if (desc.length > 0 && desc.length < 70) issues.push('توضیحات خیلی کوتاه است');
-
-                var html = '';
-                if (issues.length > 0) {
-                    html += '<div style="padding:8px 12px; background:var(--warning-soft); border-radius:8px; font-size:0.85rem; color:var(--warning);">';
-                    issues.forEach(function(i) { html += '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;margin-right:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> ' + i + '<br>'; });
-                    html += '</div>';
-                } else if (title.length > 0 || desc.length > 0) {
-                    html += '<div style="padding:8px 12px; background:var(--success-soft); border-radius:8px; font-size:0.85rem; color:var(--success);">✓ همه چیز مناسب به نظر می‌رسد</div>';
-                }
-                document.getElementById('serp_analysis').innerHTML = html;
-            };
-
-            // ===== URL Auditor =====
-            window.auditUrl = function() {
-                var url = document.getElementById('audit_url').value;
-                if (!url) { showToast('آدرس URL را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('audit_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_url_auditor');
-                fd.append('security', nonce);
-                fd.append('url', url);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data;
-                            var scoreColor = d.score >= 70 ? 'var(--success)' : (d.score >= 40 ? 'var(--warning)' : 'var(--error)');
-                            var html = '<div class="ssp-card">';
-
-                            html += '<div style="text-align:center; margin-bottom:16px;">';
-                            html += '<div style="font-size:2.5rem; font-weight:700; color:' + scoreColor + ';">' + d.score + '</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز SEO صفحه</div>';
-                            html += '<div style="color:var(--text-subtle); font-size:0.8rem; word-break:break-all;">' + escapeHtml(d.url) + '</div>';
-                            html += '</div>';
-
-                            // Data summary
-                            if (d.data) {
-                                html += '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(140px, 1fr)); gap:8px; margin-bottom:16px;">';
-                                html += '<div style="padding:8px; background:var(--bg-alt); border-radius:6px; text-align:center;"><div style="font-weight:600;">' + (d.data.status_code || '-') + '</div><div style="font-size:0.75rem; color:var(--text-muted);">کد وضعیت</div></div>';
-                                html += '<div style="padding:8px; background:var(--bg-alt); border-radius:6px; text-align:center;"><div style="font-weight:600;">' + (d.data.title || 'ندارد').substring(0, 20) + '</div><div style="font-size:0.75rem; color:var(--text-muted);">تگ Title</div></div>';
-                                if (d.data.headings) {
-                                    var hCount = Object.values(d.data.headings).reduce(function(a, b) { return a + b; }, 0);
-                                    html += '<div style="padding:8px; background:var(--bg-alt); border-radius:6px; text-align:center;"><div style="font-weight:600;">' + hCount + '</div><div style="font-size:0.75rem; color:var(--text-muted);">تگ عنوان</div></div>';
-                                }
-                                if (d.data.images) {
-                                    html += '<div style="padding:8px; background:var(--bg-alt); border-radius:6px; text-align:center;"><div style="font-weight:600;">' + d.data.images.total + '</div><div style="font-size:0.75rem; color:var(--text-muted);">تصاویر</div></div>';
-                                }
-                                if (d.data.links) {
-                                    html += '<div style="padding:8px; background:var(--bg-alt); border-radius:6px; text-align:center;"><div style="font-weight:600;">' + d.data.links.total + '</div><div style="font-size:0.75rem; color:var(--text-muted);">لینک‌ها</div></div>';
-                                }
-                                html += '</div>';
-                            }
-
-                            if (d.strengths && d.strengths.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--success);">نقاط قوت:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.strengths.forEach(function(s) { html += '<li style="color:var(--success); margin:4px 0;">✓ ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            if (d.issues && d.issues.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--error);">مشکلات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.issues.forEach(function(s) { html += '<li style="color:var(--error); margin:4px 0;">✗ ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            if (d.suggestions && d.suggestions.length > 0) {
-                                html += '<div><strong style="color:var(--info);">پیشنهادات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.suggestions.forEach(function(s) { html += '<li style="color:var(--info); margin:4px 0;">💡 ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('audit_results').innerHTML = html;
-                        } else {
-                            document.getElementById('audit_results').innerHTML = '<div class="ssp-card" style="color:var(--error);">' + escapeHtml(res.data.error || res.data.message || 'خطا') + '</div>';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Site Audit =====
-            window.runSiteAudit = function() {
-                var url = document.getElementById('site_audit_url').value.trim();
-                if (!url) { showToast('آدرس URL را وارد کنید', 'error'); return; }
-                if (url.indexOf('http') !== 0) { showToast('آدرس URL باید با http:// یا https:// شروع شود', 'error'); return; }
-
-                var btn = document.getElementById('site_audit_btn');
-                btn.classList.add('loading');
-                var resultsDiv = document.getElementById('site_audit_results');
-                resultsDiv.innerHTML = '<div class="ssp-card" style="text-align:center; padding:20px;"><div style="font-size:24px; margin-bottom:8px;"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div><p>در حال دریافت و تحلیل صفحه...</p><p style="font-size:0.8rem; color:#94a3b8;">این عملیات ممکن است 10-30 ثانیه طول بکشد</p></div>';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_site_audit');
-                fd.append('security', nonce);
-                fd.append('url', url);
-                var promptMode = document.getElementById('site_audit_prompt_mode') ? document.getElementById('site_audit_prompt_mode').value : '';
-                if (promptMode) fd.append('prompt_mode', promptMode);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            renderSiteAuditResults(res.data);
-                        } else {
-                            resultsDiv.innerHTML = '<div class="ssp-card" style="color:var(--error);">' + escapeHtml(res.data.error || res.data.message || 'خطا در تحلیل سایت') + '</div>';
-                        }
-                    })
-                    .catch(function() {
-                        btn.classList.remove('loading');
-                        showToast('خطا در ارتباط با سرور', 'error');
-                    });
-            };
-
-            window.runSiteAuditViaBrowser = function() {
-                var url = document.getElementById('site_audit_url').value.trim();
-                if (!url) { showToast('آدرس URL را وارد کنید', 'error'); return; }
-                if (url.indexOf('http') !== 0) { showToast('آدرس URL باید با http:// یا https:// شروع شود', 'error'); return; }
-
-                window._bridgeCurrentTool = 'siteaudit';
-                window._bridgeCurrentToolFn = 'runSiteAuditViaBrowser';
-
-                var prompt = 'You are an expert SEO auditor and digital marketing strategist.\n\n';
-                prompt += 'TASK: Perform a comprehensive SEO audit of the following webpage.\n\n';
-                prompt += 'URL: ' + url + '\n\n';
-                prompt += 'INSTRUCTIONS:\n';
-                prompt += '1. First, visit the URL and analyze the page content\n';
-                prompt += '2. Analyze the title, meta description, headings, content structure\n';
-                prompt += '3. Check images, links, mobile-friendliness\n';
-                prompt += '4. Evaluate E-E-A-T signals and topical authority\n';
-                prompt += '5. Assess AI search visibility (SGE, ChatGPT, Perplexity)\n\n';
-                prompt += 'Provide a comprehensive analysis with:\n';
-                prompt += '- SEO score (0-100)\n';
-                prompt += '- Page analysis (title, meta, headings, content)\n';
-                prompt += '- Strengths (3-5 items)\n';
-                prompt += '- Weaknesses (3-5 items)\n';
-                prompt += '- Improvement suggestions (5-8 items)\n';
-                prompt += '- Content ideas for better ranking (5 items)\n';
-                prompt += '- Ranking tricks specific to this niche (5 items)\n';
-                prompt += '- AI visibility optimization tips (3-5 items)\n';
-                prompt += '- Technical issues found\n';
-                prompt += '- Competitor insights\n\n';
-                prompt += 'CRITICAL RULES:\n';
-                prompt += '1. Return ONLY the raw JSON object. No explanations, no markdown.\n';
-                prompt += '2. Do NOT wrap in code blocks.\n';
-                prompt += '3. The JSON must be valid and parseable.\n';
-                prompt += '4. All string values must be in Persian (فارسی).\n\n';
-                prompt += 'Return JSON ONLY: {"seo_score":0,"page_analysis":"","strengths":[""],"weaknesses":[""],"improvements":[""],"content_ideas":[""],"ranking_tricks":[""],"ai_visibility":[""],"technical_issues":[""],"competitor_insights":"","summary":""}';
-
-                // Apply prompt mode if selected
-                var promptMode = document.getElementById('site_audit_prompt_mode') ? document.getElementById('site_audit_prompt_mode').value : '';
-                if (promptMode) {
-                    var modePrefix = getPromptModePrefix(promptMode);
-                    if (modePrefix) prompt = modePrefix + '\n\n' + prompt;
-                }
-
-                window._bridgeCurrentPrompt = prompt;
-                window._bridgeCurrentContext = 'siteaudit';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_create_task');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('context_type', 'siteaudit');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            showBridgeWaitingModal(res.data.task_id);
-                            openChatbotTab();
-                        } else if (res.data && res.data.can_force) {
-                            if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید؟')) {
-                                fd.append('force', '1');
-                                fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r2) { return r2.json(); }).then(function(res2) {
-                                    if (res2.success) {
-                                        localStorage.setItem('ssp_bridge_pending_task', res2.data.task_id);
-                                        showBridgeWaitingModal(res2.data.task_id);
-                                        openChatbotTab();
-                                    } else {
-                                        showToast(res2.data.message || 'خطا', 'error');
-                                    }
-                                });
-                            }
-                        } else {
-                            showToast(res.data.message || 'خطا', 'error');
-                        }
-                    });
-            };
-
-            function renderSiteAuditResults(d) {
-                var resultsDiv = document.getElementById('site_audit_results');
-                var html = '';
-
-                // SEO Score
-                var scoreColor = d.seo_score >= 80 ? '#22c55e' : d.seo_score >= 50 ? '#f59e0b' : '#ef4444';
-                html += '<div class="ssp-card" style="text-align:center; margin-bottom:16px;">';
-                html += '<div style="font-size:48px; font-weight:bold; color:' + scoreColor + ';">' + (d.seo_score || 0) + '</div>';
-                html += '<div style="font-size:0.9rem; color:var(--text-muted);">امتیاز SEO</div>';
-                html += '<div style="width:100%; height:8px; background:#e2e8f0; border-radius:4px; margin-top:8px; overflow:hidden;">';
-                html += '<div style="width:' + (d.seo_score || 0) + '%; height:100%; background:' + scoreColor + '; border-radius:4px; transition:width 1s;"></div>';
-                html += '</div></div>';
-
-                // Summary
-                if (d.summary) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px;"><h3 style="margin:0 0 8px;">خلاصه</h3><p style="color:var(--text-muted); margin:0;">' + escapeHtml(d.summary) + '</p></div>';
-                }
-
-                // Page Analysis
-                if (d.page_analysis) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px;"><h3 style="margin:0 0 8px;">تحلیل صفحه</h3><p style="color:var(--text-muted); margin:0; white-space:pre-line;">' + escapeHtml(d.page_analysis) + '</p></div>';
-                }
-
-                // Strengths
-                if (d.strengths && d.strengths.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:var(--success);"><h3 style="margin:0 0 8px; color:var(--success);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--success);vertical-align:middle;margin-right:2px;"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg> نقاط قوت</h3><ul style="margin:0; padding-right:20px;">';
-                    d.strengths.forEach(function(s) { html += '<li style="margin:4px 0;">' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // Weaknesses
-                if (d.weaknesses && d.weaknesses.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:var(--error);"><h3 style="margin:0 0 8px; color:var(--error);"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warning);vertical-align:middle;margin-right:2px;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> نقاط ضعف</h3><ul style="margin:0; padding-right:20px;">';
-                    d.weaknesses.forEach(function(s) { html += '<li style="margin:4px 0;">' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // Improvements
-                if (d.improvements && d.improvements.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:var(--info);"><h3 style="margin:0 0 8px; color:var(--info);">💡 پیشنهادات بهبود</h3><ul style="margin:0; padding-right:20px;">';
-                    d.improvements.forEach(function(s, i) { html += '<li style="margin:4px 0;"><strong>' + (i+1) + '.</strong> ' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // Content Ideas
-                if (d.content_ideas && d.content_ideas.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:#8b5cf6;"><h3 style="margin:0 0 8px; color:#8b5cf6;">ایده‌های تولید محتوا</h3><ul style="margin:0; padding-right:20px;">';
-                    d.content_ideas.forEach(function(s, i) { html += '<li style="margin:4px 0;"><strong>' + (i+1) + '.</strong> ' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // Ranking Tricks
-                if (d.ranking_tricks && d.ranking_tricks.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:#f59e0b;"><h3 style="margin:0 0 8px; color:#f59e0b;">ترفندهای رتبه‌بندی</h3><ul style="margin:0; padding-right:20px;">';
-                    d.ranking_tricks.forEach(function(s, i) { html += '<li style="margin:4px 0;"><strong>' + (i+1) + '.</strong> ' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // AI Visibility
-                if (d.ai_visibility && d.ai_visibility.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:#06b6d4;"><h3 style="margin:0 0 8px; color:#06b6d4;">راهکارهای دیده شدن در نتایج هوش مصنوعی</h3><ul style="margin:0; padding-right:20px;">';
-                    d.ai_visibility.forEach(function(s, i) { html += '<li style="margin:4px 0;"><strong>' + (i+1) + '.</strong> ' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // Technical Issues
-                if (d.technical_issues && d.technical_issues.length > 0) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px; border-color:#ef4444;"><h3 style="margin:0 0 8px; color:#ef4444;">🔧 مشکلات فنی</h3><ul style="margin:0; padding-right:20px;">';
-                    d.technical_issues.forEach(function(s) { html += '<li style="margin:4px 0;">✗ ' + escapeHtml(s) + '</li>'; });
-                    html += '</ul></div>';
-                }
-
-                // Competitor Insights
-                if (d.competitor_insights) {
-                    html += '<div class="ssp-card" style="margin-bottom:16px;"><h3 style="margin:0 0 8px;">بینش رقبا</h3><p style="color:var(--text-muted); margin:0; white-space:pre-line;">' + escapeHtml(d.competitor_insights) + '</p></div>';
-                }
-
-                resultsDiv.innerHTML = html;
-            }
-
-            // ===== Import Functions =====
-            window.importToGeo = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                if (title) document.getElementById('geo_title').value = title;
-                if (content) document.getElementById('geo_content').value = content;
-                showToast('محتوا از فرم بالا وارد شد', 'success');
-            };
-
-            window.importToEeat = function() {
-                var title = document.getElementById('seo_title').value;
-                var content = document.getElementById('seo_content').value;
-                if (title) document.getElementById('eeat_title').value = title;
-                if (content) document.getElementById('eeat_content').value = content;
-                showToast('محتوا از فرم بالا وارد شد', 'success');
-            };
-
-            // ===== GEO Analyzer =====
-            window.analyzeGeo = function() {
-                var title = document.getElementById('geo_title').value;
-                var content = document.getElementById('geo_content').value;
-
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('geo_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_geo_analyze');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data;
-                            var scoreColor = d.geo_score >= 70 ? 'var(--success)' : (d.geo_score >= 40 ? 'var(--warning)' : 'var(--error)');
-                            var html = '<div class="ssp-card">';
-
-                            html += '<div style="text-align:center; margin-bottom:16px;">';
-                            html += '<div style="font-size:3rem; font-weight:700; color:' + scoreColor + ';">' + d.geo_score + '</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز GEO از 100</div>';
-                            html += '<div style="font-size:0.8rem; color:var(--text-subtle);">بهینه‌سازی برای ChatGPT، Gemini، Perplexity</div>';
-                            html += '</div>';
-
-                            // Score breakdown
-                            if (d.scores) {
-                                html += '<div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(120px, 1fr)); gap:8px; margin-bottom:16px;">';
-                                var labels = {definition:'تعریف', citation:'استناد', structure:'ساختار', eeat:'E-E-A-T', qa_format:'سوال-جواب', completeness:'کامل بودن'};
-                                var maxes = {definition:20, citation:20, structure:15, eeat:15, qa_format:15, completeness:15};
-                                for (var key in d.scores) {
-                                    var val = d.scores[key];
-                                    var mx = maxes[key] || 10;
-                                    var pct = Math.round((val / mx) * 100);
-                                    var c = pct >= 70 ? 'var(--success)' : (pct >= 40 ? 'var(--warning)' : 'var(--error)');
-                                    html += '<div style="text-align:center; padding:8px; background:var(--bg); border-radius:8px;">';
-                                    html += '<div style="font-size:1.1rem; font-weight:700; color:' + c + ';">' + val + '/' + mx + '</div>';
-                                    html += '<div style="font-size:0.75rem; color:var(--text-muted);">' + (labels[key] || key) + '</div>';
-                                    html += '</div>';
-                                }
-                                html += '</div>';
-                            }
-
-                            // Strengths
-                            if (d.strengths && d.strengths.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--success);">نقاط قوت:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.strengths.forEach(function(s) { html += '<li style="color:var(--success); margin:4px 0;">✓ ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            // Issues
-                            if (d.issues && d.issues.length > 0) {
-                                html += '<div style="margin-bottom:12px;"><strong style="color:var(--error);">مشکلات:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.issues.forEach(function(s) { html += '<li style="color:var(--error); margin:4px 0;">✗ ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            // Suggestions
-                            if (d.suggestions && d.suggestions.length > 0) {
-                                html += '<div><strong style="color:var(--info);">پیشنهادات GEO:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                d.suggestions.forEach(function(s) { html += '<li style="color:var(--info); margin:4px 0;">💡 ' + escapeHtml(s) + '</li>'; });
-                                html += '</ul></div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('geo_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== E-E-A-T Analyzer =====
-            window.analyzeEeat = function() {
-                var title = document.getElementById('eeat_title').value;
-                var content = document.getElementById('eeat_content').value;
-                var author = document.getElementById('eeat_author').value;
-
-                if (!content) { showToast('محتوا را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('eeat_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_eeat_analyze');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('author', author);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data;
-                            var scoreColor = d.total_score >= 70 ? 'var(--success)' : (d.total_score >= 40 ? 'var(--warning)' : 'var(--error)');
-                            var html = '<div class="ssp-card">';
-
-                            html += '<div style="text-align:center; margin-bottom:16px;">';
-                            html += '<div style="font-size:3rem; font-weight:700; color:' + scoreColor + ';">' + d.total_score + '/100</div>';
-                            html += '<div style="color:var(--text-muted);">امتیاز E-E-A-T</div>';
-                            html += '<div style="font-weight:600; color:' + scoreColor + '; margin-top:4px;">' + d.level + '</div>';
-                            html += '</div>';
-
-                            // 4 Pillars
-                            var pillars = [
-                                {key: 'experience', label: 'تجربه (Experience)', icon: '◎', max: 25},
-                                {key: 'expertise', label: 'تخصص (Expertise)', icon: '📚', max: 25},
-                                {key: 'authoritativeness', label: 'اعتبار (Authoritativeness)', icon: '★', max: 25},
-                                {key: 'trustworthiness', label: 'اعتماد (Trustworthiness)', icon: '🔒', max: 25},
-                            ];
-
-                            html += '<div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:16px;">';
-                            pillars.forEach(function(p) {
-                                var val = d.scores[p.key] || 0;
-                                var pct = Math.round((val / p.max) * 100);
-                                var c = pct >= 60 ? 'var(--success)' : (pct >= 30 ? 'var(--warning)' : 'var(--error)');
-                                html += '<div style="padding:12px; background:var(--bg-alt); border-radius:8px;">';
-                                html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">';
-                                html += '<span>' + p.icon + ' ' + p.label + '</span>';
-                                html += '<span style="font-weight:700; color:' + c + ';">' + val + '/' + p.max + '</span>';
-                                html += '</div>';
-                                html += '<div style="background:var(--bg); border-radius:4px; height:6px;"><div style="background:' + c + '; height:100%; border-radius:4px; width:' + pct + '%;"></div></div>';
-                                html += '</div>';
-                            });
-                            html += '</div>';
-
-                            // Tips
-                            if (d.tips) {
-                                html += '<div style="margin-bottom:12px;"><strong>پیشنهادات بهبود:</strong><ul style="margin:8px 0; padding-right:20px;">';
-                                for (var key in d.tips) {
-                                    html += '<li style="color:var(--info); margin:4px 0;">💡 ' + escapeHtml(d.tips[key]) + '</li>';
-                                }
-                                html += '</ul></div>';
-                            }
-
-                            html += '</div>';
-                            document.getElementById('eeat_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Schema Generator =====
-            window.updateSchemaForm = function() {
-                var type = document.getElementById('schema_type').value;
-                var fieldsHtml = '';
-
-                switch (type) {
-                    case 'article':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">عنوان</label><input type="text" id="schema_title" class="ssp-input" placeholder="عنوان مقاله"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">توضیحات</label><textarea id="schema_desc" rows="2" class="ssp-textarea" placeholder="توضیحات"></textarea></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">نام نویسنده</label><input type="text" id="schema_author" class="ssp-input" placeholder="نام نویسنده"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">آدرس URL</label><input type="text" id="schema_url" class="ssp-input" placeholder="https://example.com/article"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">تصویر (URL)</label><input type="text" id="schema_image" class="ssp-input" placeholder="https://example.com/image.jpg"></div>';
-                        break;
-                    case 'faq':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">سوال ۱</label><input type="text" id="schema_q1" class="ssp-input" placeholder="سوال"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">جواب ۱</label><textarea id="schema_a1" rows="2" class="ssp-textarea" placeholder="جواب"></textarea></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">سوال ۲</label><input type="text" id="schema_q2" class="ssp-input" placeholder="سوال"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">جواب ۲</label><textarea id="schema_a2" rows="2" class="ssp-textarea" placeholder="جواب"></textarea></div>';
-                        break;
-                    case 'howto':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">عنوان</label><input type="text" id="schema_title" class="ssp-input" placeholder="عنوان آموزش"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">توضیحات</label><textarea id="schema_desc" rows="2" class="ssp-textarea" placeholder="توضیحات"></textarea></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">مرحله ۱</label><input type="text" id="schema_step1" class="ssp-input" placeholder="نام مرحله"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">توضیح مرحله ۱</label><textarea id="schema_step1_text" rows="2" class="ssp-textarea" placeholder="توضیح"></textarea></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">مرحله ۲</label><input type="text" id="schema_step2" class="ssp-input" placeholder="نام مرحله"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">توضیح مرحله ۲</label><textarea id="schema_step2_text" rows="2" class="ssp-textarea" placeholder="توضیح"></textarea></div>';
-                        break;
-                    case 'product':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">نام محصول</label><input type="text" id="schema_title" class="ssp-input" placeholder="نام محصول"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">توضیحات</label><textarea id="schema_desc" rows="2" class="ssp-textarea" placeholder="توضیحات"></textarea></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">قیمت</label><input type="text" id="schema_price" class="ssp-input" placeholder="150000"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">تصویر (URL)</label><input type="text" id="schema_image" class="ssp-input" placeholder="https://example.com/product.jpg"></div>';
-                        break;
-                    case 'organization':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">نام سازمان</label><input type="text" id="schema_title" class="ssp-input" placeholder="نام سازمان"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">وبسایت</label><input type="text" id="schema_url" class="ssp-input" placeholder="https://example.com"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">لوگو (URL)</label><input type="text" id="schema_image" class="ssp-input" placeholder="https://example.com/logo.png"></div>';
-                        break;
-                    case 'localbusiness':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">نام کسب‌وکار</label><input type="text" id="schema_title" class="ssp-input" placeholder="نام"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">آدرس</label><input type="text" id="schema_street" class="ssp-input" placeholder="خیابان و شماره"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">شهر</label><input type="text" id="schema_city" class="ssp-input" placeholder="شهر"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">تلفن</label><input type="text" id="schema_phone" class="ssp-input" placeholder="021-XXXXXXXX"></div>';
-                        break;
-                    case 'breadcrumb':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">صفحه ۱ (نام)</label><input type="text" id="schema_b1_name" class="ssp-input" placeholder="خانه"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">صفحه ۱ (لینک)</label><input type="text" id="schema_b1_url" class="ssp-input" placeholder="https://example.com"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">صفحه ۲ (نام)</label><input type="text" id="schema_b2_name" class="ssp-input" placeholder="دسته‌بندی"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">صفحه ۲ (لینک)</label><input type="text" id="schema_b2_url" class="ssp-input" placeholder="https://example.com/category"></div>';
-                        break;
-                    case 'video':
-                        fieldsHtml = '<div class="ssp-form-group"><label class="ssp-label">عنوان ویدیو</label><input type="text" id="schema_title" class="ssp-input" placeholder="عنوان"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">توضیحات</label><textarea id="schema_desc" rows="2" class="ssp-textarea" placeholder="توضیحات"></textarea></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">آپلود</label><input type="text" id="schema_upload_date" class="ssp-input" placeholder="2025-01-15"></div>';
-                        fieldsHtml += '<div class="ssp-form-group"><label class="ssp-label">تصویر بندانگشتی (URL)</label><input type="text" id="schema_thumbnail" class="ssp-input" placeholder="https://example.com/thumb.jpg"></div>';
-                        break;
-                }
-
-                document.getElementById('schema_form_fields').innerHTML = fieldsHtml;
-            };
-
-            window.generateSchema = function() {
-                var type = document.getElementById('schema_type').value;
-                var fd = new FormData();
-                fd.append('action', 'ssp_schema_generator');
-                fd.append('security', nonce);
-                fd.append('type', type);
-
-                // Collect all field values
-                var fields = document.getElementById('schema_form_fields').querySelectorAll('input, textarea, select');
-                fields.forEach(function(el) {
-                    if (el.id && el.value) fd.append(el.id.replace('schema_', ''), el.value);
-                });
-
-                // Special handling for FAQ
-                if (type === 'faq') {
-                    var questions = [];
-                    for (var i = 1; i <= 10; i++) {
-                        var q = document.getElementById('schema_q' + i);
-                        var a = document.getElementById('schema_a' + i);
-                        if (q && q.value && a && a.value) {
-                            questions.push({question: q.value, answer: a.value});
-                        }
-                    }
-                    fd.append('questions', JSON.stringify(questions));
-                }
-
-                // Special handling for HowTo
-                if (type === 'howto') {
-                    var steps = [];
-                    for (var i = 1; i <= 10; i++) {
-                        var s = document.getElementById('schema_step' + i);
-                        var t = document.getElementById('schema_step' + i + '_text');
-                        if (s && s.value && t && t.value) {
-                            steps.push({name: s.value, text: t.value});
-                        }
-                    }
-                    fd.append('steps', JSON.stringify(steps));
-                }
-
-                // Special handling for Breadcrumb
-                if (type === 'breadcrumb') {
-                    var items = [];
-                    for (var i = 1; i <= 10; i++) {
-                        var n = document.getElementById('schema_b' + i + '_name');
-                        var u = document.getElementById('schema_b' + i + '_url');
-                        if (n && n.value && u && u.value) {
-                            items.push({name: n.value, url: u.value});
-                        }
-                    }
-                    fd.append('items', JSON.stringify(items));
-                }
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var d = res.data;
-                            var html = '<div class="ssp-card">';
-                            html += '<h3>Schema Markup (' + d.type + ')</h3>';
-                            html += '<pre style="padding:12px; background:var(--bg-alt); border-radius:8px; overflow-x:auto; font-size:0.8rem; direction:ltr; text-align:left; white-space:pre-wrap;">' + escapeHtml(d.json_ld) + '</pre>';
-                            html += '<div style="margin-top:12px; display:flex; gap:10px;">';
-                            html += '<button class="ssp-btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById(\'schema_code\').textContent).then(function(){showToast(\'کپی شد\', \'success\')})">کپی JSON-LD</button>';
-                            html += '<button class="ssp-btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById(\'schema_html_code\').textContent).then(function(){showToast(\'کپی شد\', \'success\')})">کپی HTML</button>';
-                            html += '</div>';
-                            html += '<pre id="schema_code" style="display:none;">' + escapeHtml(d.json_ld) + '</pre>';
-                            html += '<pre id="schema_html_code" style="display:none;">' + escapeHtml(d.html) + '</pre>';
-                            html += '</div>';
-                            document.getElementById('schema_results').innerHTML = html;
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Link Shortener Functions =====
-            window.saveLinkSettings = function(e) {
-                e.preventDefault();
-                var btn = document.getElementById('save_link_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_link_settings');
-                fd.append('security', nonce);
-                fd.append('enabled', document.getElementById('link_shortener_enabled').checked ? 1 : 0);
-                fd.append('provider', document.getElementById('link_provider').value);
-                fd.append('api_key', document.getElementById('link_api_key').value);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.testShortenUrl = function() {
-                var url = document.getElementById('test_long_url').value;
-                if (!url) { showToast('لینک را وارد کنید', 'warning'); return; }
-
-                var btn = document.getElementById('test_shorten_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_shorten_url');
-                fd.append('security', nonce);
-                fd.append('url', url);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            document.getElementById('shorten_result').innerHTML = '<div style="padding:12px; background:var(--success-soft); border:1px solid var(--success); border-radius:8px;"><strong>لینک کوتاه:</strong> <a href="' + escapeHtml(res.data.short_url) + '" target="_blank" style="color:var(--accent);">' + escapeHtml(res.data.short_url) + '</a></div>';
-                        } else {
-                            showToast(res.data.message || 'خطا در کوتاه کردن لینک', 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.toggleApiKeyField = function() {
-                var provider = document.getElementById('link_provider').value;
-                var apiKeyField = document.getElementById('api_key_field');
-                apiKeyField.style.display = provider === 'self' ? 'none' : 'block';
-            };
-
-            // ===== UTM Preview =====
-            function updateUtmPreview() {
-                var preview = document.getElementById('utm_preview');
-                if (!preview) return;
-                var source = document.getElementById('utm_source').value || 'smart-automation';
-                var medium = document.getElementById('utm_medium').value || 'social';
-                var campaign = document.getElementById('utm_campaign').value;
-                var url = 'https://example.com/page?utm_source=' + source + '&utm_medium=' + medium;
-                if (campaign) url += '&utm_campaign=' + campaign;
-                preview.textContent = url;
-            }
-            ['utm_source', 'utm_medium', 'utm_campaign'].forEach(function(id) {
-                var el = document.getElementById(id);
-                if (el) el.addEventListener('input', updateUtmPreview);
-            });
-            updateUtmPreview();
-
-            window.toggleShortUrlFormat = function() {
-                var format = document.querySelector('input[name="short_url_format"]:checked').value;
-                var customField = document.getElementById('custom_url_field');
-                customField.style.display = format === 'custom' ? 'block' : 'none';
-
-                // Update active state on cards
-                document.querySelectorAll('input[name="short_url_format"]').forEach(function(radio) {
-                    var card = radio.closest('.ssp-feature-card');
-                    if (card) {
-                        card.classList.toggle('active', radio.checked);
-                    }
-                });
-            };
-
-            window.saveShortUrlFormat = function() {
-                var format = document.querySelector('input[name="short_url_format"]:checked').value;
-                var customUrl = document.getElementById('short_url_custom').value;
-
-                var btn = document.getElementById('save_format_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_short_url_format');
-                fd.append('security', nonce);
-                fd.append('format', format);
-                fd.append('custom_url', customUrl);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            showSaved('format_saved');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.saveCustomDomain = function() {
-                var customDomain = document.getElementById('user_custom_domain').value;
-
-                var btn = document.getElementById('save_domain_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_custom_domain');
-                fd.append('security', nonce);
-                fd.append('custom_domain', customDomain);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            showSaved('domain_saved');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.copyShortLink = function(url) {
-                navigator.clipboard.writeText(url).then(function() {
-                    showToast('لینک کپی شد!', 'success');
-                }).catch(function() {
-                    showToast('خطا در کپی کردن', 'error');
-                });
-            };
-
-            window.deleteShortLink = function(code) {
-                if (!confirm('آیا از حذف این لینک مطمئن هستید؟')) return;
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_short_link');
-                fd.append('security', nonce);
-                fd.append('code', code);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-        })();
-        </script>
-        <script>
-        (function(){
-            var ajaxurl = '<?php echo admin_url('admin-ajax.php'); ?>';
-            var nonce = '<?php echo $nonce; ?>';
-
-            // ===== RSS Fetch Now =====
-            window.fetchRssNow = function(feedId, extractNow) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_rss_now');
-                fd.append('security', nonce);
-                fd.append('feed_id', feedId);
-                if (extractNow) fd.append('extract_now', 1);
-                showToast(extractNow ? 'در حال دریافت و استخراج محتوا...' : 'در حال دریافت فید...', 'info');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.items && res.data.items.length > 0) {
-                            window._rssPreviewItems = res.data.items;
-                            window._rssPreviewFeedId = feedId;
-                            renderRssPreview(res.data.items, res.data.feed_name, extractNow);
-                            document.getElementById('modal_rss_preview').classList.add('active');
-                        } else if (res.success) {
-                            showToast('آیتم جدیدی یافت نشد', 'warning');
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            function renderRssPreview(items, feedName, extractedMode) {
-                var container = document.getElementById('rss_preview_items');
-                var modeLabel = extractedMode ? ' (با استخراج محتوای کامل)' : '';
-                var html = '<p style="color:var(--text-muted); font-size:0.85rem; margin:0 0 12px;">' +
-                    items.length + ' آیتم از «' + (feedName || '') + '» دریافت شد' + modeLabel + '. آیتم‌های مورد نظر را انتخاب و ویرایش کنید:</p>';
-
-                items.forEach(function(item, idx) {
-                    var displayContent = item.content || '';
-                    var hasExtracted = extractedMode && item.extracted && item.extracted.length > 50;
-                    var contentRows = hasExtracted ? 6 : 4;
-
-                    html += '<div class="ssp-item-card" style="margin-bottom:10px; border:1px solid var(--border); border-radius:10px; overflow:hidden;">' +
-                        '<div style="display:flex; align-items:flex-start; gap:10px; padding:12px 12px 8px;">' +
-                        '<input type="checkbox" class="rss-preview-cb" data-idx="' + idx + '" ' + (item.selected ? 'checked' : '') + ' style="margin-top:6px;">' +
-                        '<div style="flex:1; min-width:0;">' +
-                        '<div dir="auto" style="font-weight:600; margin-bottom:4px; font-size:0.9rem; line-height:1.4;">' + escapeHtml(item.title || 'بدون عنوان') + '</div>';
-
-                    if (hasExtracted) {
-                        html += '<div style="background:var(--bg-alt); border-radius:8px; padding:8px; margin:6px 0;">' +
-                            '<div style="font-size:0.75rem; color:var(--success); margin-bottom:4px;">⬇ محتوای استخراج‌شده از مقاله</div>' +
-                            '<textarea class="rss-preview-content ssp-textarea" data-idx="' + idx + '" rows="' + contentRows + '" style="font-size:0.85rem; width:100%; resize:vertical; direction:rtl;">' + escapeHtml(item.extracted || '') + '</textarea>' +
-                            '</div>';
-                    } else {
-                        html += '<textarea class="rss-preview-content ssp-textarea" data-idx="' + idx + '" rows="' + contentRows + '" style="font-size:0.85rem; width:100%; resize:vertical; direction:rtl; margin:6px 0;">' + escapeHtml(displayContent) + '</textarea>';
-                    }
-
-                    html += '<div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:0.75rem; color:var(--text-muted);">' +
-                        (item.url ? '<a href="' + escapeHtml(item.url) + '" target="_blank" style="color:var(--accent);">→ لینک اصلی</a>' : '');
-
-                    if (!hasExtracted && item.url) {
-                        html += '<button class="ssp-btn-secondary" style="font-size:0.7rem; padding:2px 8px;" onclick="rssExtractSingle(' + idx + ', this)">📄 استخراج محتوا</button>';
-                    }
-
-                    html += (item.pub_date ? '<span>☰ ' + escapeHtml(item.pub_date) : '') + '</span>' +
-                        '</div>' +
-                        '</div>' +
-                        '</div>' +
-                        '</div>';
-                });
-
-                container.innerHTML = html;
-            }
-
-            window.rssExtractSingle = function(idx, btnEl) {
-                var item = window._rssPreviewItems[idx];
-                if (!item || !item.url) return;
-                var btn = btnEl || (event && event.target) || document.querySelector('[onclick*="rssExtractSingle(' + idx + ')"]');
-                if (btn) { btn.disabled = true; btn.textContent = '⏳'; btn.style.opacity = '0.6'; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_rss_content_batch');
-                fd.append('security', nonce);
-                fd.append('urls', JSON.stringify([item.url]));
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.extracted && res.data.extracted.length > 0) {
-                            var extracted = res.data.extracted[0].content;
-                            item.extracted = extracted;
-                            item.content = extracted;
-                            var allItems = window._rssPreviewItems;
-                            renderRssPreview(allItems, '', true);
-                            showToast('محتوا استخراج شد', 'success');
-                        } else {
-                            showToast('امکان استخراج محتوا وجود نداشت', 'warning');
-                        }
-                    })
-                    .catch(function() { showToast('خطا', 'error'); })
-                    .finally(function() { if (btn) { btn.disabled = false; btn.textContent = '📄 استخراج محتوا'; btn.style.opacity = '1'; } });
-            };
-
-            window.rssSendSelected = function() {
-                var selected = [];
-                document.querySelectorAll('.rss-preview-cb:checked').forEach(function(cb) {
-                    var idx = parseInt(cb.dataset.idx);
-                    var contentEl = document.querySelector('.rss-preview-content[data-idx="' + idx + '"]');
-                    var item = window._rssPreviewItems[idx];
-                    if (item) {
-                        selected.push({
-                            title: item.title,
-                            content: contentEl ? contentEl.value : item.content,
-                            url: item.url,
-                            guid: item.guid
-                        });
-                    }
-                });
-
-                if (selected.length === 0) { showToast('آیتمی انتخاب نشده', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_rss_send_selected');
-                fd.append('security', nonce);
-                fd.append('items', JSON.stringify(selected));
-                fd.append('feed_id', window._rssPreviewFeedId);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeModal('modal_rss_preview');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.copyText = function(btn) {
-                var textarea = btn.parentElement.previousElementSibling;
-                if (textarea && textarea.tagName === 'TEXTAREA') {
-                    textarea.select();
-                    document.execCommand('copy');
-                    showToast('کپی شد!', 'success');
-                }
-            };
-
-            window.rssAiProcessSelected = function() {
-                var selectedTexts = [];
-                document.querySelectorAll('.rss-preview-cb:checked').forEach(function(cb) {
-                    var idx = parseInt(cb.dataset.idx);
-                    var contentEl = document.querySelector('.rss-preview-content[data-idx="' + idx + '"]');
-                    if (contentEl) selectedTexts.push(contentEl.value);
-                });
-                if (selectedTexts.length === 0) { showToast('متنی انتخاب نشده', 'warning'); return; }
-
-                // Show AI mode selector
-                var html = '<div style="padding:16px;">' +
-                    '<h4 style="margin:0 0 12px;">✨ پردازش با هوش مصنوعی</h4>' +
-                    '<p style="font-size:0.85rem; color:var(--text-muted); margin:0 0 12px;">' + selectedTexts.length + ' متن انتخاب شد. حالت پردازش را انتخاب کنید:</p>' +
-                    '<div class="ssp-form-group"><select id="rss_ai_mode" class="ssp-select" style="width:100%;">' +
-                    '<option value="summarize">✂️ خلاصه‌سازی</option>' +
-                    '<option value="translate_to_fa">🌐 ترجمه به فارسی</option>' +
-                    '<option value="rewrite">✏️ بازنویسی</option>' +
-                    '<option value="hashtags"># هشتگ‌سازی</option>' +
-                    '<option value="extract_keywords">🔑 کلمات کلیدی</option>' +
-                    '</select></div>' +
-                    '<div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">' +
-                    '<button class="ssp-btn-primary" onclick="rssAiRun()">شروع پردازش</button>' +
-                    '<button class="ssp-btn-secondary" onclick="closeModal(\'modal_rss_preview\')">انصراف</button>' +
-                    '</div></div>';
-                document.getElementById('rss_preview_items').innerHTML = html;
-                window._rssAiTexts = selectedTexts;
-            };
-
-            window.rssAiRun = function() {
-                var mode = document.getElementById('rss_ai_mode').value;
-                var texts = window._rssAiTexts;
-                if (!texts || texts.length === 0) return;
-                var combined = texts.join('\n\n---\n\n');
-
-                var btn = document.querySelector('#rss_preview_items .ssp-btn-primary');
-                if (btn) { btn.disabled = true; btn.textContent = '⏳ در حال پردازش...'; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_rss_ai_process');
-                fd.append('security', nonce);
-                fd.append('text', combined);
-                fd.append('ai_mode', mode);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            if (res.data.mode === 'browser') {
-                                showToast(res.data.message, 'info');
-                                // Browser Bridge flow
-                                window._bridgeTaskId = res.data.task_id;
-                                window._bridgePrompt = res.data.prompt;
-                                window.open('https://chat.deepseek.com', '_blank');
-                                // Start polling
-                                var pollInterval = setInterval(function() {
-                                    var pfd = new FormData();
-                                    pfd.append('action', 'ssp_bridge_poll_status');
-                                    pfd.append('security', nonce);
-                                    pfd.append('task_id', res.data.task_id);
-                                    fetch(ajaxurl, {method: 'POST', body: pfd})
-                                        .then(function(r) { return r.json(); })
-                                        .then(function(pres) {
-                                            if (pres.success && pres.data.status === 'completed') {
-                                                clearInterval(pollInterval);
-                                                closeModal('modal_rss_preview');
-                                                showToast('AI پردازش شد!', 'success');
-                                                // Re-fetch the RSS feed to get updated content
-                                            } else if (pres.data.status === 'expired' || pres.data.status === 'error') {
-                                                clearInterval(pollInterval);
-                                                showToast('AI پردازش نشد، دوباره تلاش کنید', 'error');
-                                            }
-                                        });
-                                }, 3000);
-                            } else {
-                                // API mode - replace content
-                                var result = res.data.result || '';
-                                closeModal('modal_rss_preview');
-                                showToast('متن با AI پردازش شد!', 'success');
-                                // Show result in a small modal or copy to clipboard
-                                var html = '<div style="padding:16px;"><h4 style="margin:0 0 8px;">نتیجه پردازش AI</h4>' +
-                                    '<textarea class="ssp-textarea" rows="10" style="width:100%; direction:rtl;" readonly>' + escapeHtml(result) + '</textarea>' +
-                                    '<div style="margin-top:12px; display:flex; gap:8px;">' +
-                                    '<button class="ssp-btn-primary" onclick="copyText(this)">📋 کپی</button>' +
-                                    '<button class="ssp-btn-secondary" onclick="closeModal(\'modal_rss_preview\')">بستن</button></div></div>';
-                                document.getElementById('rss_preview_items').innerHTML = html;
-                                document.getElementById('modal_rss_preview').classList.add('active');
-                            }
-                        } else {
-                            showToast(res.data.message || 'خطا در پردازش AI', 'error');
-                            if (btn) { btn.disabled = false; btn.textContent = 'شروع پردازش'; }
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); if (btn) { btn.disabled = false; btn.textContent = 'شروع پردازش'; } });
-            };
-
-            window.rssSaveDrafts = function() {
-                var selected = [];
-                document.querySelectorAll('.rss-preview-cb:checked').forEach(function(cb) {
-                    var idx = parseInt(cb.dataset.idx);
-                    var contentEl = document.querySelector('.rss-preview-content[data-idx="' + idx + '"]');
-                    var item = window._rssPreviewItems[idx];
-                    if (item) {
-                        selected.push({
-                            title: item.title,
-                            content: contentEl ? contentEl.value : item.content,
-                            url: item.url
-                        });
-                    }
-                });
-
-                if (selected.length === 0) { showToast('آیتمی انتخاب نشده', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_rss_save_drafts');
-                fd.append('security', nonce);
-                fd.append('items', JSON.stringify(selected));
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeModal('modal_rss_preview');
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.rssScheduleItems = function() {
-                var selected = [];
-                document.querySelectorAll('.rss-preview-cb:checked').forEach(function(cb) {
-                    var idx = parseInt(cb.dataset.idx);
-                    var contentEl = document.querySelector('.rss-preview-content[data-idx="' + idx + '"]');
-                    var item = window._rssPreviewItems[idx];
-                    if (item) {
-                        selected.push({
-                            title: item.title,
-                            content: contentEl ? contentEl.value : item.content
-                        });
-                    }
-                });
-
-                if (selected.length === 0) { showToast('آیتمی انتخاب نشده', 'warning'); return; }
-
-                // Show schedule form
-                var html = '<div style="padding:16px;">' +
-                    '<h4 style="margin:0 0 12px;">زمان‌بندی ' + selected.length + ' آیتم</h4>' +
-                    '<div class="ssp-grid-2">' +
-                    '<div class="ssp-form-group"><label class="ssp-label">تاریخ و ساعت شروع</label>' +
-                    '<input type="datetime-local" id="rss_schedule_start" class="ssp-input"></div>' +
-                    '<div class="ssp-form-group"><label class="ssp-label">فاصله (دقیقه)</label>' +
-                    '<select id="rss_schedule_interval" class="ssp-select">' +
-                    '<option value="15">هر ۱۵ دقیقه</option>' +
-                    '<option value="30">هر ۳۰ دقیقه</option>' +
-                    '<option value="60" selected>هر ۱ ساعت</option>' +
-                    '<option value="120">هر ۲ ساعت</option>' +
-                    '</select></div></div>' +
-                    '<div style="margin-top:12px; display:flex; gap:8px;">' +
-                    '<button class="ssp-btn-primary" onclick="confirmRssSchedule()">تأیید زمان‌بندی</button>' +
-                    '<button class="ssp-btn-secondary" onclick="closeModal(\'modal_rss_preview\')">انصراف</button>' +
-                    '</div></div>';
-
-                document.getElementById('rss_preview_items').innerHTML = html;
-                window._rssScheduleItems = selected;
-            };
-
-            window.confirmRssSchedule = function() {
-                var start = document.getElementById('rss_schedule_start').value;
-                var interval = document.getElementById('rss_schedule_interval').value;
-
-                if (!start) { showToast('تاریخ شروع را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_rss_schedule');
-                fd.append('security', nonce);
-                fd.append('items', JSON.stringify(window._rssScheduleItems));
-                fd.append('start_datetime', start);
-                fd.append('interval', interval);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            closeModal('modal_rss_preview');
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== UTM Settings =====
-            window.saveUtmSettings = function(e) {
-                e.preventDefault();
-                var btn = document.getElementById('save_utm_btn');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_utm_settings');
-                fd.append('security', nonce);
-                fd.append('utm_enabled', document.getElementById('utm_enabled').checked ? '1' : '0');
-                fd.append('utm_source', document.getElementById('utm_source').value);
-                fd.append('utm_medium', document.getElementById('utm_medium').value);
-                fd.append('utm_campaign', document.getElementById('utm_campaign').value);
-                fd.append('utm_auto_source', document.getElementById('utm_auto_source').checked ? '1' : '0');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        showToast(res.data ? res.data.message : 'ذخیره شد', res.success ? 'success' : 'error');
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Prompt Builder =====
-            window.openPromptBuilderModal = function() {
-                document.getElementById('modal_prompt_builder').classList.add('active');
-                document.getElementById('pb_edit_id').value = '';
-                document.getElementById('pb_name').value = '';
-                if (document.getElementById('pb_type')) document.getElementById('pb_type').value = 'product';
-                document.getElementById('pb_industry').value = '';
-                document.getElementById('pb_tone').value = '';
-                document.getElementById('pb_general_rules').value = '';
-                document.getElementById('pb_short_rules').value = '';
-                document.getElementById('pb_long_rules').value = '';
-                document.getElementById('pb_seo_rules').value = '';
-                document.getElementById('pb_focus').value = '';
-                document.getElementById('pb_forbidden').value = '';
-                document.getElementById('pb_extra').value = '';
-                document.getElementById('pb_is_default').checked = false;
-                document.getElementById('pb_preview').style.display = 'none';
-                loadPromptTemplates();
-            };
-
-            window.savePromptTemplate = function() {
-                var name = document.getElementById('pb_name').value.trim();
-                if (!name) { showToast('نام قالب را وارد کنید', 'error'); return; }
-                var fd = new FormData();
-                var editId = document.getElementById('pb_edit_id').value;
-                fd.append('action', 'ssp_save_prompt_template');
-                fd.append('security', nonce);
-                if (editId && parseInt(editId) > 0) fd.append('template_id', editId);
-                fd.append('name', name);
-                fd.append('type', document.getElementById('pb_type') ? document.getElementById('pb_type').value : 'product');
-                fd.append('industry', document.getElementById('pb_industry').value);
-                fd.append('tone', document.getElementById('pb_tone').value);
-                fd.append('general_rules', document.getElementById('pb_general_rules').value);
-                fd.append('short_rules', document.getElementById('pb_short_rules').value);
-                fd.append('long_rules', document.getElementById('pb_long_rules').value);
-                fd.append('seo_rules', document.getElementById('pb_seo_rules').value);
-                fd.append('focus', document.getElementById('pb_focus').value);
-                fd.append('forbidden', document.getElementById('pb_forbidden').value);
-                fd.append('extra', document.getElementById('pb_extra').value);
-                fd.append('is_default', document.getElementById('pb_is_default').checked ? '1' : '0');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { showToast(res.data.message, 'success'); loadPromptTemplates(); loadSavedPromptOptions(); }
-                        else showToast(res.data ? res.data.message : 'خطا', 'error');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            window.loadPromptTemplates = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var list = document.getElementById('pb_templates_list');
-                        if (!list) return;
-                        var templates = res.data.templates || [];
-                        if (templates.length === 0) { list.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">هنوز قالبی ذخیره نشده.</p>'; return; }
-                        var html = '';
-                        var typeLabels = {product: 'محصول', article: 'مقاله'};
-                        templates.forEach(function(t) {
-                            var isBuiltinModal = (t.id < 0 || t.built_in);
-                            html += '<div style="display:flex; align-items:center; gap:8px; padding:8px; border:1px solid var(--border); border-radius:8px; margin-bottom:6px;">' +
-                                '<div style="flex:1;"><strong style="font-size:0.85rem;">' + (t.name || 'بدون نام') + '</strong>' +
-                                (t.is_default ? ' <span class="ssp-badge info" style="font-size:0.65rem;">پیش‌فرض</span>' : '') +
-                                (isBuiltinModal ? ' <span class="ssp-badge" style="font-size:0.65rem; background:var(--accent-soft); color:var(--accent);">آماده</span>' : '') +
-                                ' <span class="ssp-badge" style="font-size:0.65rem; background:var(--bg-alt);">' + (typeLabels[t.type] || 'محصول') + '</span>' +
-                                '<br><span style="color:var(--text-muted); font-size:0.75rem;">' + (t.industry || '') + '</span></div>' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.7rem; padding:3px 8px;" onclick="editPromptTemplate(' + t.id + ')">ویرایش</button>' +
-                                (isBuiltinModal ? '' : '<button class="ssp-btn-danger" style="font-size:0.7rem; padding:3px 8px;" onclick="deletePromptTemplate(' + t.id + ')">حذف</button>') +
-                                '</div>';
-                        });
-                        list.innerHTML = html;
-                    })
-                    .catch(function() {});
-            };
-
-            window.editPromptTemplate = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var templates = res.data.templates || [];
-                        templates.forEach(function(t) {
-                            if (t.id === id) {
-                                document.getElementById('pb_edit_id').value = t.id;
-                                document.getElementById('pb_name').value = t.name || '';
-                                if (document.getElementById('pb_type')) document.getElementById('pb_type').value = t.type || 'product';
-                                document.getElementById('pb_industry').value = t.industry || '';
-                                document.getElementById('pb_tone').value = t.tone || '';
-                                document.getElementById('pb_general_rules').value = t.general_rules || '';
-                                document.getElementById('pb_short_rules').value = t.short_rules || '';
-                                document.getElementById('pb_long_rules').value = t.long_rules || '';
-                                document.getElementById('pb_seo_rules').value = t.seo_rules || '';
-                                document.getElementById('pb_focus').value = t.focus || '';
-                                document.getElementById('pb_forbidden').value = t.forbidden || '';
-                                document.getElementById('pb_extra').value = t.extra || '';
-                                document.getElementById('pb_is_default').checked = !!(t.is_default);
-                            }
-                        });
-                    });
-            };
-
-            window.deletePromptTemplate = function(id) {
-                if (!confirm('آیا از حذف این قالب مطمئن هستید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_prompt_template');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { if (res.success) { showToast(res.data.message, 'success'); loadPromptTemplates(); loadSavedPromptOptions(); } });
-            };
-
-            window.previewPromptTemplate = function() {
-                var editId = document.getElementById('pb_edit_id').value;
-                var productName = document.getElementById('pg_ai_name') ? document.getElementById('pg_ai_name').value : 'نام محصول نمونه';
-                if (!productName) productName = 'نام محصول نمونه';
-                var fd = new FormData();
-                fd.append('action', 'ssp_preview_prompt');
-                fd.append('security', nonce);
-                fd.append('template_id', editId);
-                fd.append('product_name', productName);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            document.getElementById('pb_preview').textContent = res.data.prompt;
-                            document.getElementById('pb_preview').style.display = 'block';
-                        } else showToast(res.data ? res.data.message : 'خطا', 'error');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            window.loadSavedPromptOptions = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var optgroup = document.getElementById('pg_saved_templatesoptgroup');
-                        if (!optgroup) return;
-                        optgroup.innerHTML = '';
-                        (res.data.templates || []).forEach(function(t) {
-                            var opt = document.createElement('option');
-                            opt.value = 'saved_' + t.id;
-                            opt.textContent = (t.is_default ? '⭐ ' : '') + (t.name || 'قالب ' + t.id);
-                            optgroup.appendChild(opt);
-                        });
-                    })
-                    .catch(function() {});
-            };
-
-            // Load saved prompt options on page load
-            if (document.getElementById('pg_saved_templatesoptgroup')) {
-                loadSavedPromptOptions();
-            }
-
-            // ===== Prompt Builder Tab Functions =====
-            window.pbTabSave = function() {
-                var name = document.getElementById('pb_tab_name').value.trim();
-                if (!name) { showToast('نام قالب را وارد کنید', 'error'); return; }
-                var fd = new FormData();
-                var editId = document.getElementById('pb_tab_edit_id').value;
-                var originalBuiltinId = document.getElementById('pb_tab_original_builtin_id').value;
-                fd.append('action', 'ssp_save_prompt_template');
-                fd.append('security', nonce);
-                // Send template_id if it's a positive user-saved template ID (for update)
-                // Negative IDs are built-in templates and should be saved as new templates
-                if (editId && parseInt(editId) > 0) fd.append('template_id', editId);
-                fd.append('name', name);
-                fd.append('type', document.getElementById('pb_tab_type') ? document.getElementById('pb_tab_type').value : 'product');
-                fd.append('industry', document.getElementById('pb_tab_industry').value);
-                fd.append('tone', document.getElementById('pb_tab_tone').value);
-                fd.append('general_rules', document.getElementById('pb_tab_general_rules').value);
-                fd.append('short_rules', document.getElementById('pb_tab_short_rules').value);
-                fd.append('long_rules', document.getElementById('pb_tab_long_rules').value);
-                fd.append('seo_rules', document.getElementById('pb_tab_seo_rules').value);
-                fd.append('focus', document.getElementById('pb_tab_focus').value);
-                fd.append('forbidden', document.getElementById('pb_tab_forbidden').value);
-                fd.append('extra', document.getElementById('pb_tab_extra').value);
-                fd.append('is_default', document.getElementById('pb_tab_is_default').checked ? '1' : '0');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            // Always set the edit_id to the returned ID so subsequent saves update the same template
-                            document.getElementById('pb_tab_edit_id').value = res.data.id || '';
-                            // Also preserve the original builtin ID for reset functionality
-                            if (originalBuiltinId) {
-                                document.getElementById('pb_tab_original_builtin_id').value = originalBuiltinId;
-                            }
-                            showToast(res.data.message, 'success');
-                            pbTabLoadTemplates();
-                            loadSavedPromptOptions();
-                        }
-                        else showToast(res.data ? res.data.message : 'خطا', 'error');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            window.pbTabLoadTemplates = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var list = document.getElementById('pb_tab_templates_list');
-                        if (!list) return;
-                        var templates = res.data.templates || [];
-                        if (templates.length === 0) { list.innerHTML = '<p style="color:var(--text-muted); font-size:0.85rem;">هنوز قالبی ذخیره نشده.</p>'; return; }
-                        var html = '';
-                        var typeLabelsTab = {product: 'محصول', article: 'مقاله'};
-                        templates.forEach(function(t) {
-                            var isBuiltin = (t.id < 0 || t.built_in);
-                            html += '<div style="display:flex; align-items:center; gap:8px; padding:8px; border:1px solid var(--border); border-radius:8px; margin-bottom:6px;">' +
-                                '<div style="flex:1;"><strong style="font-size:0.85rem;">' + (t.name || 'بدون نام') + '</strong>' +
-                                (t.is_default ? ' <span class="ssp-badge info" style="font-size:0.65rem;">پیش‌فرض</span>' : '') +
-                                (isBuiltin ? ' <span class="ssp-badge" style="font-size:0.65rem; background:var(--accent-soft); color:var(--accent);">آماده</span>' : '') +
-                                ' <span class="ssp-badge" style="font-size:0.65rem; background:var(--bg-alt);">' + (typeLabelsTab[t.type] || 'محصول') + '</span>' +
-                                '<br><span style="color:var(--text-muted); font-size:0.75rem;">' + (t.industry || '') + '</span></div>' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.7rem; padding:3px 8px;" onclick="pbTabEdit(' + t.id + ')">ویرایش</button>' +
-                                (isBuiltin ? '' : '<button class="ssp-btn-danger" style="font-size:0.7rem; padding:3px 8px;" onclick="pbTabDelete(' + t.id + ')">حذف</button>') +
-                                '</div>';
-                        });
-                        list.innerHTML = html;
-                    })
-                    .catch(function() {});
-            };
-
-            window.pbTabEdit = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var templates = res.data.templates || [];
-                        var resetBtn = document.getElementById('pb_tab_reset_builtin_btn');
-                        var originalBuiltinId = '';
-                        var selectedTemplate = null;
-                        
-                        // First find the selected template
-                        for (var i = 0; i < templates.length; i++) {
-                            if (templates[i].id === id) {
-                                selectedTemplate = templates[i];
-                                break;
-                            }
-                        }
-                        
-                        if (!selectedTemplate) return;
-                        
-                        var t = selectedTemplate;
-                        document.getElementById('pb_tab_edit_id').value = t.id;
-                        document.getElementById('pb_tab_name').value = t.name || '';
-                        if (document.getElementById('pb_tab_type')) document.getElementById('pb_tab_type').value = t.type || 'product';
-                        document.getElementById('pb_tab_industry').value = t.industry || '';
-                        document.getElementById('pb_tab_tone').value = t.tone || '';
-                        document.getElementById('pb_tab_general_rules').value = t.general_rules || '';
-                        document.getElementById('pb_tab_short_rules').value = t.short_rules || '';
-                        document.getElementById('pb_tab_long_rules').value = t.long_rules || '';
-                        document.getElementById('pb_tab_seo_rules').value = t.seo_rules || '';
-                        document.getElementById('pb_tab_focus').value = t.focus || '';
-                        document.getElementById('pb_tab_forbidden').value = t.forbidden || '';
-                        document.getElementById('pb_tab_extra').value = t.extra || '';
-                        document.getElementById('pb_tab_is_default').checked = !!(t.is_default);
-                        
-                        // Find the corresponding built-in template by exact name match
-                        // Always search through ALL templates to find a built-in with the same name
-                        for (var i = 0; i < templates.length; i++) {
-                            if ((templates[i].built_in || templates[i].id < 0) && templates[i].name === t.name) {
-                                originalBuiltinId = templates[i].id;
-                                break;
-                            }
-                        }
-                        
-                        document.getElementById('pb_tab_original_builtin_id').value = originalBuiltinId;
-                        
-                        // Show reset button only if we found a built-in version
-                        if (resetBtn) {
-                            resetBtn.style.display = originalBuiltinId ? 'inline-block' : 'none';
-                        }
-                    });
-            };
-
-            window.pbTabDelete = function(id) {
-                if (!confirm('آیا از حذف این قالب مطمئن هستید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_prompt_template');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { if (res.success) { showToast(res.data.message, 'success'); pbTabLoadTemplates(); loadSavedPromptOptions(); } });
-            };
-
-            window.pbTabPreview = function() {
-                var editId = document.getElementById('pb_tab_edit_id').value;
-                if (!editId) { showToast('ابتدا یک قالب ذخیره یا انتخاب کنید', 'error'); return; }
-                var fd = new FormData();
-                fd.append('action', 'ssp_preview_prompt');
-                fd.append('security', nonce);
-                fd.append('template_id', editId);
-                fd.append('product_name', 'نام محصول نمونه');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            document.getElementById('pb_tab_preview').textContent = res.data.prompt;
-                            document.getElementById('pb_tab_preview').style.display = 'block';
-                        } else showToast(res.data ? res.data.message : 'خطا', 'error');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            window.pbTabReset = function() {
-                document.getElementById('pb_tab_edit_id').value = '';
-                document.getElementById('pb_tab_original_builtin_id').value = '';
-                document.getElementById('pb_tab_name').value = '';
-                if (document.getElementById('pb_tab_type')) document.getElementById('pb_tab_type').value = 'product';
-                document.getElementById('pb_tab_industry').value = '';
-                document.getElementById('pb_tab_tone').value = '';
-                document.getElementById('pb_tab_general_rules').value = '';
-                document.getElementById('pb_tab_short_rules').value = '';
-                document.getElementById('pb_tab_long_rules').value = '';
-                document.getElementById('pb_tab_seo_rules').value = '';
-                document.getElementById('pb_tab_focus').value = '';
-                document.getElementById('pb_tab_forbidden').value = '';
-                document.getElementById('pb_tab_extra').value = '';
-                document.getElementById('pb_tab_is_default').checked = false;
-                document.getElementById('pb_tab_preview').style.display = 'none';
-            };
-
-            window.pbResetToDefault = function() {
-                // Reset to the original built-in values of the currently selected template
-                var editId = document.getElementById('pb_tab_edit_id').value;
-                var originalBuiltinId = document.getElementById('pb_tab_original_builtin_id').value;
-                
-                if (!editId) { showToast('ابتدا یک قالب انتخاب کنید', 'error'); return; }
-                
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) { showToast('خطا در دریافت قالب پیش‌فرض', 'error'); return; }
-                        var templates = res.data.templates || [];
-                        var originalTemplate = null;
-                        
-                        // Try to find the built-in template using the stored ID
-                        if (originalBuiltinId) {
-                            for (var i = 0; i < templates.length; i++) {
-                                var t = templates[i];
-                                if (t.id == originalBuiltinId) {
-                                    originalTemplate = t;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // If not found by ID, try to find by name matching
-                        if (!originalTemplate) {
-                            var currentTemplate = null;
-                            for (var i = 0; i < templates.length; i++) {
-                                var t = templates[i];
-                                if (t.id == editId) {
-                                    currentTemplate = t;
-                                    break;
-                                }
-                            }
-                            
-                            if (currentTemplate) {
-                                for (var i = 0; i < templates.length; i++) {
-                                    var t = templates[i];
-                                    if ((t.built_in || t.id < 0) && t.name === currentTemplate.name) {
-                                        originalTemplate = t;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        // If still not found, show error
-                        if (!originalTemplate) {
-                            showToast('قالب اولیه یافت نشد. مطمئن شوید نام قالب تغییر نکرده است.', 'error');
-                            return;
-                        }
-                        
-                        // Populate form with original template values
-                        // Keep the edit_id so saving will update the same template
-                        document.getElementById('pb_tab_name').value = originalTemplate.name || '';
-                        if (document.getElementById('pb_tab_type')) document.getElementById('pb_tab_type').value = originalTemplate.type || 'product';
-                        document.getElementById('pb_tab_industry').value = originalTemplate.industry || '';
-                        document.getElementById('pb_tab_tone').value = originalTemplate.tone || '';
-                        document.getElementById('pb_tab_general_rules').value = originalTemplate.general_rules || '';
-                        document.getElementById('pb_tab_short_rules').value = originalTemplate.short_rules || '';
-                        document.getElementById('pb_tab_long_rules').value = originalTemplate.long_rules || '';
-                        document.getElementById('pb_tab_seo_rules').value = originalTemplate.seo_rules || '';
-                        document.getElementById('pb_tab_focus').value = originalTemplate.focus || '';
-                        document.getElementById('pb_tab_forbidden').value = originalTemplate.forbidden || '';
-                        document.getElementById('pb_tab_extra').value = originalTemplate.extra || '';
-                        document.getElementById('pb_tab_is_default').checked = !!(originalTemplate.is_default);
-                        document.getElementById('pb_tab_preview').style.display = 'none';
-                        var resetBtn = document.getElementById('pb_tab_reset_builtin_btn');
-                        if (resetBtn) resetBtn.style.display = (originalTemplate.built_in || originalTemplate.id < 0) ? 'inline-block' : 'none';
-                        showToast('قالب پرامپت به حالت اولیه بازگردانی شد', 'success');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            window.pbTabResetBuiltin = function() {
-                // Reset built-in template to its original values from server
-                var editId = document.getElementById('pb_tab_edit_id').value;
-                if (!editId) { showToast('ابتدا یک قالب آماده انتخاب کنید', 'error'); return; }
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_prompt_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var templates = res.data.templates || [];
-                        var found = false;
-                        templates.forEach(function(t) {
-                            if (t.id == editId && (t.built_in || t.id < 0)) {
-                                // Reset to original built-in values
-                                document.getElementById('pb_tab_name').value = t.name || '';
-                                if (document.getElementById('pb_tab_type')) document.getElementById('pb_tab_type').value = t.type || 'product';
-                                document.getElementById('pb_tab_industry').value = t.industry || '';
-                                document.getElementById('pb_tab_tone').value = t.tone || '';
-                                document.getElementById('pb_tab_general_rules').value = t.general_rules || '';
-                                document.getElementById('pb_tab_short_rules').value = t.short_rules || '';
-                                document.getElementById('pb_tab_long_rules').value = t.long_rules || '';
-                                document.getElementById('pb_tab_seo_rules').value = t.seo_rules || '';
-                                document.getElementById('pb_tab_focus').value = t.focus || '';
-                                document.getElementById('pb_tab_forbidden').value = t.forbidden || '';
-                                document.getElementById('pb_tab_extra').value = t.extra || '';
-                                document.getElementById('pb_tab_is_default').checked = !!(t.is_default);
-                                document.getElementById('pb_tab_preview').style.display = 'none';
-                                found = true;
-                                showToast('قالب آماده به حالت اولیه بازگردانی شد', 'success');
-                            }
-                        });
-                        if (!found) showToast('قالب آماده یافت نشد', 'error');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            // Load prompt templates when promptbuilder tab is activated
-            (function() {
-                var _origSwitchTab = window.switchTab;
-                window.switchTab = function(tabId, btn) {
-                    if (_origSwitchTab) _origSwitchTab(tabId, btn);
-                    if (tabId === 'promptbuilder') {
-                        pbTabLoadTemplates();
-                    }
-                };
-            })();
-
-            // ===== Content Distribution =====
-            window.openDistributionForm = function() {
-                document.getElementById('distribution_form_wrap').style.display = 'block';
-                document.getElementById('dist_edit_id').value = '';
-                document.getElementById('dist_name').value = '';
-                document.getElementById('dist_template').value = '{title}\n{excerpt}\n{url}';
-                document.getElementById('dist_filter_categories').value = '';
-                document.getElementById('dist_filter_tags').value = '';
-                document.getElementById('dist_filter_min_price').value = '';
-                document.getElementById('dist_filter_max_price').value = '';
-                document.getElementById('dist_only_new').checked = true;
-                toggleNewContentDelay();
-                document.getElementById('dist_include_image').checked = true;
-                // Reset time slots to default
-                var timesContainer = document.getElementById('dist_time_slots');
-                if (timesContainer) {
-                    timesContainer.innerHTML = '<div class="dist-time-slot" style="display:flex; align-items:center; gap:8px; background:var(--card); padding:8px 12px; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,0.06);">' +
-                        '<input type="time" class="dist-time-input ssp-input" value="10:00" style="padding:6px 10px; font-size:0.9rem; width:130px; border:1px solid var(--border); border-radius:6px;">' +
-                        '<button type="button" onclick="removeDistTimeSlot(this)" style="background:var(--error-soft); border:none; color:var(--danger); cursor:pointer; font-size:1.2rem; padding:0 8px; border-radius:6px; transition:all 0.2s;" title="حذف این ساعت">×<\/button>' +
-                        '</div>';
-                    document.getElementById('dist_schedule_times').value = '10:00';
-                    updateScheduleSummary();
-                }
-            };
-
-            window.closeDistributionForm = function() {
-                document.getElementById('distribution_form_wrap').style.display = 'none';
-            };
-
-            window.saveDistribution = function() {
-                var fd = new FormData();
-                var editId = document.getElementById('dist_edit_id').value;
-                fd.append('action', 'ssp_save_distribution');
-                fd.append('security', nonce);
-                if (editId) fd.append('distribution_id', editId);
-                fd.append('name', document.getElementById('dist_name').value);
-                fd.append('source_site_id', document.getElementById('dist_source_site').value);
-                fd.append('source_type', document.getElementById('dist_source_type').value);
-                fd.append('only_new', document.getElementById('dist_only_new').checked ? '1' : '0');
-                // Add delay settings for new content mode
-                fd.append('new_delay_value', document.getElementById('dist_new_delay').value || '0');
-                fd.append('new_delay_unit', document.getElementById('dist_new_delay_unit').value || 'minutes');
-                // Calculate daily_limit from time slots count
-                var times = [];
-                document.querySelectorAll('.dist-time-input').forEach(function(inp) {
-                    if (inp.value) times.push(inp.value);
-                });
-                fd.append('daily_limit', times.length || 1);
-                fd.append('filter_categories', document.getElementById('dist_filter_categories').value);
-                fd.append('filter_tags', document.getElementById('dist_filter_tags').value);
-                fd.append('filter_min_price', document.getElementById('dist_filter_min_price').value || '0');
-                fd.append('filter_max_price', document.getElementById('dist_filter_max_price').value || '0');
-                fd.append('filter_stock', document.getElementById('dist_filter_stock').value);
-                fd.append('sort_order', document.getElementById('dist_sort').value);
-                fd.append('message_template', document.getElementById('dist_template').value);
-                fd.append('schedule_type', document.getElementById('dist_schedule_type').value);
-                fd.append('include_image', document.getElementById('dist_include_image').checked ? '1' : '0');
-
-                // Collect time slots
-                fd.append('schedule_times', times.join(','));
-                fd.append('schedule_interval', '0');
-
-                var targets = [];
-                document.querySelectorAll('.dist_target_cb:checked').forEach(function(cb) { targets.push(cb.value); });
-                fd.append('target_messengers', targets.join(','));
-                fd.append('is_active', '1');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { showToast(res.data.message, 'success'); loadDistributions(); closeDistributionForm(); }
-                        else showToast(res.data ? res.data.message : 'خطا', 'error');
-                    })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            // Toggle delay section visibility based on only_new checkbox
-            window.toggleNewContentDelay = function() {
-                var checked = document.getElementById('dist_only_new').checked;
-                var section = document.getElementById('new_content_delay_section');
-                if (section) {
-                    section.style.display = checked ? 'block' : 'none';
-                    if (!checked) {
-                        document.getElementById('dist_new_delay').value = '0';
-                    }
-                }
-            };
-
-            // === Distribution Time Slot Management ===
-            window.addDistTimeSlot = function() {
-                var container = document.getElementById('dist_time_slots');
-                var slot = document.createElement('div');
-                slot.className = 'dist-time-slot';
-                slot.style.cssText = 'display:flex; align-items:center; gap:8px; background:var(--card); padding:8px 12px; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,0.06);';
-                slot.innerHTML = '<input type="time" class="dist-time-input ssp-input" value="12:00" style="padding:6px 10px; font-size:0.9rem; width:130px; border:1px solid var(--border); border-radius:6px;">' +
-                    '<button type="button" onclick="removeDistTimeSlot(this)" style="background:var(--error-soft); border:none; color:var(--danger); cursor:pointer; font-size:1.2rem; padding:0 8px; border-radius:6px; transition:all 0.2s;" title="حذف این ساعت">×</button>';
-                container.appendChild(slot);
-                updateScheduleSummary();
-            };
-
-            window.removeDistTimeSlot = function(btn) {
-                var slots = document.querySelectorAll('.dist-time-slot');
-                if (slots.length <= 1) { showToast('حداقل یک ساعت الزامی است', 'warning'); return; }
-                btn.closest('.dist-time-slot').remove();
-                updateScheduleSummary();
-            };
-
-            window.updateScheduleSummary = function() {
-                var times = [];
-                document.querySelectorAll('.dist-time-input').forEach(function(inp) {
-                    if (inp.value) times.push(inp.value);
-                });
-                var summaryEl = document.getElementById('schedule_summary_text');
-                if (summaryEl) {
-                    var count = times.length;
-                    var persianCount = count === 1 ? '۱' : (count === 2 ? '۲' : (count === 3 ? '۳' : (count === 4 ? '۴' : (count === 5 ? '۵' : count.toString()))));
-                    var timeList = times.slice(0, 5).join('، ');
-                    if (times.length > 5) timeList += ' و ...';
-                    summaryEl.textContent = persianCount + ' ارسال در روز (' + timeList + ')';
-                }
-                // Update hidden field for saving
-                document.getElementById('dist_schedule_times').value = times.join(',');
-            };
-
-            window.addPresetTimes = function() {
-                var container = document.getElementById('dist_time_slots');
-                if (!container) return;
-                var presetTimes = ['09:00', '12:00', '15:00', '18:00'];
-                var existingTimes = [];
-                document.querySelectorAll('.dist-time-input').forEach(function(inp) {
-                    if (inp.value) existingTimes.push(inp.value);
-                });
-                presetTimes.forEach(function(t) {
-                    if (existingTimes.indexOf(t) === -1) {
-                        var slot = document.createElement('div');
-                        slot.className = 'dist-time-slot';
-                        slot.style.cssText = 'display:flex; align-items:center; gap:8px; background:var(--card); padding:8px 12px; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,0.06);';
-                        slot.innerHTML = '<input type="time" class="dist-time-input ssp-input" value="' + t + '" style="padding:6px 10px; font-size:0.9rem; width:130px; border:1px solid var(--border); border-radius:6px;">' +
-                            '<button type="button" onclick="removeDistTimeSlot(this)" style="background:var(--error-soft); border:none; color:var(--danger); cursor:pointer; font-size:1.2rem; padding:0 8px; border-radius:6px; transition:all 0.2s;" title="حذف این ساعت">×</button>';
-                        container.appendChild(slot);
-                    }
-                });
-                updateScheduleSummary();
-            };
-
-            window.loadDistributions = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_distributions');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var list = document.getElementById('distributions_list');
-                        if (!list) return;
-                        var dists = res.data.distributions || [];
-                        if (dists.length === 0) { list.innerHTML = '<div class="ssp-empty">هنوز توزیعی تعریف نشده است.</div>'; return; }
-                        var html = '';
-                        dists.forEach(function(d) {
-                            var times = (d.schedule_times || '10:00').split(',').filter(Boolean).join('، ');
-                            var onlyNewLabel = d.only_new ? 'فقط جدید' : 'چرخشی';
-                            var typeLabel = d.source_type === 'product' ? 'محصولات' : d.source_type === 'post' ? 'نوشته‌ها' : 'پیش‌نویس';
-                            html += '<div class="ssp-item-card"><div class="ssp-item-card-head"><div class="ssp-item-card-title">' +
-                                '<span class="ssp-badge ' + (d.is_active ? 'ok' : 'error') + '">' + (d.is_active ? 'فعال' : 'غیرفعال') + '</span> ' +
-                                (d.name || 'بدون نام') + '</div></div>' +
-                                '<div class="ssp-item-card-meta">' + typeLabel + ' | ' + onlyNewLabel +
-                                (d.filter_categories ? ' | دسته: ' + d.filter_categories : '') +
-                                (d.filter_tags ? ' | برچسب: ' + d.filter_tags : '') +
-                                (d.filter_min_price > 0 ? ' | از ' + d.filter_min_price + ' تومان' : '') +
-                                (d.filter_max_price > 0 ? ' | تا ' + d.filter_max_price + ' تومان' : '') +
-                                ' | ارسال‌ها: ' + times + '</div>' +
-                                '<div class="ssp-item-card-actions">' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.75rem;" onclick="editDistribution(' + d.id + ')">ویرایش</button>' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.75rem;" onclick="toggleDistribution(' + d.id + ')">' + (d.is_active ? 'توقف' : 'فعال‌سازی') + '</button>' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.75rem;" onclick="runDistributionNow(' + d.id + ')">اجرای فوری</button>' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.75rem;" onclick="previewDistributionById(' + d.id + ')">پیش‌نمایش</button>' +
-                                '<button class="ssp-btn-danger" style="font-size:0.75rem;" onclick="deleteDistribution(' + d.id + ')">حذف</button>' +
-                                '</div></div>';
-                        });
-                        list.innerHTML = html;
-                    })
-                    .catch(function() {});
-            };
-
-            window.toggleDistribution = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_toggle_distribution');
-                fd.append('security', nonce);
-                fd.append('distribution_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { if (res.success) loadDistributions(); });
-            };
-
-            window.editDistribution = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_distributions');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) return;
-                        var dists = res.data.distributions || [];
-                        var d = dists.find(function(x) { return x.id === id; });
-                        if (!d) return;
-                        openDistributionForm();
-                        document.getElementById('dist_edit_id').value = d.id;
-                        document.getElementById('dist_name').value = d.name || '';
-                        document.getElementById('dist_source_site').value = d.source_site_id || '';
-                        document.getElementById('dist_source_type').value = d.source_type || 'product';
-                        document.getElementById('dist_only_new').checked = !!(d.only_new);
-                        // Toggle delay section visibility
-                        toggleNewContentDelay();
-                        // Restore delay settings
-                        document.getElementById('dist_new_delay').value = d.new_delay_value || 5;
-                        document.getElementById('dist_new_delay_unit').value = d.new_delay_unit || 'minutes';
-                        document.getElementById('dist_filter_categories').value = d.filter_categories || '';
-                        document.getElementById('dist_filter_tags').value = d.filter_tags || '';
-                        document.getElementById('dist_filter_min_price').value = d.filter_min_price || '';
-                        document.getElementById('dist_filter_max_price').value = d.filter_max_price || '';
-                        document.getElementById('dist_filter_stock').value = d.filter_stock || '';
-                        document.getElementById('dist_sort').value = d.sort_order || 'newest';
-                        document.getElementById('dist_template').value = d.message_template || '{title}\n{excerpt}\n{url}';
-                        document.getElementById('dist_include_image').checked = !!(d.include_image && parseInt(d.include_image));
-                        document.getElementById('dist_schedule_type').value = d.schedule_type || 'daily';
-                        // Restore time slots
-                        var timesContainer = document.getElementById('dist_time_slots');
-                        timesContainer.innerHTML = '';
-                        var times = (d.schedule_times || '10:00').split(',');
-                        times.forEach(function(t) {
-                            if (!t) return;
-                            var slot = document.createElement('div');
-                            slot.className = 'dist-time-slot';
-                            slot.style.cssText = 'display:flex;align-items:center;gap:8px;background:var(--card);padding:8px 12px;border-radius:10px;box-shadow:0 2px 6px rgba(0,0,0,0.06);';
-                            slot.innerHTML = '<input type="time" class="dist-time-input ssp-input" value="' + t + '" style="padding:6px 10px;font-size:0.9rem;width:130px;border:1px solid var(--border);border-radius:6px;">' +
-                                '<button type="button" onclick="removeDistTimeSlot(this)" style="background:var(--error-soft);border:none;color:var(--danger);cursor:pointer;font-size:1.2rem;padding:0 8px;border-radius:6px;transition:all 0.2s;" title="حذف این ساعت">×</button>';
-                            timesContainer.appendChild(slot);
-                        });
-                        document.getElementById('dist_schedule_times').value = d.schedule_times || '10:00';
-                        // Update summary display
-                        updateScheduleSummary();
-                        // Restore messengers
-                        document.querySelectorAll('.dist_target_cb').forEach(function(cb) { cb.checked = false; });
-                        var targets = (d.target_messengers || '' ).split(',');
-                        targets.forEach(function(tid) {
-                            if (!tid) return;
-                            var cb = document.querySelector('.dist_target_cb[value="' + tid + '"]');
-                            if (cb) cb.checked = true;
-                        });
-                    });
-            };
-
-            window.deleteDistribution = function(id) {
-                if (!confirm('آیا از حذف این توزیع مطمئن هستید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_distribution');
-                fd.append('security', nonce);
-                fd.append('distribution_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { if (res.success) { showToast(res.data.message, 'success'); loadDistributions(); } });
-            };
-
-            window.runDistributionNow = function(id) {
-                showToast('در حال اجرای توزیع...', 'info');
-                var fd = new FormData();
-                fd.append('action', 'ssp_run_distribution_now');
-                fd.append('security', nonce);
-                fd.append('distribution_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.data ? res.data.message : 'انجام شد', res.success ? 'success' : 'error'); })
-                    .catch(function() { showToast('خطا در اتصال', 'error'); });
-            };
-
-            window.previewDistributionById = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_preview_distribution');
-                fd.append('security', nonce);
-                fd.append('distribution_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (!res.success) { showToast(res.data ? res.data.message : 'خطا', 'error'); return; }
-                        var html = '<div class="ssp-card"><h3>پیش‌نمایش (' + (res.data.total || 0) + ' محتوا)</h3>';
-                        (res.data.previews || []).forEach(function(p, i) {
-                            html += '<div style="padding:10px; border:1px solid var(--border); border-radius:8px; margin-top:8px; white-space:pre-wrap; font-size:0.85rem;">' + (i + 1) + '. ' + p + '</div>';
-                        });
-                        html += '</div>';
-                        document.getElementById('dist_preview').innerHTML = html;
-                        document.getElementById('dist_preview').style.display = 'block';
-                    });
-            };
-
-            window.previewDistribution = function() {
-                var editId = document.getElementById('dist_edit_id').value;
-                if (editId) {
-                    showToast('در حال دریافت پیش‌نمایش...', 'info');
-                    previewDistributionById(parseInt(editId));
-                    return;
-                }
-                showToast('ابتدا توزیع را ذخیره کنید', 'info');
-            };
-
-            // Load distributions on tab switch
-            if (document.querySelector('[data-tab="distribution"]')) {
-                var origSwitchTab = window.switchTab;
-                window.switchTab = function(tabId, btn) {
-                    origSwitchTab(tabId, btn);
-                    if (tabId === 'distribution') setTimeout(loadDistributions, 100);
-                };
-            }
-
-            // ===== AI Image Generation =====
-            window.generateImageNow = function() {
-                var prompt = document.getElementById('image_prompt').value;
-                if (!prompt) { showToast('پرامپت را وارد کنید', 'error'); return; }
-                var btn = document.getElementById('gen_image_btn');
-                btn.classList.add('loading');
-                var resultDiv = document.getElementById('image_result');
-                resultDiv.innerHTML = '<div style="color:var(--text-muted);">در حال تولید تصویر...</div>';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_image');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('size', document.getElementById('default_image_size').value);
-                fd.append('quality', document.getElementById('default_image_quality').value);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            resultDiv.innerHTML = '<img src="' + res.data.url + '" style="max-width:100%; border-radius:12px; border:1px solid var(--border);">';
-                            showToast(res.data.message, 'success');
-                        } else {
-                            resultDiv.innerHTML = '<div style="color:var(--error);">' + res.data.message + '</div>';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); resultDiv.innerHTML = ''; showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.saveImageSettings = function(e) {
-                e.preventDefault();
-                var btn = document.getElementById('save_image_settings_btn');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_image_settings');
-                fd.append('security', nonce);
-                fd.append('auto_image', document.getElementById('auto_image').checked ? '1' : '0');
-                fd.append('default_size', document.getElementById('default_image_size').value);
-                fd.append('default_quality', document.getElementById('default_image_quality').value);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        showToast(res.data ? res.data.message : 'ذخیره شد', res.success ? 'success' : 'error');
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.exportCSV = function() {
-                var table = document.getElementById('sspLogsTable');
-                if (!table) return;
-                var csv = [], rows = table.rows;
-                for (var i = 0; i < rows.length; i++) {
-                    var row = [], cols = rows[i].querySelectorAll('td, th');
-                    for (var j = 0; j < cols.length; j++) row.push('"' + cols[j].innerText.replace(/"/g, '""') + '"');
-                    csv.push(row.join(','));
-                }
-                var blob = new Blob(['\uFEFF' + csv.join('\n')], {type: 'text/csv;charset=utf-8;'});
-                var link = document.createElement('a');
-                link.href = URL.createObjectURL(blob);
-                link.download = 'ssp_logs_' + Date.now() + '.csv';
-                link.click();
-                showToast('فایل دانلود شد', 'success');
-            };
-
-            window.clearLogs = function() {
-                if (!confirm('همه لاگ‌ها پاک شوند؟ این عمل غیرقابل بازگشت است.')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_clear_logs');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { showToast(res.data.message, 'success'); setTimeout(function() { location.reload(); }, 800); }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.toggleLogDetail = function(logId) {
-                var detail = document.getElementById('log-detail-' + logId);
-                if (detail) {
-                    detail.style.display = detail.style.display === 'none' ? 'table-row' : 'none';
-                }
-            };
-
-            window.retryMessage = function(logId) {
-                if (!confirm('آیا می‌خواهید این پیام را مجدداً ارسال کنید؟')) return;
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_retry_message');
-                fd.append('security', nonce);
-                fd.append('log_id', logId);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast(res.data.message, 'success');
-                            setTimeout(function() { location.reload(); }, 800);
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.retryMessageOld = function(logId, toolType, title, message) {
-                // Store the message data for the target tool
-                var data = {
-                    title: title || '',
-                    message: message || '',
-                    log_id: logId
-                };
-
-                // Determine which tool to navigate to
-                var tabMap = {
-                    'manual_send': 'manual',
-                    'postgen': 'postgen',
-                    'contentgen': 'contentgen',
-                    'productgen': 'productgen',
-                    'ai_generated': 'postgen',
-                    'rss_post': 'manual',
-                    'batch': 'generate',
-                    'distribution': 'manual'
-                };
-
-                var targetTab = tabMap[toolType] || 'manual';
-
-                // Store data in localStorage for the target tool to pick up
-                localStorage.setItem('ssp_retry_data', JSON.stringify(data));
-
-                // Navigate to the target tool tab
-                switchTab(targetTab, document.querySelector('[data-tab="' + targetTab + '"]'));
-
-                showToast('محتوا آماده ویرایش است. تصویر/ویدیو را مجدداً آپلود کنید.', 'info');
-            };
-
-            // ===== Queue Cancel Functions =====
-            window.cancelQueueItem = function(itemId) {
-                if (!confirm('آیا می‌خواهید این پیام را از صف حذف کنید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_cancel_queue_item');
-                fd.append('security', nonce);
-                fd.append('item_id', itemId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { showToast(res.data.message, 'success'); setTimeout(function() { location.reload(); }, 500); }
-                        else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.cancelAllQueue = function() {
-                if (!confirm('آیا می‌خواهید تمام پیام‌های صف را لغو کنید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_cancel_all_queue');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { showToast(res.data.message, 'success'); setTimeout(function() { location.reload(); }, 500); }
-                        else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            window.cancelSchedule = function(scheduleId) {
-                if (!confirm('آیا می‌خواهید این زمان‌بندی را لغو کنید؟')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_cancel_schedule');
-                fd.append('security', nonce);
-                fd.append('schedule_id', scheduleId);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) { showToast(res.data.message, 'success'); setTimeout(function() { location.reload(); }, 500); }
-                        else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا در ارتباط با سرور', 'error'); });
-            };
-
-            // ===== Onboarding Wizard =====
-            (function() {
-                var showOnboarding = <?php echo (empty($messengers) && empty($wp_sites) && $total_count === 0) ? 'true' : 'false'; ?>;
-                var dismissed = localStorage.getItem('ssp_onboarding_dismissed');
-                if (showOnboarding && !dismissed) {
-                    setTimeout(function() {
-                        document.getElementById('modal_onboarding').classList.add('active');
-                    }, 1000);
-                }
-            })();
-
-            window.skipOnboarding = function() {
-                localStorage.setItem('ssp_onboarding_dismissed', '1');
-                closeModal('modal_onboarding');
-            };
-
-            window.skipOnboardingStep = function(step, skip) {
-                var ind = document.getElementById('ob-ind-' + step);
-                if (ind) { ind.classList.remove('current'); ind.classList.add('completed'); }
-                var current = document.getElementById('ob-step-' + step);
-                if (current) current.style.display = 'none';
-                var tabMap = {1: 'messengers', 2: 'ai', 3: 'manual'};
-                if (step < 3) {
-                    var next = document.getElementById('ob-step-' + (step + 1));
-                    if (next) next.style.display = 'block';
-                    var nextInd = document.getElementById('ob-ind-' + (step + 1));
-                    if (nextInd) nextInd.classList.add('current');
-                    if (!skip && tabMap[step]) {
-                        var btn = document.querySelector('[data-tab="' + tabMap[step] + '"]');
-                        if (btn) switchTab(tabMap[step], btn);
-                    }
-                } else {
-                    skipOnboarding();
-                    if (!skip && tabMap[step]) {
-                        var btn = document.querySelector('[data-tab="' + tabMap[step] + '"]');
-                        if (btn) switchTab(tabMap[step], btn);
-                    }
-                }
-            };
-
-            /* ============ Product Generator JS ============ */
-            var pgAttrCount = 0;
-
-            window.pgContentTypeChanged = function() {
-                // Product generator only handles products - no-op
-            };
-
-            window.pgSiteChanged = function() {
-                pgLoadCategories();
-                var sel = document.getElementById('pg_target_site');
-                var opt = sel.options[sel.selectedIndex];
-                var status = document.getElementById('pg_site_status');
-                if (opt && opt.value) {
-                    status.innerHTML = '<span style="color:var(--success);">&#10003; سایت انتخاب شد: ' + escapeHtml(opt.getAttribute('data-name')) + '</span>';
-                }
-            };
-
-            window.pgPromptModeChanged = function() {
-                var mode = document.getElementById('pg_prompt_mode').value;
-                var wrap = document.getElementById('pg_custom_prompt_wrap');
-                wrap.style.display = mode === 'custom' ? 'block' : 'none';
-            };
-
-            window.pgResetPromptMode = function() {
-                document.getElementById('pg_prompt_mode').value = 'default_product';
-                pgPromptModeChanged();
-                showToast('قالب پرامپت به پیش‌فرض بازگردانی شد', 'success');
-            };
-
-            window.pgLoadCategories = function() {
-                var siteSel = document.getElementById('pg_target_site');
-                if (!siteSel || !siteSel.value) return;
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_woo_categories');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                fd.append('content_type', 'product');
-
-                var targetSelect = document.getElementById('pg_woo_categories');
-                if (!targetSelect) return;
-                targetSelect.innerHTML = '<option value="">در حال بارگذاری...</option>';
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.categories) {
-                            var html = '<option value="">انتخاب دسته‌بندی</option>';
-                            res.data.categories.forEach(function(c) {
-                                html += '<option value="' + c.id + '">' + escapeHtml(c.name) + ' (ID: ' + c.id + ')</option>';
-                            });
-                            targetSelect.innerHTML = html;
-                        } else {
-                            targetSelect.innerHTML = '<option value="">دسته‌بندی‌ای یافت نشد</option>';
-                        }
-                    })
-                    .catch(function() {
-                        targetSelect.innerHTML = '<option value="">خطا در بارگذاری</option>';
-                    });
-            };
-
-            window.pgGenerateWithAI = function() {
-                // In browser mode, redirect to browser generation
-                if (document.getElementById('ssp_ai_mode') && document.getElementById('ssp_ai_mode').value === 'browser') {
-                    pgGenerateViaBrowser();
-                    return;
-                }
-                var name = document.getElementById('pg_ai_name').value.trim();
-                var brief = document.getElementById('pg_ai_brief').value.trim();
-                var promptMode = document.getElementById('pg_prompt_mode').value;
-                var customPrompt = document.getElementById('pg_custom_prompt').value;
-                var contentType = 'product';
-                var errorEl = document.getElementById('pg_ai_error');
-                var tokensEl = document.getElementById('pg_ai_tokens');
-
-                if (!name) { errorEl.textContent = 'نام محصول را وارد کنید'; errorEl.style.display = 'block'; return; }
-                errorEl.style.display = 'none';
-
-                var btn = document.getElementById('pg_ai_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_product_ai');
-                fd.append('security', nonce);
-                fd.append('product_name', name);
-                fd.append('product_brief', brief);
-                fd.append('content_type', contentType);
-                fd.append('prompt_mode', promptMode);
-                fd.append('custom_prompt', customPrompt);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            pgFillForm(res.data.data, contentType);
-                            if (res.data.tokens_used) {
-                                tokensEl.textContent = res.data.tokens_used + ' tokens';
-                                tokensEl.style.display = 'inline-flex';
-                            }
-                            showToast('اطلاعات با AI تولید شد!', 'success');
-                        } else {
-                            errorEl.textContent = res.data.message;
-                            errorEl.style.display = 'block';
-                        }
-                    })
-                    .catch(function() {
-                        btn.classList.remove('loading');
-                        errorEl.textContent = 'خطا در ارتباط با سرور';
-                        errorEl.style.display = 'block';
-                    });
-            };
-
-            window.pgFillForm = function(data, contentType) {
-                if (data.name) document.getElementById('pg_product_name').value = data.name;
-                
-                // پردازش توضیحات کوتاه: حذف پاراگراف اول اگر با "خلاصه سریع" شروع می‌شود
-                if (data.short_description) {
-                    let shortDesc = data.short_description;
-                    if (shortDesc.includes('<strong>خلاصه سریع:</strong>')) {
-                        shortDesc = shortDesc.replace(/<p>\s*<strong>خلاصه سریع:<\/strong>\s*[^<]*<\/p>/gi, '');
-                        shortDesc = shortDesc.trim();
-                    }
-                    document.getElementById('pg_short_desc').value = shortDesc;
-                }
-                
-                if (data.description) document.getElementById('pg_description').value = data.description;
-                if (data.regular_price) document.getElementById('pg_regular_price').value = data.regular_price;
-                if (data.sale_price) document.getElementById('pg_sale_price').value = data.sale_price;
-                if (data.sku) document.getElementById('pg_sku').value = data.sku;
-                if (data.weight) document.getElementById('pg_weight').value = data.weight;
-                if (data.dimensions) {
-                    if (data.dimensions.length) document.getElementById('pg_length').value = data.dimensions.length;
-                    if (data.dimensions.width) document.getElementById('pg_width').value = data.dimensions.width;
-                    if (data.dimensions.height) document.getElementById('pg_height').value = data.dimensions.height;
-                }
-                if (data.meta_title) document.getElementById('pg_meta_title') && (document.getElementById('pg_meta_title').value = data.meta_title);
-                if (data.meta_description) document.getElementById('pg_meta_description') && (document.getElementById('pg_meta_description').value = data.meta_description);
-
-                // Fill attributes
-                var attrList = document.getElementById('pg_attributes_list');
-                if (attrList) {
-                    attrList.innerHTML = '';
-                    pgAttrCount = 0;
-                    if (data.attributes && Array.isArray(data.attributes)) {
-                        data.attributes.forEach(function(attr) {
-                            pgAddAttribute(attr.name, attr.options ? attr.options.join(', ') : '');
-                        });
-                    }
-                }
-
-                // Try to select category by name
-                if (data.categories && data.categories.length > 0) {
-                    var catSelect = document.getElementById('pg_woo_categories');
-                    if (catSelect) {
-                        var catName = data.categories[0];
-                        for (var i = 0; i < catSelect.options.length; i++) {
-                            if (catSelect.options[i].text.toLowerCase().indexOf(catName.toLowerCase()) !== -1) {
-                                catSelect.selectedIndex = i;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                // Set product status to draft by default for AI-generated products
-                var statusSelect = document.getElementById('pg_product_status');
-                if (statusSelect) {
-                    statusSelect.value = 'draft';
-                }
-            };
-
-            window.pgAddAttribute = function(name, values) {
-                pgAttrCount++;
-                var id = pgAttrCount;
-                var html = '<div class="ssp-grid-2" id="pg_attr_' + id + '" style="margin-bottom:8px;">' +
-                    '<input type="text" class="ssp-input pg_attr_name" data-id="' + id + '" placeholder="نام ویژگی (مثلاً: رنگ)" value="' + escapeHtml(name || '') + '">' +
-                    '<div style="display:flex; gap:6px;">' +
-                    '<input type="text" class="ssp-input pg_attr_values" data-id="' + id + '" placeholder="مقادیر (جدا شده با کاما)" value="' + escapeHtml(values || '') + '" style="flex:1;">' +
-                    '<button class="ssp-btn-danger" onclick="pgRemoveAttribute(' + id + ')" style="padding:6px 10px; font-size:0.8rem;">&#10005;</button>' +
-                    '</div></div>';
-                document.getElementById('pg_attributes_list').insertAdjacentHTML('beforeend', html);
-            };
-
-            window.pgRemoveAttribute = function(id) {
-                var el = document.getElementById('pg_attr_' + id);
-                if (el) el.remove();
-            };
-
-            window.pgResetForm = function() {
-                document.getElementById('pg_ai_name').value = '';
-                document.getElementById('pg_ai_brief').value = '';
-                document.getElementById('pg_product_name').value = '';
-                document.getElementById('pg_short_desc').value = '';
-                document.getElementById('pg_description').value = '';
-                document.getElementById('pg_regular_price').value = '';
-                document.getElementById('pg_sale_price').value = '';
-                document.getElementById('pg_sku').value = '';
-                document.getElementById('pg_weight').value = '';
-                document.getElementById('pg_length').value = '';
-                document.getElementById('pg_width').value = '';
-                document.getElementById('pg_height').value = '';
-                document.getElementById('pg_thumbnail_file').value = '';
-                document.getElementById('pg_thumbnail_url').value = '';
-                document.getElementById('pg_gallery_urls').value = '';
-                document.getElementById('pg_attributes_list').innerHTML = '';
-                document.getElementById('pg_ai_error').style.display = 'none';
-                document.getElementById('pg_ai_tokens').style.display = 'none';
-                pgAttrCount = 0;
-            };
-
-            window.pgPreview = function() {
-                var html = '<div style="direction:rtl; text-align:right;">';
-                html += '<h3 style="margin:0 0 12px;">پیش‌نمایش محصول</h3>';
-                html += '<p><strong>نام:</strong> ' + escapeHtml(document.getElementById('pg_product_name').value || '-') + '</p>';
-                html += '<p><strong>قیمت:</strong> ' + escapeHtml(document.getElementById('pg_regular_price').value || '-') + ' تومان';
-                if (document.getElementById('pg_sale_price').value) {
-                    html += ' | <strong>قیمت ویژه:</strong> ' + escapeHtml(document.getElementById('pg_sale_price').value) + ' تومان';
-                }
-                html += '</p>';
-                html += '<p><strong>توضیحات کوتاه:</strong> ' + escapeHtml(document.getElementById('pg_short_desc').value || '-') + '</p>';
-                html += '<p><strong>توضیحات بلند:</strong></p>';
-                html += '<div style="background:var(--bg-alt); padding:12px; border-radius:8px; margin-bottom:12px; max-height:200px; overflow-y:auto;">' + (document.getElementById('pg_description').value || '-') + '</div>';
-                html += '</div>';
-                var result = document.getElementById('pg_result');
-                result.style.display = 'block';
-                result.style.background = 'var(--bg-alt)';
-                result.style.border = '1px solid var(--border)';
-                result.innerHTML = html;
-            };
-
-            window.pgPublish = function() {
-                var siteSel = document.getElementById('pg_target_site');
-                if (!siteSel || !siteSel.value) { showToast('سایت مقصد را انتخاب کنید', 'warning'); return; }
-
-                var btn = document.getElementById('pg_publish_btn');
-                var result = document.getElementById('pg_result');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_product');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                fd.append('content_type', 'product');
-                fd.append('image_resize', document.getElementById('pg_image_resize').value);
-
-                fd.append('product_name', document.getElementById('pg_product_name').value);
-                fd.append('product_status', document.getElementById('pg_product_status').value);
-                fd.append('short_description', document.getElementById('pg_short_desc').value);
-                fd.append('description', document.getElementById('pg_description').value);
-                fd.append('regular_price', document.getElementById('pg_regular_price').value);
-                fd.append('sale_price', document.getElementById('pg_sale_price').value);
-                fd.append('sku', document.getElementById('pg_sku').value);
-                fd.append('manage_stock', document.getElementById('pg_manage_stock').checked ? '1' : '0');
-                if (document.getElementById('pg_manage_stock').checked) {
-                    fd.append('stock_quantity', document.getElementById('pg_stock_quantity').value);
-                    fd.append('stock_status', 'instock');
-                } else {
-                    fd.append('stock_status', 'instock');
-                }
-                fd.append('weight', document.getElementById('pg_weight').value);
-                fd.append('length', document.getElementById('pg_length').value);
-                fd.append('width', document.getElementById('pg_width').value);
-                fd.append('height', document.getElementById('pg_height').value);
-                fd.append('brand_id', document.getElementById('pg_brand').value);
-                fd.append('shipping_class_id', document.getElementById('pg_shipping_class').value);
-                fd.append('purchase_limit', document.getElementById('pg_purchase_limit').value);
-                fd.append('menu_order', document.getElementById('pg_menu_order').value);
-                fd.append('virtual', document.getElementById('pg_virtual').checked ? '1' : '0');
-                fd.append('downloadable', document.getElementById('pg_downloadable').checked ? '1' : '0');
-                fd.append('meta_title', document.getElementById('pg_meta_title').value);
-                fd.append('meta_description', document.getElementById('pg_meta_description').value);
-                fd.append('cross_sell_ids', document.getElementById('pg_cross_sell_ids').value);
-                fd.append('upsell_ids', document.getElementById('pg_upsell_ids').value);
-                fd.append('date_on_sale_from', document.getElementById('pg_date_on_sale_from').value);
-                fd.append('date_on_sale_to', document.getElementById('pg_date_on_sale_to').value);
-
-                // Categories - send as array of objects with name property for WooCommerce API
-                var catVal = document.getElementById('pg_woo_categories').value;
-                var catText = '';
-                if (catVal) {
-                    var catSelect = document.getElementById('pg_woo_categories');
-                    if (catSelect && catSelect.options[catSelect.selectedIndex]) {
-                        catText = catSelect.options[catSelect.selectedIndex].text;
-                    }
-                    // Send both ID and name - WooCommerce will match by ID first, then name
-                    fd.append('categories[]', catVal);
-                    fd.append('category_names[]', catText);
-                }
-
-                // Attributes
-                document.querySelectorAll('.pg_attr_name').forEach(function(el) {
-                    var id = el.getAttribute('data-id');
-                    var name = el.value;
-                    var values = document.querySelector('.pg_attr_values[data-id="' + id + '"]');
-                    if (name && values && values.value) {
-                        fd.append('attribute_names[]', name);
-                        fd.append('attribute_values[]', values.value);
-                    }
-                });
-
-                // Custom meta
-                document.querySelectorAll('.pg_meta_key').forEach(function(el) {
-                    var id = el.getAttribute('data-id');
-                    var key = el.value;
-                    var val = document.querySelector('.pg_meta_value[data-id="' + id + '"]');
-                    if (key && val && val.value) {
-                        fd.append('custom_meta_keys[]', key);
-                        fd.append('custom_meta_values[]', val.value);
-                    }
-                });
-
-                // Images
-                var thumbFile = document.getElementById('pg_thumbnail_file').files[0];
-                if (thumbFile) fd.append('thumbnail_file', thumbFile);
-                var thumbUrl = document.getElementById('pg_thumbnail_url').value;
-                if (thumbUrl) fd.append('thumbnail_url', thumbUrl);
-
-                var galleryFiles = document.getElementById('pg_gallery_files').files;
-                for (var i = 0; i < galleryFiles.length; i++) {
-                    fd.append('gallery_files[]', galleryFiles[i]);
-                }
-
-                var galleryUrls = document.getElementById('pg_gallery_urls').value.split('\n').filter(function(u) { return u.trim(); });
-                galleryUrls.forEach(function(url) { fd.append('gallery_urls[]', url.trim()); });
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        result.style.display = 'block';
-                        if (res.success) {
-                            result.style.background = 'var(--success-soft)';
-                            result.style.border = '1px solid var(--success)';
-                            result.style.color = 'var(--success)';
-                            var linkHtml = res.data.url ? '<br><a href="' + escapeHtml(res.data.url) + '" target="_blank" style="color:var(--success); text-decoration:underline;">مشاهده در سایت &#8599;</a>' : '';
-                            result.innerHTML = '&#10003; ' + escapeHtml(res.data.message) + linkHtml;
-                            showToast(res.data.message, 'success');
-                        } else {
-                            result.style.background = 'var(--error-soft)';
-                            result.style.border = '1px solid var(--error)';
-                            result.style.color = 'var(--error)';
-                            result.innerHTML = '&#10007; ' + escapeHtml(res.data.message);
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() {
-                        btn.classList.remove('loading');
-                        result.style.display = 'block';
-                        result.style.background = 'var(--error-soft)';
-                        result.style.border = '1px solid var(--error)';
-                        result.style.color = 'var(--error)';
-                        result.innerHTML = '&#10007; خطا در ارتباط با سرور';
-                    });
-            };
-
-            // Load categories on tab switch
-            (function() {
-                var origSwitch = window.switchTab;
-                window.switchTab = function(tabId, btn) {
-                    origSwitch(tabId, btn);
-                    if (tabId === 'productgen') {
-                        setTimeout(function() { pgSiteChanged(); pgLoadCategories(); pgLoadBrands(); pgLoadShippingClasses(); }, 200);
-                    }
-                    if (tabId === 'contentgen') {
-                        setTimeout(function() { cgSiteChanged(); }, 200);
-                    }
-                };
-            })();
-
-            /* ============ Jalali/Solar Calendar Helpers ============ */
-            window.gregorianToJalali = function(gy, gm, gd) {
-                var g_d_m = [0,31,59,90,120,151,181,212,243,273,304,334];
-                var gy2 = (gm > 2) ? (gy + 1) : gy;
-                var days = 355666 + (365 * gy) + Math.floor((gy2 + 3) / 4) - Math.floor((gy2 + 99) / 100) + Math.floor((gy2 + 399) / 400) + gd + g_d_m[gm - 1];
-                var jy = -1595 + (33 * Math.floor(days / 12053));
-                days %= 12053;
-                jy += 4 * Math.floor(days / 1461);
-                days %= 1461;
-                if (days > 365) { jy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
-                var jm, jd;
-                if (days < 186) { jm = 1 + Math.floor(days / 31); jd = 1 + (days % 31); }
-                else { jm = 7 + Math.floor((days - 186) / 30); jd = 1 + ((days - 186) % 30); }
-                return [jy, jm, jd];
-            }
-            window.jalaliToGregorian = function(jy, jm, jd) {
-                jy += 1595;
-                var days = -355668 + (365 * jy) + Math.floor(jy / 33) * 8 + Math.floor(((jy % 33) + 3) / 4) + jd + ((jm < 7) ? (jm - 1) * 31 : ((jm - 7) * 30 + 186));
-                var gy = 400 * Math.floor(days / 146097);
-                days %= 146097;
-                if (days > 36524) { gy += 100 * Math.floor(--days / 36524); days %= 36524; if (days >= 365) days++; }
-                gy += 4 * Math.floor(days / 1461); days %= 1461;
-                if (days > 365) { gy += Math.floor((days - 1) / 365); days = (days - 1) % 365; }
-                var gd = days + 1;
-                var sal_a = [0,31,((gy%4===0&&gy%100!==0)||(gy%400===0))?29:28,31,30,31,30,31,31,30,31,30,31];
-                var gm;
-                for (gm = 0; gm < 13 && gd > sal_a[gm]; gm++) gd -= sal_a[gm];
-                return [gy, gm, gd];
-            }
-
-            /* ============ Jalali Helpers ============ */
-            window.formatJalaliDateTime = function(gregStr) {
-                if (!gregStr) return '';
-                var dt = new Date(gregStr.replace(' ', 'T'));
-                if (isNaN(dt)) return gregStr;
-                var jd = gregorianToJalali(dt.getFullYear(), dt.getMonth() + 1, dt.getDate());
-                var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                var h = dt.getHours(), m = dt.getMinutes();
-                return jd[0] + '/' + (jd[1]<10?'0':'') + jd[1] + '/' + (jd[2]<10?'0':'') + jd[2] + ' ' + months[jd[1]-1] + ' - ' + (h<10?'0':'') + h + ':' + (m<10?'0':'') + m;
-            }
-            window.schGetMinDateTime = function() {
-                // Use SERVER time, not browser time
-                var serverNow = new Date(<?php echo (int)current_time('timestamp') * 1000; ?>);
-                serverNow.setMinutes(serverNow.getMinutes() + 10);
-                var jd = gregorianToJalali(serverNow.getFullYear(), serverNow.getMonth() + 1, serverNow.getDate());
-                return { year: jd[0], month: jd[1], day: jd[2], hour: serverNow.getHours(), minute: serverNow.getMinutes(), date: serverNow };
-            }
-            window.schValidateDateTime = function(y, m, d, h, mi) {
-                var min = schGetMinDateTime();
-                var gd = jalaliToGregorian(y, m, d);
-                var selected = new Date(gd[0], gd[1] - 1, gd[2], h, mi, 0);
-                if (selected < min.date) return 'حداقل ۱۰ دقیقه آینده را انتخاب کنید';
-                return null;
-            }
-
-            // ===== Schedules Jalali Calendar Picker =====
-            // Schedule calendar - uses unified openJalaliPicker (defined above)
-            // Old schOpenJalaliPicker, schNavMonth, schRenderCalendar, schPickDay, schConfirmJalaliDate removed
-
-            /* ============ Post Generator JS ============ */
-            window.pgGeneratePost = function() {
-                if (document.getElementById('ssp_ai_mode') && document.getElementById('ssp_ai_mode').value === 'browser') {
-                    pgGeneratePostViaBrowser();
-                    return;
-                }
-                var topic = document.getElementById('pg_topic').value.trim();
-                var style = document.getElementById('pg_style').value;
-                var details = document.getElementById('pg_details').value.trim();
-                var errorEl = document.getElementById('pg_gen_error');
-                var tokensEl = document.getElementById('pg_gen_tokens');
-
-                if (!topic) { errorEl.textContent = 'موضوع را وارد کنید'; errorEl.style.display = 'block'; return; }
-                errorEl.style.display = 'none';
-
-                var btn = document.getElementById('pg_gen_btn');
-                btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_product_ai');
-                fd.append('security', nonce);
-                fd.append('product_name', topic);
-                fd.append('product_brief', details);
-                fd.append('content_type', 'post');
-                fd.append('prompt_mode', style === 'general' ? 'default_post' : style);
-                fd.append('custom_prompt', '');
-                fd.append('content_length', document.getElementById('pg_length').value);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data.data;
-                            var content = d.content || d.message || '';
-                            content = content.replace(/\\n\\n/g, '\n\n').replace(/\\n/g, '\n').replace(/\\r\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-content = content.replace(/nn(?=[^\s])/g, '\n\n').replace(/([\u0600-\u06FF])n(?=[^\sa-zA-Z\u0600-\u06FF])/g, '$1\n').replace(/([^\sa-zA-Z\u0600-\u06FF])n(?=[^\s])/g, '$1\n');
-                            content = content.replace(/([\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F000}-\u{1FFFF}])n/gu, '$1\n');
-                            content = content.replace(/([.!??:;\u060C\u061F\u061B\u2026\-\*])n/g, '$1\n');
-                            content = content.replace(/\]n/g, ']\n');
-                            content = content.replace(/\nn/g, '\n\n');
-                            content = content.replace(/\n{3,}/g, '\n\n');
-                            document.getElementById('pg_result_title').value = d.title || topic;
-                            document.getElementById('pg_result_content').value = content;
-                            document.getElementById('pg_result_hashtags').value = d.hashtags || '';
-                            var preview = document.getElementById('pg_result_preview');
-                            if (preview) preview.innerText = content;
-                            document.getElementById('pg_post_result').style.display = 'block';
-                            pgToggleView('visual');
-                            if (res.data.tokens_used) { tokensEl.textContent = res.data.tokens_used + ' tokens'; tokensEl.style.display = 'inline-flex'; }
-                            showToast('محتوا تولید شد!', 'success');
-                        } else {
-                            errorEl.textContent = res.data.message;
-                            errorEl.style.display = 'block';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); errorEl.textContent = 'خطا'; errorEl.style.display = 'block'; });
-            };
-
-            window.pgToggleView = function(mode) {
-                var textarea = document.getElementById('pg_result_content');
-                var preview = document.getElementById('pg_result_preview');
-                var visualBtn = document.getElementById('pg_view_visual_btn');
-                var rawBtn = document.getElementById('pg_view_raw_btn');
-                if (mode === 'visual') {
-                    textarea.style.display = 'none';
-                    preview.style.display = 'block';
-                    preview.innerText = textarea.value;
-                    // Make preview read-only — editing always happens in textarea (like manual send)
-                    preview.contentEditable = 'false';
-                    if (visualBtn) { visualBtn.style.borderColor = 'var(--accent)'; visualBtn.style.color = 'var(--accent)'; }
-                    if (rawBtn) { rawBtn.style.borderColor = 'var(--border)'; rawBtn.style.color = 'var(--text-muted)'; }
-                } else {
-                    textarea.style.display = 'block';
-                    preview.style.display = 'none';
-                    if (rawBtn) { rawBtn.style.borderColor = 'var(--accent)'; rawBtn.style.color = 'var(--accent)'; }
-                    if (visualBtn) { visualBtn.style.borderColor = 'var(--border)'; visualBtn.style.color = 'var(--text-muted)'; }
-                }
-            };
-
-            // Preview is read-only — editing happens only in textarea (matches manual send behavior)
-            // No input listener needed
-
-            window.pgResetPostForm = function() {
-                document.getElementById('pg_topic').value = '';
-                document.getElementById('pg_details').value = '';
-                document.getElementById('pg_result_title').value = '';
-                document.getElementById('pg_result_content').value = '';
-                document.getElementById('pg_result_hashtags').value = '';
-                var preview = document.getElementById('pg_result_preview');
-                if (preview) preview.textContent = '';
-                var imageUrl = document.getElementById('pg_image_url');
-                if (imageUrl) imageUrl.value = '';
-                var imagePreview = document.getElementById('pg_image_preview');
-                if (imagePreview) imagePreview.style.display = 'none';
-                var imageStatus = document.getElementById('pg_image_upload_status');
-                if (imageStatus) imageStatus.textContent = '';
-                var imageFile = document.getElementById('pg_image_file');
-                if (imageFile) imageFile.value = '';
-                var scheduleForm = document.getElementById('pg_schedule_form');
-                if (scheduleForm) scheduleForm.style.display = 'none';
-                var scheduleDateDisplay = document.getElementById('pg_schedule_date_display');
-                if (scheduleDateDisplay) scheduleDateDisplay.value = '';
-                var scheduleDatetime = document.getElementById('pg_schedule_datetime');
-                if (scheduleDatetime) scheduleDatetime.value = '';
-                var jalaliPicker = document.getElementById('pg_jalali_picker');
-                if (jalaliPicker) jalaliPicker.style.display = 'none';
-                document.getElementById('pg_post_result').style.display = 'none';
-                document.getElementById('pg_gen_error').style.display = 'none';
-                document.getElementById('pg_gen_tokens').style.display = 'none';
-            };
-
-            window.pgSendPost = function() {
-                var title = document.getElementById('pg_result_title').value;
-                var textarea = document.getElementById('pg_result_content');
-                // Always use textarea.value — it's the source of truth
-                // The input listener on preview keeps textarea in sync
-                var content = textarea ? textarea.value : '';
-                var hashtags = document.getElementById('pg_result_hashtags').value;
-                var messengers = [];
-                document.querySelectorAll('input[name="pg_dest_messengers[]"]:checked').forEach(function(el) { messengers.push(el.value); });
-                var imageUrl = document.getElementById('pg_image_url') ? document.getElementById('pg_image_url').value.trim() : '';
-
-                if (!title && !content) { showToast('محتوایی برای ارسال وجود ندارد', 'warning'); return; }
-
-                // Caption length check: Telegram/Bale/WhatsApp limit is 1024 chars for media captions
-                var fullMsg = (title ? title + '\n\n' : '') + content;
-                if (imageUrl && fullMsg.length > 1024) {
-                    showToast('محتوا برای پست به همراه تصویر خیلی طولانی است (حداکثر ۱۰۲۴ کاراکتر). لطفاً محتوا را کوتاه‌تر کنید یا تصویر را حذف کنید.', 'warning');
-                    return;
-                }
-
-                var btn = document.querySelector('[onclick="pgSendPost()"]');
-                if (btn) btn.classList.add('loading');
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_manual_send');
-                fd.append('security', nonce);
-                addImpersonate(fd);
-                fd.append('title', title);
-                fd.append('message', content);
-                fd.append('hashtags', hashtags);
-                if (messengers.length) fd.append('messengers', messengers.join(','));
-                if (imageUrl) fd.append('image_url', imageUrl);
-                fd.append('skip_ai_rewrite', '1');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (btn) btn.classList.remove('loading');
-                        if (res.success) {
-                            showToast('محتوا به صف ارسال اضافه شد!', 'success');
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { if (btn) btn.classList.remove('loading'); showToast('خطا', 'error'); });
-            };
-
-            window.pgOpenJalaliPicker = function() {
-                var picker = document.getElementById('pg_jalali_picker');
-                picker.style.display = picker.style.display === 'none' ? 'block' : 'none';
-                if (picker.style.display === 'block') {
-                    var now = new Date();
-                    var jd = gregorianToJalali(now.getFullYear(), now.getMonth() + 1, now.getDate());
-                    var yearSel = document.getElementById('pg_jalali_year');
-                    var monthSel = document.getElementById('pg_jalali_month');
-                    yearSel.innerHTML = '';
-                    for (var y = jd[0] - 1; y <= jd[0] + 1; y++) {
-                        yearSel.innerHTML += '<option value="' + y + '"' + (y === jd[0] ? ' selected' : '') + '>' + y + '</option>';
-                    }
-                    var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                    monthSel.innerHTML = '';
-                    for (var m = 1; m <= 12; m++) {
-                        monthSel.innerHTML += '<option value="' + m + '"' + (m === jd[1] ? ' selected' : '') + '>' + months[m-1] + '</option>';
-                    }
-                    pgUpdateJalaliDays();
-                    // Populate hour and minute selects
-                    var hourSel = document.getElementById('pg_jalali_hour');
-                    var minuteSel = document.getElementById('pg_jalali_minute');
-                    if (hourSel && hourSel.options.length === 0) {
-                        for (var h = 0; h < 24; h++) {
-                            hourSel.innerHTML += '<option value="' + (h < 10 ? '0' : '') + h + '"' + (h === now.getHours() ? ' selected' : '') + '>' + (h < 10 ? '0' : '') + h + '</option>';
-                        }
-                    }
-                    if (minuteSel && minuteSel.options.length === 0) {
-                        var closest5 = Math.ceil(now.getMinutes() / 5) * 5;
-                        if (closest5 >= 60) closest5 = 0;
-                        for (var mn = 0; mn < 60; mn += 5) {
-                            minuteSel.innerHTML += '<option value="' + (mn < 10 ? '0' : '') + mn + '"' + (mn === closest5 ? ' selected' : '') + '>' + (mn < 10 ? '0' : '') + mn + '</option>';
-                        }
-                    }
-                }
-            };
-
-            window.pgUpdateJalaliDays = function() {
-                var y = parseInt(document.getElementById('pg_jalali_year').value);
-                var m = parseInt(document.getElementById('pg_jalali_month').value);
-                var daySel = document.getElementById('pg_jalali_day');
-                var currentDay = parseInt(daySel.value) || 1;
-                var daysInMonth = m <= 6 ? 31 : (m <= 11 ? 30 : 29);
-                daySel.innerHTML = '';
-                for (var d = 1; d <= daysInMonth; d++) {
-                    daySel.innerHTML += '<option value="' + d + '"' + (d === currentDay ? ' selected' : '') + '>' + d + '</option>';
-                }
-            };
-
-            window.pgConfirmJalaliDate = function() {
-                var y = parseInt(document.getElementById('pg_jalali_year').value);
-                var m = parseInt(document.getElementById('pg_jalali_month').value);
-                var d = parseInt(document.getElementById('pg_jalali_day').value);
-                var h = parseInt(document.getElementById('pg_jalali_hour').value || '9');
-                var mi = parseInt(document.getElementById('pg_jalali_minute').value || '0');
-                var time = (h<10?'0':'') + h + ':' + (mi<10?'0':'') + mi;
-                var err = schValidateDateTime(y, m, d, h, mi);
-                if (err) { showToast(err, 'warning'); return; }
-                var gd = jalaliToGregorian(y, m, d);
-                var gregDate = gd[0] + '-' + (gd[1] < 10 ? '0' : '') + gd[1] + '-' + (gd[2] < 10 ? '0' : '') + gd[2] + ' ' + time;
-                document.getElementById('pg_schedule_datetime').value = gregDate;
-                var months = ['فروردین','اردیبهشت','خرداد','تیر','مرداد','شهریور','مهر','آبان','آذر','دی','بهمن','اسفند'];
-                document.getElementById('pg_schedule_date_display').value = y + '/' + (m < 10 ? '0' : '') + m + '/' + (d < 10 ? '0' : '') + d + ' ' + months[m-1] + ' - ' + time;
-                document.getElementById('pg_jalali_picker').style.display = 'none';
-            };
-
-            window.pgSchedulePost = function() {
-                var form = document.getElementById('pg_schedule_form');
-                form.style.display = form.style.display === 'none' ? 'block' : 'none';
-                if (form.style.display === 'block') {
-                    document.getElementById('pg_schedule_datetime').value = '';
-                    document.getElementById('pg_schedule_date_display').value = '';
-                    document.getElementById('pg_jalali_picker').style.display = 'none';
-                }
-            };
-
-            window.pgConfirmSchedule = function() {
-                var title = document.getElementById('pg_result_title').value;
-                var textarea = document.getElementById('pg_result_content');
-                var content = textarea ? textarea.value : '';
-                var hashtags = document.getElementById('pg_result_hashtags').value;
-                var datetime = document.getElementById('pg_schedule_datetime').value;
-                var recurring = document.getElementById('pg_schedule_recurring').value;
-                var imageUrl = document.getElementById('pg_image_url') ? document.getElementById('pg_image_url').value.trim() : '';
-
-                if (!datetime) { showToast('تاریخ و ساعت را انتخاب کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_add_schedule');
-                fd.append('security', nonce);
-                addImpersonate(fd);
-                fd.append('title', title);
-                fd.append('message', content);
-                fd.append('hashtags', hashtags);
-                fd.append('scheduled_at', datetime.replace('T', ' '));
-                fd.append('recurring', recurring);
-                if (imageUrl) fd.append('image_url', imageUrl);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('زمان‌بندی ایجاد شد!', 'success');
-                            document.getElementById('pg_schedule_form').style.display = 'none';
-                        } else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا', 'error'); });
-            };
-
-            window.pgSaveAsDraftPost = function() {
-                var title = document.getElementById('pg_result_title').value;
-                var textarea = document.getElementById('pg_result_content');
-                var content = textarea ? textarea.value : '';
-                var hashtags = document.getElementById('pg_result_hashtags').value;
-                var imageUrl = document.getElementById('pg_image_url') ? document.getElementById('pg_image_url').value.trim() : '';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_draft');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('hashtags', hashtags);
-                fd.append('meta_description', imageUrl);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('ذخیره شد!', 'success');
-                        } else {
-                            showToast(res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا', 'error'); });
-            };
-
-            window.pgCopyPost = function() {
-                var preview = document.getElementById('pg_result_preview');
-                var textarea = document.getElementById('pg_result_content');
-                var content = (preview && preview.style.display !== 'none') ? preview.innerText : textarea.value;
-                var hashtags = document.getElementById('pg_result_hashtags').value;
-                var fullText = content + (hashtags ? '\n\n' + hashtags : '');
-                navigator.clipboard.writeText(fullText).then(function() {
-                    showToast('کپی شد!', 'success');
-                }).catch(function() {
-                    showToast('خطا در کپی', 'error');
-                });
-            };
-
-            /* ============ Draft Loader (Postgen) ============ */
-            window._pgDraftData = [];
-            window.pgRefreshDrafts = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_drafts');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data && res.data.drafts) {
-                            window._pgDraftData = res.data.drafts;
-                            var sel = document.getElementById('pg_load_draft');
-                            sel.innerHTML = '<option value="">انتخاب پیش‌نویس...</option>';
-                            res.data.drafts.forEach(function(d, i) {
-                                sel.innerHTML += '<option value="' + i + '">' + escapeHtml(d.title || 'بدون عنوان') + '</option>';
-                            });
-                        }
-                    });
-            };
-            window.pgLoadDraft = function(idx) {
-                if (idx === '' || !window._pgDraftData[idx]) return;
-                var d = window._pgDraftData[idx];
-                document.getElementById('pg_topic').value = d.title || '';
-                document.getElementById('pg_details').value = d.content || '';
-                showToast('پیش‌نویس بارگذاری شد. روی تولید کلیک کنید.', 'success');
-            };
-            pgRefreshDrafts();
-
-            /* ============ Draft Loader (Contentgen) ============ */
-            window._cgDraftData = [];
-            window.cgRefreshDrafts = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_drafts');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data && res.data.drafts) {
-                            window._cgDraftData = res.data.drafts;
-                            var sel = document.getElementById('cg_load_draft');
-                            sel.innerHTML = '<option value="">انتخاب پیش‌نویس...</option>';
-                            res.data.drafts.forEach(function(d, i) {
-                                sel.innerHTML += '<option value="' + i + '">' + escapeHtml(d.title || 'بدون عنوان') + '</option>';
-                            });
-                        }
-                    });
-            };
-            window.cgLoadDraft = function(idx) {
-                if (idx === '' || !window._cgDraftData[idx]) return;
-                var d = window._cgDraftData[idx];
-                document.getElementById('cg_post_title').value = d.title || '';
-                document.getElementById('cg_post_content').value = d.content || '';
-                if (d.hashtags) document.getElementById('cg_post_tags').value = d.hashtags;
-                showToast('پیش‌نویس بارگذاری شد.', 'success');
-            };
-            cgRefreshDrafts();
-
-            /* ============ Post Media JS (Multi-file) ============ */
-            window._pgMediaUrls = [];
-
-            window.switchPgMediaTab = function(tab) {
-                document.querySelectorAll('.pg_media_tab').forEach(function(t) { t.classList.remove('active'); t.style.background = ''; t.style.color = ''; });
-                var tabs = document.querySelectorAll('.pg_media_tab');
-                tabs.forEach(function(t) { if (t.textContent.includes(tab === 'upload' ? 'آپلود' : 'URL')) { t.classList.add('active'); t.style.background = 'var(--accent)'; t.style.color = '#fff'; } });
-                if (tab === 'upload') {
-                    document.getElementById('pg_media_tab_upload').style.display = 'block';
-                    document.getElementById('pg_media_tab_url').style.display = 'none';
-                    // Reset URL list
-                    window._pgMediaUrls = [];
-                    document.getElementById('pg_media_url_list').innerHTML = '';
-                } else {
-                    document.getElementById('pg_media_tab_upload').style.display = 'none';
-                    document.getElementById('pg_media_tab_url').style.display = 'block';
-                    // Reset upload preview
-                    window._pgMediaUrls = [];
-                    document.getElementById('pg_media_file').value = '';
-                    document.getElementById('pg_media_preview').style.display = 'none';
-                    document.getElementById('pg_media_preview').innerHTML = '';
-                    document.getElementById('pg_media_placeholder').style.display = 'block';
-                }
-            };
-
-            window.handlePgMediaUpload = function(input) {
-                if (!input.files || !input.files.length) return;
-                var files = Array.from(input.files);
-                var allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/mpeg', 'video/quicktime'];
-                var maxSize = 80 * 1024 * 1024;
-
-                var progress = document.getElementById('pg_media_progress');
-                var progressBar = document.getElementById('pg_media_progress_bar');
-                var statusEl = document.getElementById('pg_media_status');
-                var placeholder = document.getElementById('pg_media_placeholder');
-                var preview = document.getElementById('pg_media_preview');
-
-                progress.style.display = 'block';
-                placeholder.style.display = 'none';
-
-                var uploaded = 0;
-                var errors = 0;
-
-                function uploadNext() {
-                    if (uploaded >= files.length) {
-                        progress.style.display = 'none';
-                        syncPgMediaUrls();
-                        if (errors > 0) showToast(errors + ' فایل آپلود نشد', 'error');
-                        return;
-                    }
-                    var file = files[uploaded];
-                    if (allowed.indexOf(file.type) === -1) { errors++; uploaded++; uploadNext(); return; }
-                    if (file.size > maxSize) { errors++; uploaded++; uploadNext(); return; }
-
-                    var fd = new FormData();
-                    fd.append('action', 'ssp_upload_media');
-                    fd.append('security', nonce);
-                    fd.append('media_file', file);
-
-                    fetch(ajaxurl, {method: 'POST', body: fd})
-                        .then(function(r) { return r.json(); })
-                        .then(function(res) {
-                            if (res.success) {
-                                window._pgMediaUrls.push({ url: res.data.url, name: file.name, type: file.type, size: file.size });
-                                renderPgMediaPreview();
-                            } else { errors++; }
-                            uploaded++;
-                            uploadNext();
-                        })
-                        .catch(function() { errors++; uploaded++; uploadNext(); });
-                }
-                uploadNext();
-            };
-
-            window.renderPgMediaPreview = function() {
-                var preview = document.getElementById('pg_media_preview');
-                var placeholder = document.getElementById('pg_media_placeholder');
-                if (!window._pgMediaUrls.length) { preview.style.display = 'none'; placeholder.style.display = 'block'; return; }
-                placeholder.style.display = 'none';
-                preview.style.display = 'block';
-                var html = '<div style="display:flex; flex-wrap:wrap; gap:8px;">';
-                window._pgMediaUrls.forEach(function(item, idx) {
-                    var isVideo = item.type && item.type.startsWith('video');
-                    html += '<div style="position:relative;">';
-                    if (isVideo) {
-                        html += '<div style="width:80px; height:60px; background:var(--bg-alt); border:1px solid var(--border); border-radius:6px; display:flex; align-items:center; justify-content:center; font-size:1.5rem;">▶</div>';
-                    } else {
-                        html += '<img src="' + item.url + '" style="width:80px; height:60px; object-fit:cover; border-radius:6px; border:1px solid var(--border);">';
-                    }
-                    html += '<button onclick="removePgMedia(' + idx + ')" style="position:absolute; top:-4px; right:-4px; background:var(--danger); color:white; border:none; border-radius:50%; width:18px; height:18px; font-size:10px; cursor:pointer; display:flex; align-items:center; justify-content:center;">×</button>';
-                    html += '</div>';
-                });
-                html += '<div style="font-size:0.75rem; color:var(--text-muted); width:100%; margin-top:4px;">' + window._pgMediaUrls.length + ' فایل انتخاب شده</div>';
-                preview.innerHTML = html;
-            };
-
-            window.removePgMedia = function(idx) {
-                window._pgMediaUrls.splice(idx, 1);
-                syncPgMediaUrls();
-                renderPgMediaPreview();
-            };
-
-            window.syncPgMediaUrls = function() {
-                // Store as JSON array for the backend
-                var hidden = document.getElementById('pg_image_url');
-                if (hidden) {
-                    hidden.value = window._pgMediaUrls.length ? JSON.stringify(window._pgMediaUrls) : '';
-                }
-            };
-
-            window.addPgMediaUrl = function() {
-                var input = document.getElementById('pg_media_url_input');
-                var url = input.value.trim();
-                if (!url) return;
-                window._pgMediaUrls.push({ url: url, name: url.split('/').pop() || 'image', type: '', size: 0 });
-                syncPgMediaUrls();
-                renderPgMediaPreview();
-                var list = document.getElementById('pg_media_url_list');
-                var itemHtml = '<div style="display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--border); font-size:0.85rem;">' +
-                    '<span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + escapeHtml(url) + '</span>' +
-                    '<button class="ssp-btn-danger" style="padding:2px 8px; font-size:0.75rem;" onclick="this.parentElement.remove()">×</button></div>';
-                list.insertAdjacentHTML('beforeend', itemHtml);
-                input.value = '';
-            };
-
-            /* ============ Brainstorm / Ideation JS ============ */
-            // Poll for bridge results (simple, reliable)
-            (function() {
-                setInterval(function() {
-                    // Check brainstorm
-                    var br = window._bridgeBrainstormResult;
-                    if (br && Array.isArray(br) && br.length > 0) {
-                        var grid = document.getElementById('bs_ideas_grid');
-                        var results = document.getElementById('bs_results');
-                        if (grid && results && !grid.dataset.rendered) {
-                            try {
-                                bsRenderIdeas(br);
-                                grid.dataset.rendered = '1';
-                                window._bridgeBrainstormResult = null;
-                            } catch(e) { console.error('[Brainstorm Poll]', e); }
-                        }
-                    }
-                    // Check brainstorm raw - only if grid is empty
-                    var braw = window._bridgeBrainstormRaw;
-                    if (braw) {
-                        var grid = document.getElementById('bs_ideas_grid');
-                        var results = document.getElementById('bs_results');
-                        if (grid && results && grid.children.length === 0) {
-                            var displayText = braw;
-                            try {
-                                var vp = validateAndParseBridgeResponse(braw);
-                                if (vp) displayText = JSON.stringify(vp, null, 2);
-                            } catch(pe) {}
-                            grid.innerHTML = '<div class="ssp-item-card" style="grid-column:1/-1;border-left:3px solid var(--success);padding:20px;">' +
-                                '<h4 style="margin:0 0 12px;color:var(--success);">&#9989; پاسخ AI دریافت شد</h4>' +
-                                '<p style="font-size:0.85rem;color:var(--text-muted);margin:0 0 8px;">پاسخ زیر از چت‌بات دریافت شد:</p>' +
-                                '<pre style="background:var(--bg-alt);padding:12px;border-radius:8px;font-size:0.8rem;white-space:pre-wrap;direction:ltr;max-height:500px;overflow:auto;border:1px solid var(--border);">' + (function(s){if(!s)return'';var d=document.createElement('div');d.appendChild(document.createTextNode(String(s)));return d.innerHTML;})(displayText) + '</pre>' +
-                                '<div style="margin-top:12px;display:flex;gap:8px;">' +
-                                '<button class="ssp-btn-primary" style="font-size:0.8rem;" onclick="navigator.clipboard.writeText(this.closest(\'.ssp-item-card\').querySelector(\'pre\').textContent).then(function(){showToast(\'کپی شد!\',\'success\')})">&#128203; کپی متن</button>' +
-                                '<button class="ssp-btn-secondary" style="font-size:0.8rem;" onclick="bsRetryBridgeParse()">&#128260; تلاش مجدد پردازش</button>' +
-                                '</div></div>';
-                            results.style.display = 'block';
-                            window._bridgeBrainstormRaw = null;
-                        }
-                    }
-                    // Check postgen
-                    var pr = window._bridgePostgenResult;
-                    if (pr) {
-                        var obj = null;
-                        if (pr && pr.title) obj = pr;
-                        else if (typeof pr === 'string') {
-                            try { var m = pr.match(/\{[\s\S]*"title"[\s\S]*\}/); if (m) { var o = JSON.parse(m[0]); if (o && o.title) obj = o; } } catch(e) {}
-                        }
-                        if (obj && obj.title) {
-                            try {
-                                var el;
-                                el = document.getElementById('pg_result_title'); if (el) el.value = obj.title;
-                                var content = obj.message || obj.content || '';
-                                // Normalize content: convert various newline representations to actual newlines
-                                content = content.replace(/\\n\\n/g, '\n\n').replace(/\\n/g, '\n').replace(/\\r\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t');
-                                // Handle AI output that uses nn instead of \n\n (between non-space chars)
-                                content = content.replace(/nn(?=[^\s])/g, '\n\n').replace(/([\u0600-\u06FF])n(?=[^\sa-zA-Z\u0600-\u06FF])/g, '$1\n').replace(/([^\sa-zA-Z\u0600-\u06FF])n(?=[^\s])/g, '$1\n');
-                                el = document.getElementById('pg_result_content'); if (el) el.value = content;
-                                var preview = document.getElementById('pg_result_preview'); if (preview) preview.innerText = content;
-                                el = document.getElementById('pg_result_hashtags'); if (el) el.value = obj.hashtags || '';
-                                var resultEl = document.getElementById('pg_post_result'); if (resultEl) resultEl.style.display = 'block';
-                                if (typeof pgToggleView === 'function') pgToggleView('visual');
-                            } catch(e) {}
-                            window._bridgePostgenResult = null;
-                        }
-                    }
-                }, 500);
-            })();
-
-            window.bsGenerate = function() {
-                var topic = document.getElementById('bs_topic').value.trim();
-                var count = document.getElementById('bs_count').value;
-                var typeFilter = document.getElementById('bs_type').value;
-                var errorEl = document.getElementById('bs_error');
-                if (!topic) { errorEl.textContent = 'موضوع را وارد کنید'; errorEl.style.display = 'block'; return; }
-                errorEl.style.display = 'none';
-
-                var btn = document.getElementById('bs_gen_btn');
-                btn.classList.add('loading');
-
-                var prompt = 'You are a creative content strategist and social media expert.\n\n';
-                prompt += 'TASK: Generate ' + count + ' diverse, actionable content ideas for the topic below.\n\n';
-                prompt += 'TOPIC: ' + topic + '\n';
-                if (typeFilter === 'post') prompt += 'FOCUS: Only messenger/telegram post ideas (short, engaging, 400-2000 chars).\n';
-                else if (typeFilter === 'article') prompt += 'FOCUS: Only WordPress article ideas (long-form, SEO-optimized, 800+ words).\n';
-                else prompt += 'FOCUS: Mix of both short messenger posts and long articles.\n';
-                prompt += '\nFor EACH idea, provide a JSON object with these fields:\n';
-                prompt += '- "title": A catchy Persian title for the content\n';
-                prompt += '- "description": A 2-3 sentence description of what the content would cover\n';
-                prompt += '- "type": Either "post" (for messenger) or "article" (for WordPress site)\n';
-                prompt += '- "audience": Target audience (e.g. "جوانان علاقه‌مند به موتور")\n';
-                prompt += '- "angle": Content angle or hook (e.g. "آموزشی", "ترفندی", "مقایسه‌ای", "خبری", "سرگرمی")\n';
-                prompt += '- "keywords": 3-5 relevant Persian keywords separated by comma\n';
-                prompt += '\nCRITICAL RULES:\n';
-                prompt += '1. Return ONLY the raw JSON array. No explanations, no markdown, no code blocks.\n';
-                prompt += '2. All content must be in Persian.\n';
-                prompt += '3. Ideas must be diverse — different angles, audiences, and formats.\n';
-                prompt += '4. Make titles catchy and click-worthy.\n';
-                prompt += '5. Descriptions should be specific enough to write from.\n\n';
-                prompt += 'Return JSON ONLY: [{"title":"","description":"","type":"post|article","audience":"","angle":"","keywords":""}, ...]';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_brainstorm_ideas');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            bsRenderIdeas(res.data.ideas);
-                        } else {
-                            errorEl.textContent = res.data.message;
-                            errorEl.style.display = 'block';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); errorEl.textContent = 'خطا'; errorEl.style.display = 'block'; });
-            };
-
-            // Retry parsing bridge brainstorm result
-            window.bsRetryBridgeParse = function() {
-                var raw = window._bridgeBrainstormRaw || window._bridgeBrainstormResult;
-                if (!raw) { showToast('داده‌ای برای پردازش مجدد وجود ندارد', 'warning'); return; }
-                if (typeof raw === 'string') {
-                    var strategies = [
-                        function(s) { return JSON.parse(s); },
-                        function(s) { var m = s.match(/\[\s*\{[\s\S]*\}\s*\]/); return m ? JSON.parse(m[0]) : null; },
-                        function(s) { var t = s.replace(/```(?:json)?\s*\n?/gi, '').replace(/```\s*$/gm, '').trim(); var m = t.match(/\[\s*\{[\s\S]*\}\s*\]/); return m ? JSON.parse(m[0]) : null; },
-                        function(s) { var v = validateAndParseBridgeResponse(s); if (Array.isArray(v)) return v; if (v && v.ideas && Array.isArray(v.ideas)) return v.ideas; return null; }
-                    ];
-                    for (var i = 0; i < strategies.length; i++) {
-                        try {
-                            var result = strategies[i](raw);
-                            if (Array.isArray(result) && result.length > 0) {
-                                window._bridgeBrainstormResult = result;
-                                window._bridgeBrainstormRaw = null;
-                                bsRenderIdeas(result);
-                                showToast(result.length + ' ایده با موفقیت پردازش شد!', 'success');
-                                return;
-                            }
-                        } catch(e) {}
-                    }
-                } else if (Array.isArray(raw) && raw.length > 0) {
-                    bsRenderIdeas(raw);
-                    showToast(raw.length + ' ایده با موفقیت نمایش داده شد!', 'success');
-                    return;
-                }
-                showToast('متأسفانه پردازش مجدد هم موفقیت‌آمیز نبود. متن خام را کپی کنید.', 'error');
-            };
-
-            window.bsRenderIdeas = function(ideas) {
-                var grid = document.getElementById('bs_ideas_grid');
-                if (!grid || !ideas || !ideas.length) return;
-                // Local escapeHtml - avoid scope issues
-                var _eh = function(s) { if (!s) return ''; var d = document.createElement('div'); d.appendChild(document.createTextNode(String(s))); return d.innerHTML; };
-                var html = '';
-                var postCount = 0, articleCount = 0;
-
-                ideas.forEach(function(idea, idx) {
-                    var isPost = idea.type === 'post';
-                    if (isPost) postCount++; else articleCount++;
-                    var borderColor = isPost ? 'var(--accent)' : 'var(--success)';
-                    var badgeClass = isPost ? 'info' : 'success';
-                    var badgeText = isPost ? '□ پست' : '□ مقاله';
-                    var angleColors = {'آموزشی':'#3B82F6','ترفندی':'#8B5CF6','مقایسه‌ای':'#F59E0B','خبری':'#EF4444','سرگرمی':'#10B981','انگیزشی':'#EC4899','نقد و بررسی':'#6366F1','داستانی':'#14B8A6'};
-                    var angleColor = angleColors[idea.angle] || 'var(--text-muted)';
-
-                    html += '<div class="ssp-item-card" style="border-left:3px solid ' + borderColor + '; animation: cardEnter 0.3s ease ' + (idx * 0.05) + 's both;">';
-                    html += '<div style="display:flex; justify-content:space-between; align-items:start; gap:8px; margin-bottom:8px;">';
-                    html += '<div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">';
-                    html += '<span style="background:' + borderColor + '; color:white; width:24px; height:24px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; font-size:0.75rem; font-weight:700;">' + (idx + 1) + '</span>';
-                    html += '<span class="ssp-badge ' + badgeClass + '">' + badgeText + '</span>';
-                    if (idea.angle) html += '<span style="font-size:0.75rem; color:' + angleColor + '; background:' + angleColor + '15; padding:2px 8px; border-radius:4px;">' + _eh(idea.angle) + '</span>';
-                    html += '</div>';
-                    html += '</div>';
-                    html += '<h4 style="margin:0 0 6px; font-size:0.95rem; color:var(--text); line-height:1.5;">' + _eh(idea.title) + '</h4>';
-                    html += '<p style="font-size:0.85rem; color:var(--text-muted); margin:0 0 8px; line-height:1.6;">' + _eh(idea.description) + '</p>';
-                    if (idea.audience) html += '<div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:4px;">&#128101; <strong>مخاطب:</strong> ' + _eh(idea.audience) + '</div>';
-                    if (idea.keywords) html += '<div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:10px;">&#128270; <strong>کلمات کلیدی:</strong> ' + _eh(idea.keywords) + '</div>';
-                    html += '<div style="display:flex; gap:6px; flex-wrap:wrap;">';
-                    if (isPost) {
-                        html += '<button class="ssp-btn-primary" style="font-size:0.8rem; padding:5px 12px;" onclick="bsUseIdea(' + idx + ', \'post\')">&#9654; تولید پست</button>';
-                    } else {
-                        html += '<button class="ssp-btn-primary" style="font-size:0.8rem; padding:5px 12px; background:var(--success);" onclick="bsUseIdea(' + idx + ', \'article\')">&#9654; تولید مقاله</button>';
-                    }
-                    html += '<button class="ssp-btn-secondary" style="font-size:0.8rem; padding:5px 12px;" onclick="bsCopyIdea(' + idx + ')">&#128203; کپی</button>';
-                    html += '<button class="ssp-btn-secondary" style="font-size:0.8rem; padding:5px 12px;" onclick="bsSaveIdeaDraft(' + idx + ')">&#128190; ذخیره</button>';
-                    html += '</div>';
-                    html += '</div>';
-                });
-
-                grid.innerHTML = html;
-                var badge = document.getElementById('bs_count_badge');
-                if (badge) badge.textContent = postCount + ' پست + ' + articleCount + ' مقاله = ' + ideas.length + ' ایده';
-                var results = document.getElementById('bs_results');
-                if (results) results.style.display = 'block';
-                window._bsIdeas = ideas;
-            };
-
-            window.bsUseIdea = function(idx, type) {
-                var idea = window._bsIdeas[idx];
-                if (!idea) return;
-                if (type === 'post') {
-                    switchTab('postgen', document.querySelector('[data-tab=postgen]'));
-                    document.getElementById('pg_topic').value = idea.title;
-                    document.getElementById('pg_details').value = idea.description + (idea.audience ? '\nمخاطب: ' + idea.audience : '') + (idea.keywords ? '\nکلمات کلیدی: ' + idea.keywords : '');
-                    showToast('ایده به تولید پست منتقل شد. روی تولید کلیک کنید.', 'success');
-                } else {
-                    switchTab('contentgen', document.querySelector('[data-tab=contentgen]'));
-                    document.getElementById('cg_ai_name').value = idea.title;
-                    document.getElementById('cg_ai_brief').value = idea.description + (idea.audience ? '\nمخاطب: ' + idea.audience : '') + (idea.keywords ? '\nکلمات کلیدی: ' + idea.keywords : '');
-                    showToast('ایده به تولید مقاله منتقل شد. روی تولید کلیک کنید.', 'success');
-                }
-            };
-
-            window.bsCopyIdea = function(idx) {
-                var idea = window._bsIdeas[idx];
-                if (!idea) return;
-                var text = idea.title + '\n\n' + idea.description;
-                if (idea.audience) text += '\nمخاطب: ' + idea.audience;
-                if (idea.keywords) text += '\nکلمات کلیدی: ' + idea.keywords;
-                navigator.clipboard.writeText(text).then(function() {
-                    showToast('ایده کپی شد!', 'success');
-                }).catch(function() {
-                    showToast('خطا در کپی', 'error');
-                });
-            };
-
-            window.bsSaveIdeaDraft = function(idx) {
-                var idea = window._bsIdeas[idx];
-                if (!idea) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_draft');
-                fd.append('security', nonce);
-                fd.append('title', idea.title);
-                fd.append('content', idea.description);
-                fd.append('hashtags', idea.keywords || '');
-                fd.append('meta_description', (idea.audience || '') + (idea.angle ? ' | ' + idea.angle : ''));
-                fd.append('draft_type', idea.type || 'post');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) showToast('ایده به پیش‌نویس ذخیره شد!', 'success');
-                        else showToast(res.data.message, 'error');
-                    })
-                    .catch(function() { showToast('خطا', 'error'); });
             };
 
             window.bsGenerateViaBrowser = function() {
-                window._bridgeCurrentTool = 'brainstorm';
-                window._bridgeCurrentToolFn = 'bsGenerateViaBrowser';
-                var topic = document.getElementById('bs_topic').value.trim();
-                var count = document.getElementById('bs_count').value;
-                var typeFilter = document.getElementById('bs_type').value;
-                if (!topic) { showToast('موضوع را وارد کنید', 'error'); return; }
-
-                var prompt = 'You are a creative content strategist and social media expert.\n\n';
-                prompt += 'TASK: Generate ' + count + ' diverse, actionable content ideas for the topic below.\n\n';
-                prompt += 'TOPIC: ' + topic + '\n';
-                if (typeFilter === 'post') prompt += 'FOCUS: Only messenger/telegram post ideas (short, engaging, 400-2000 chars).\n';
-                else if (typeFilter === 'article') prompt += 'FOCUS: Only WordPress article ideas (long-form, SEO-optimized, 800+ words).\n';
-                else prompt += 'FOCUS: Mix of both short messenger posts and long articles.\n';
-                prompt += '\nFor EACH idea, provide a JSON object with these fields:\n';
-                prompt += '- "title": A catchy Persian title for the content\n';
-                prompt += '- "description": A 2-3 sentence description of what the content would cover\n';
-                prompt += '- "type": Either "post" (for messenger) or "article" (for WordPress site)\n';
-                prompt += '- "audience": Target audience (e.g. "جوانان علاقه‌مند به موتور")\n';
-                prompt += '- "angle": Content angle or hook (e.g. "آموزشی", "ترفندی", "مقایسه‌ای", "خبری", "سرگرمی")\n';
-                prompt += '- "keywords": 3-5 relevant Persian keywords separated by comma\n';
-                prompt += '\nCRITICAL RULES:\n';
-                prompt += '1. Return ONLY the raw JSON array. No explanations, no markdown, no code blocks.\n';
-                prompt += '2. All content must be in Persian.\n';
-                prompt += '3. Ideas must be diverse — different angles, audiences, and formats.\n';
-                prompt += '4. Make titles catchy and click-worthy.\n';
-                prompt += '5. Descriptions should be specific enough to write from.\n\n';
-                prompt += 'Return JSON ONLY: [{"title":"","description":"","type":"post|article","audience":"","angle":"","keywords":""}, ...]';
-                window._bridgeCurrentPrompt = prompt;
-                window._bridgeCurrentContext = 'brainstorm';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_bridge_create_task');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('context_type', 'brainstorm');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            localStorage.setItem('ssp_bridge_pending_task', res.data.task_id);
-                            showBridgeWaitingModal(res.data.task_id);
-                            openChatbotTab();
-                        } else if (res.data && res.data.can_force) {
-                            if (confirm('تسک قبلی هنوز فعال است. آیا می‌خواهید آن را لغو کنید و تسک جدید ایجاد کنید؟')) {
-                                fd.append('force', '1');
-                                fetch(ajaxurl, {method: 'POST', body: fd}).then(function(r2) { return r2.json(); }).then(function(res2) {
-                                    if (res2.success) {
-                                        localStorage.setItem('ssp_bridge_pending_task', res2.data.task_id);
-                                        showBridgeWaitingModal(res2.data.task_id);
-                                        openChatbotTab();
-                                    } else { showToast(res2.data.message || 'خطا', 'error'); }
-                                });
-                            }
-                        } else { showToast(res.data.message || 'خطا', 'error'); }
-                    });
-            };
-
-            /* ============ Content Generator JS ============ */
-            window.cgSiteChanged = function() {
-                var siteSel = document.getElementById('cg_target_site');
-                if (!siteSel || !siteSel.value) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_woo_categories');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                fd.append('content_type', document.getElementById('cg_content_type').value);
-                var catSelect = document.getElementById('cg_wp_categories');
-                catSelect.innerHTML = '<option value="">در حال بارگذاری...</option>';
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.categories) {
-                            var html = '<option value="">انتخاب دسته‌بندی</option>';
-                            res.data.categories.forEach(function(c) { html += '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>'; });
-                            catSelect.innerHTML = html;
-                        } else { catSelect.innerHTML = '<option value="">دسته‌بندی‌ای یافت نشد</option>'; }
-                    })
-                    .catch(function() { catSelect.innerHTML = '<option value="">خطا</option>'; });
-            };
-
-            window.cgGenerateWithAI = function() {
-                // In browser mode, redirect to browser generation
-                if (document.getElementById('ssp_ai_mode') && document.getElementById('ssp_ai_mode').value === 'browser') {
-                    cgGenerateViaBrowser();
-                    return;
+                if (typeof window.bsGenerate === 'function') {
+                    window.bsGenerate();
+                } else {
+                    showToast('در حال بارگذاری موتور هوش مصنوعی...', 'info');
                 }
-                var name = document.getElementById('cg_ai_name').value.trim();
-                var brief = document.getElementById('cg_ai_brief').value.trim();
-                var promptMode = document.getElementById('cg_prompt_mode').value;
-                var customPrompt = document.getElementById('cg_custom_prompt').value;
-                var errorEl = document.getElementById('cg_ai_error');
-                var tokensEl = document.getElementById('cg_ai_tokens');
-                if (!name) { errorEl.textContent = 'عنوان را وارد کنید'; errorEl.style.display = 'block'; return; }
-                errorEl.style.display = 'none';
-                var btn = document.getElementById('cg_ai_btn');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_product_ai');
-                fd.append('security', nonce);
-                fd.append('product_name', name);
-                fd.append('product_brief', brief);
-                fd.append('content_type', 'post');
-                fd.append('prompt_mode', promptMode);
-                fd.append('custom_prompt', customPrompt);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            var d = res.data.data;
-                            if (d.title) document.getElementById('cg_post_title').value = d.title;
-                            if (d.content) document.getElementById('cg_post_content').value = d.content;
-                            if (d.excerpt) document.getElementById('cg_ai_brief').value = d.excerpt;
-                            if (d.tags) document.getElementById('cg_post_tags').value = Array.isArray(d.tags) ? d.tags.join(', ') : d.tags;
-                            if (d.meta_title) document.getElementById('cg_meta_title').value = d.meta_title;
-                            if (d.meta_description) document.getElementById('cg_meta_description').value = d.meta_description;
-                            if (d.categories && d.categories.length) {
-                                var catSel = document.getElementById('cg_wp_categories');
-                                for (var i = 0; i < catSel.options.length; i++) {
-                                    if (catSel.options[i].text.toLowerCase().indexOf(d.categories[0].toLowerCase()) !== -1) { catSel.selectedIndex = i; break; }
-                                }
-                            }
-                            if (res.data.tokens_used) { tokensEl.textContent = res.data.tokens_used + ' tokens'; tokensEl.style.display = 'inline-flex'; }
-                            showToast('محتوا تولید شد!', 'success');
-                        } else { errorEl.textContent = res.data.message; errorEl.style.display = 'block'; }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); errorEl.textContent = 'خطا'; errorEl.style.display = 'block'; });
             };
-
-            window.cgResetForm = function() {
-                document.getElementById('cg_ai_name').value = '';
-                document.getElementById('cg_ai_brief').value = '';
-                document.getElementById('cg_post_title').value = '';
-                document.getElementById('cg_post_content').value = '';
-                document.getElementById('cg_post_tags').value = '';
-                document.getElementById('cg_meta_title').value = '';
-                document.getElementById('cg_meta_description').value = '';
-                document.getElementById('cg_thumbnail_file').value = '';
-                document.getElementById('cg_thumbnail_url').value = '';
-                document.getElementById('cg_ai_error').style.display = 'none';
-                document.getElementById('cg_ai_tokens').style.display = 'none';
-            };
-
-            window.cgPromptModeChanged = function() {
-                var mode = document.getElementById('cg_prompt_mode').value;
-                var wrap = document.getElementById('cg_custom_prompt_wrap');
-                wrap.style.display = mode === 'custom' ? 'block' : 'none';
-            };
-
-            window.cgResetPromptMode = function() {
-                document.getElementById('cg_prompt_mode').value = 'default_post';
-                cgPromptModeChanged();
-                showToast('قالب پرامپت به پیش‌فرض بازگردانی شد', 'success');
-            };
-
-            window.sendCgToSeo = function() {
-                var title = document.getElementById('cg_post_title').value;
-                var content = document.getElementById('cg_post_content').value;
-                var tags = document.getElementById('cg_post_tags').value;
-
-                if (!title && !content) { showToast('محتوایی برای ارسال وجود ندارد', 'warning'); return; }
-
-                // Switch to SEO tab
-                var seoTab = document.querySelector('[data-tab="seo"]');
-                if (seoTab) switchTab('seo', seoTab);
-
-                // Fill SEO fields
-                setTimeout(function() {
-                    if (title) document.getElementById('seo_title').value = title;
-                    if (content) document.getElementById('seo_content').value = content;
-                    if (tags) document.getElementById('seo_hashtags').value = tags;
-                    updateSeoCharCount('title');
-                    updateSeoCharCount('content');
-                    updateSeoHashtagCount();
-                    showToast('محتوا به ابزار SEO ارسال شد', 'success');
-                }, 300);
-            };
-
-            window.sendPgToSeo = function() {
-                var title = document.getElementById('pg_name') ? document.getElementById('pg_name').value : '';
-                var desc = document.getElementById('pg_short_description') ? document.getElementById('pg_short_description').value : '';
-                var longDesc = document.getElementById('pg_description') ? document.getElementById('pg_description').value : '';
-                var content = desc || longDesc;
-
-                if (!title && !content) { showToast('محتوایی برای ارسال وجود ندارد', 'warning'); return; }
-
-                var seoTab = document.querySelector('[data-tab="seo"]');
-                if (seoTab) switchTab('seo', seoTab);
-
-                setTimeout(function() {
-                    if (title) document.getElementById('seo_title').value = title;
-                    if (content) document.getElementById('seo_content').value = content;
-                    updateSeoCharCount('title');
-                    updateSeoCharCount('content');
-                    showToast('اطلاعات محصول به ابزار SEO ارسال شد', 'success');
-                }, 300);
-            };
-
-            window.cgPreview = function() {
-                var html = '<div style="direction:rtl; text-align:right;">';
-                html += '<h3 style="margin:0 0 12px;">پیش‌نمایش</h3>';
-                html += '<p><strong>عنوان:</strong> ' + escapeHtml(document.getElementById('cg_post_title').value || '-') + '</p>';
-                html += '<p><strong>محتوا:</strong></p>';
-                html += '<div style="background:var(--bg-alt); padding:12px; border-radius:8px; max-height:200px; overflow-y:auto;">' + (document.getElementById('cg_post_content').value || '-') + '</div>';
-                html += '</div>';
-                var result = document.getElementById('cg_result');
-                result.style.display = 'block'; result.style.background = 'var(--bg-alt)'; result.style.border = '1px solid var(--border)'; result.innerHTML = html;
-            };
-
-            window.cgPublish = function() {
-                var siteSel = document.getElementById('cg_target_site');
-                if (!siteSel || !siteSel.value) { showToast('سایت مقصد را انتخاب کنید', 'warning'); return; }
-                var btn = document.getElementById('cg_publish_btn');
-                var result = document.getElementById('cg_result');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_product');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                fd.append('content_type', document.getElementById('cg_content_type').value);
-                fd.append('post_title', document.getElementById('cg_post_title').value);
-                fd.append('post_content', document.getElementById('cg_post_content').value);
-                fd.append('post_status', document.getElementById('cg_post_status').value);
-                fd.append('post_excerpt', '');
-                fd.append('post_tags', document.getElementById('cg_post_tags').value);
-                fd.append('image_resize', document.getElementById('cg_image_resize').value);
-                var catVal = document.getElementById('cg_wp_categories').value;
-                if (catVal) fd.append('post_categories[]', catVal);
-                var thumbFile = document.getElementById('cg_thumbnail_file').files[0];
-                if (thumbFile) fd.append('thumbnail_file', thumbFile);
-                var thumbUrl = document.getElementById('cg_thumbnail_url').value;
-                if (thumbUrl) fd.append('thumbnail_url', thumbUrl);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        result.style.display = 'block';
-                        if (res.success) {
-                            result.style.background = 'var(--success-soft)'; result.style.border = '1px solid var(--success)'; result.style.color = 'var(--success)';
-                            var linkHtml = res.data.url ? '<br><a href="' + escapeHtml(res.data.url) + '" target="_blank" style="color:var(--success);">مشاهده &#8599;</a>' : '';
-                            result.innerHTML = '&#10003; ' + escapeHtml(res.data.message) + linkHtml;
-                            showToast(res.data.message, 'success');
-                        } else {
-                            result.style.background = 'var(--error-soft)'; result.style.border = '1px solid var(--error)'; result.style.color = 'var(--error)';
-                            result.innerHTML = '&#10007; ' + escapeHtml(res.data.message);
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); result.style.display = 'block'; result.style.background = 'var(--error-soft)'; result.style.border = '1px solid var(--error)'; result.style.color = 'var(--error)'; result.innerHTML = 'خطا'; });
-            };
-
-            window.cgSaveAsDraft = function() {
-                var title = document.getElementById('cg_post_title').value;
-                var content = document.getElementById('cg_post_content').value;
-                var tags = document.getElementById('cg_post_tags').value;
-                var metaDesc = document.getElementById('cg_meta_description').value;
-
-                if (!title && !content) { showToast('عنوان یا محتوا را وارد کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_draft');
-                fd.append('security', nonce);
-                fd.append('title', title);
-                fd.append('content', content);
-                fd.append('hashtags', tags);
-                fd.append('meta_description', metaDesc);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('پیش‌نویس ذخیره شد!', 'success');
-                        } else {
-                            showToast(res.data.message || 'خطا در ذخیره', 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا', 'error'); });
-            };
-
-            // AI Image Generation for Content
-            window.cgGenerateImage = function() {
-                var prompt = document.getElementById('cg_image_prompt').value.trim();
-                var size = document.getElementById('cg_image_size').value;
-                var quality = document.getElementById('cg_image_quality').value;
-                var errorEl = document.getElementById('cg_image_result');
-
-                if (!prompt) { errorEl.innerHTML = '<span style="color:var(--error);">پرامپت تصویر را وارد کنید</span>'; return; }
-
-                var btn = document.getElementById('cg_gen_image_btn');
-                btn.classList.add('loading');
-                errorEl.innerHTML = '<span style="color:var(--text-muted);">در حال تولید تصویر...</span>';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_image');
-                fd.append('security', nonce);
-                fd.append('prompt', prompt);
-                fd.append('size', size);
-                fd.append('quality', quality);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success) {
-                            errorEl.innerHTML = '<div style="margin-top:8px;"><img src="' + escapeHtml(res.data.url) + '" style="max-width:300px; border-radius:8px; border:1px solid var(--border);"><br><a href="' + escapeHtml(res.data.url) + '" target="_blank" style="font-size:0.8rem; color:var(--accent);">مشاهده در اندازه اصلی &#8599;</a></div>';
-                            // Auto-fill thumbnail URL
-                            document.getElementById('cg_thumbnail_url').value = res.data.url;
-                            showToast('تصویر تولید شد!', 'success');
-                        } else {
-                            errorEl.innerHTML = '<span style="color:var(--error);">' + escapeHtml(res.data.message) + '</span>';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); errorEl.innerHTML = '<span style="color:var(--error);">خطا در تولید تصویر</span>'; });
-            };
-
-            // Batch Content Generation
-            window.cgBatchGenerate = function() {
-                var count = document.getElementById('cg_batch_count').value;
-                var style = document.getElementById('cg_batch_style').value;
-                var topic = document.getElementById('cg_batch_topic').value.trim();
-                var siteSel = document.getElementById('cg_target_site');
-
-                if (!topic) { showToast('موضوع را وارد کنید', 'warning'); return; }
-                if (!siteSel || !siteSel.value) { showToast('سایت مقصد را انتخاب کنید', 'warning'); return; }
-
-                var btn = document.getElementById('cg_batch_gen_btn');
-                var resultEl = document.getElementById('cg_batch_results');
-                btn.classList.add('loading');
-                resultEl.innerHTML = '<div style="text-align:center; color:var(--text-muted);">در حال تولید ' + count + ' محتوا...</div>';
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_batch_generate');
-                fd.append('security', nonce);
-                fd.append('count', count);
-                fd.append('style', style);
-                fd.append('topic', topic);
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        if (res.success && res.data.items) {
-                            var html = '<div style="display:flex; flex-direction:column; gap:8px;">';
-                            res.data.items.forEach(function(item, i) {
-                                html += '<div class="ssp-card" style="padding:12px;">';
-                                html += '<strong>' + escapeHtml(item.title || 'محتوای ' + (i+1)) + '</strong>';
-                                html += '<p style="color:var(--text-muted); font-size:0.85rem; margin:8px 0;">' + escapeHtml((item.message || '').substring(0, 150)) + '...</p>';
-                                html += '<div style="display:flex; gap:6px;">';
-                                html += '<button class="ssp-btn-secondary" onclick="cgPublishBatchItem(\'' + escapeHtml(item.title || '') + '\', \'' + escapeHtml(item.message || '') + '\')" style="font-size:0.75rem;">انتشار</button>';
-                                html += '<button class="ssp-btn-secondary" onclick="cgFillBatchItem(\'' + escapeHtml(item.title || '') + '\', \'' + escapeHtml(item.message || '') + '\')" style="font-size:0.75rem;">پر کردن فرم</button>';
-                                html += '</div></div>';
-                            });
-                            html += '</div>';
-                            resultEl.innerHTML = html;
-                            showToast(count + ' محتوا تولید شد!', 'success');
-                        } else {
-                            resultEl.innerHTML = '<span style="color:var(--error);">' + escapeHtml(res.data.message || 'خطا') + '</span>';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); resultEl.innerHTML = '<span style="color:var(--error);">خطا</span>'; });
-            };
-
-            window.cgFillBatchItem = function(title, content) {
-                document.getElementById('cg_post_title').value = title;
-                document.getElementById('cg_post_content').value = content;
-                window.scrollTo({top: 0, behavior: 'smooth'});
-                showToast('فرم پر شد!', 'success');
-            };
-
-            window.cgPublishBatchItem = function(title, content) {
-                var siteSel = document.getElementById('cg_target_site');
-                if (!siteSel || !siteSel.value) { showToast('سایت مقصد را انتخاب کنید', 'warning'); return; }
-
-                var fd = new FormData();
-                fd.append('action', 'ssp_generate_product');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                fd.append('content_type', document.getElementById('cg_content_type').value);
-                fd.append('post_title', title);
-                fd.append('post_content', content);
-                fd.append('post_status', 'publish');
-                fd.append('post_excerpt', '');
-                fd.append('post_tags', '');
-
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            showToast('انتشار موفق: ' + title, 'success');
-                        } else {
-                            showToast('خطا: ' + res.data.message, 'error');
-                        }
-                    })
-                    .catch(function() { showToast('خطا', 'error'); });
-            };
-
-            /* ============ Product Generator Advanced JS ============ */
-
-            // Section switching
-            window.pgShowSection = function(section) {
-                var sections = ['single', 'bulk', 'clone', 'templates', 'history'];
-                sections.forEach(function(s) {
-                    var el = document.getElementById('pg_section_' + s);
-                    if (el) el.style.display = s === section ? 'block' : 'none';
-                    var btn = document.getElementById('pg_mode_' + s);
-                    if (btn) {
-                        btn.style.borderColor = s === section ? 'var(--accent)' : '';
-                        btn.style.color = s === section ? 'var(--accent)' : '';
-                    }
-                });
-                if (section === 'templates') pgLoadTemplates();
-                if (section === 'history') pgLoadHistory();
-                if (section === 'bulk') pgBulkAddItem();
-            };
-
-            // Load brands
-            window.pgLoadBrands = function() {
-                var siteSel = document.getElementById('pg_target_site');
-                if (!siteSel || !siteSel.value) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_woo_brands');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                var brandSelect = document.getElementById('pg_brand');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.brands && res.data.brands.length) {
-                            var html = '<option value="">بدون برند</option>';
-                            res.data.brands.forEach(function(b) { html += '<option value="' + b.id + '">' + escapeHtml(b.name) + '</option>'; });
-                            brandSelect.innerHTML = html;
-                        } else {
-                            brandSelect.innerHTML = '<option value="">بدون برند</option>';
-                        }
-                    })
-                    .catch(function() { brandSelect.innerHTML = '<option value="">خطا</option>'; });
-            };
-
-            // Load shipping classes
-            window.pgLoadShippingClasses = function() {
-                var siteSel = document.getElementById('pg_target_site');
-                if (!siteSel || !siteSel.value) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_woo_shipping');
-                fd.append('security', nonce);
-                fd.append('site_id', siteSel.value);
-                var shipSelect = document.getElementById('pg_shipping_class');
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success && res.data.shipping_classes && res.data.shipping_classes.length) {
-                            var html = '<option value="">پیش‌فرض</option>';
-                            res.data.shipping_classes.forEach(function(c) { html += '<option value="' + c.id + '">' + escapeHtml(c.name) + '</option>'; });
-                            shipSelect.innerHTML = html;
-                        } else {
-                            shipSelect.innerHTML = '<option value="">پیش‌فرض</option>';
-                        }
-                    })
-                    .catch(function() { shipSelect.innerHTML = '<option value="">خطا</option>'; });
-            };
-
-            // Custom meta fields
-            var pgMetaCount = 0;
-            window.pgAddCustomMeta = function(key, value) {
-                pgMetaCount++;
-                var id = pgMetaCount;
-                var html = '<div class="ssp-grid-2" id="pg_meta_' + id + '" style="margin-bottom:8px;">' +
-                    '<input type="text" class="ssp-input pg_meta_key" data-id="' + id + '" placeholder="کلید (مثلاً: _custom_field)" value="' + escapeHtml(key || '') + '">' +
-                    '<div style="display:flex; gap:6px;">' +
-                    '<input type="text" class="ssp-input pg_meta_value" data-id="' + id + '" placeholder="مقدار" value="' + escapeHtml(value || '') + '" style="flex:1;">' +
-                    '<button class="ssp-btn-danger" onclick="pgRemoveMeta(' + id + ')" style="padding:6px 10px; font-size:0.8rem;">&#10005;</button>' +
-                    '</div></div>';
-                document.getElementById('pg_custom_meta_list').insertAdjacentHTML('beforeend', html);
-            };
-            window.pgRemoveMeta = function(id) {
-                var el = document.getElementById('pg_meta_' + id);
-                if (el) el.remove();
-            };
-
-            // Image preview
-            document.addEventListener('DOMContentLoaded', function() {
-                var fileInput = document.getElementById('pg_thumbnail_file');
-                if (fileInput) {
-                    fileInput.addEventListener('change', function() {
-                        var file = this.files[0];
-                        if (file) {
-                            var reader = new FileReader();
-                            reader.onload = function(e) {
-                                var preview = document.getElementById('pg_image_preview');
-                                var img = document.getElementById('pg_image_preview_img');
-                                if (preview && img) {
-                                    img.src = e.target.result;
-                                    preview.style.display = 'block';
-                                }
-                            };
-                            reader.readAsDataURL(file);
-                        }
-                    });
-                }
-                // Manage stock toggle
-                var manageStockCheckbox = document.getElementById('pg_manage_stock');
-                var stockQuantityGroup = document.getElementById('pg_stock_quantity_group');
-                if (manageStockCheckbox && stockQuantityGroup) {
-                    manageStockCheckbox.addEventListener('change', function() {
-                        if (this.checked) {
-                            stockQuantityGroup.style.display = 'block';
-                        } else {
-                            stockQuantityGroup.style.display = 'none';
-                        }
-                    });
-                }
-                // SEO counter
-                var metaTitle = document.getElementById('pg_meta_title');
-                var metaDesc = document.getElementById('pg_meta_description');
-                if (metaTitle) metaTitle.addEventListener('input', function() { document.getElementById('pg_meta_title_count').textContent = this.value.length; });
-                if (metaDesc) metaDesc.addEventListener('input', function() { document.getElementById('pg_meta_desc_count').textContent = this.value.length; });
-            });
-
-            // Clone product
-            window.pgCloneProduct = function() {
-                pgShowSection('clone');
-            };
-            window.pgCloneFetch = function() {
-                var siteId = document.getElementById('pg_clone_site').value;
-                var url = document.getElementById('pg_clone_url').value;
-                if (!url) { showToast('آدرس محصول را وارد کنید', 'warning'); return; }
-                var btn = document.getElementById('pg_clone_btn');
-                var result = document.getElementById('pg_clone_result');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_fetch_remote_product');
-                fd.append('security', nonce);
-                fd.append('site_id', siteId);
-                fd.append('product_url', url);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        result.style.display = 'block';
-                        if (res.success) {
-                            var d = res.data.data;
-                            // Fill form
-                            document.getElementById('pg_product_name').value = d.name || '';
-                            document.getElementById('pg_short_desc').value = d.short_description || '';
-                            document.getElementById('pg_description').value = d.description || '';
-                            document.getElementById('pg_regular_price').value = d.regular_price || '';
-                            document.getElementById('pg_sale_price').value = d.sale_price || '';
-                            document.getElementById('pg_sku').value = d.sku || '';
-                            document.getElementById('pg_weight').value = d.weight || '';
-                            if (d.dimensions) {
-                                document.getElementById('pg_length').value = d.dimensions.length || '';
-                                document.getElementById('pg_width').value = d.dimensions.width || '';
-                                document.getElementById('pg_height').value = d.dimensions.height || '';
-                            }
-                            // Fill attributes
-                            document.getElementById('pg_attributes_list').innerHTML = '';
-                            pgAttrCount = 0;
-                            if (d.attributes) d.attributes.forEach(function(a) { pgAddAttribute(a.name, a.options.join(', ')); });
-                            // Switch to single
-                            pgShowSection('single');
-                            result.innerHTML = '&#10003; اطلاعات محصول دریافت شد و در فرم پر شد.';
-                            result.style.background = 'var(--success-soft)';
-                            result.style.border = '1px solid var(--success)';
-                            result.style.color = 'var(--success)';
-                            showToast('محصول کلون شد!', 'success');
-                        } else {
-                            result.innerHTML = '&#10007; ' + escapeHtml(res.data.message);
-                            result.style.background = 'var(--error-soft)';
-                            result.style.border = '1px solid var(--error)';
-                            result.style.color = 'var(--error)';
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); result.style.display = 'block'; result.innerHTML = 'خطا'; });
-            };
-
-            // Save as template
-            window.pgSaveAsTemplate = function() {
-                var name = prompt('نام قالب را وارد کنید:');
-                if (!name) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_save_product_template');
-                fd.append('security', nonce);
-                // Send template_id if updating existing template
-                var currentId = document.getElementById('pg_current_template_id') ? document.getElementById('pg_current_template_id').value : '';
-                if (currentId && parseInt(currentId) > 0) fd.append('template_id', currentId);
-                fd.append('template_name', name);
-                fd.append('content_type', 'product');
-                fd.append('product_name', document.getElementById('pg_product_name').value);
-                fd.append('short_description', document.getElementById('pg_short_desc').value);
-                fd.append('description', document.getElementById('pg_description').value);
-                fd.append('regular_price', document.getElementById('pg_regular_price').value);
-                fd.append('sale_price', document.getElementById('pg_sale_price').value);
-                fd.append('sku', document.getElementById('pg_sku').value);
-                fd.append('weight', document.getElementById('pg_weight').value);
-                fd.append('length', document.getElementById('pg_length').value);
-                fd.append('width', document.getElementById('pg_width').value);
-                fd.append('height', document.getElementById('pg_height').value);
-                fd.append('stock_status', document.getElementById('pg_stock_status').value);
-                fd.append('manage_stock', document.getElementById('pg_manage_stock').checked ? '1' : '0');
-                fd.append('product_status', document.getElementById('pg_product_status').value);
-                document.querySelectorAll('.pg_attr_name').forEach(function(el) {
-                    var id = el.getAttribute('data-id');
-                    var vals = document.querySelector('.pg_attr_values[data-id="' + id + '"]');
-                    if (el.value && vals && vals.value) {
-                        fd.append('attribute_names[]', el.value);
-                        fd.append('attribute_values[]', vals.value);
-                    }
-                });
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { 
-                        showToast(res.data.message, res.success ? 'success' : 'error');
-                        // Store the returned ID for future updates
-                        if (res.success && res.data.id && document.getElementById('pg_current_template_id')) {
-                            document.getElementById('pg_current_template_id').value = res.data.id;
-                        }
-                    })
-                    .catch(function() { showToast('خطا', 'error'); });
-            };
-
-            // Load templates
-            window.pgLoadTemplates = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_product_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        var list = document.getElementById('pg_templates_list');
-                        if (res.success && res.data.templates && res.data.templates.length) {
-                            var html = '';
-                            res.data.templates.forEach(function(t) {
-                                html += '<div class="ssp-item-card" style="margin-bottom:8px;"><div class="ssp-item-card-head"><div><div class="ssp-item-card-title">' + escapeHtml(t.name) + ' <span class="ssp-badge info">' + (t.content_type || 'product') + '</span></div><div class="ssp-item-card-meta">' + escapeHtml(t.data.product_name || t.data.post_title || '') + '</div></div><div style="display:flex; gap:6px;"><button class="ssp-btn-secondary" onclick="pgLoadTemplate(' + t.id + ')" style="font-size:0.8rem;">بارگذاری</button><button class="ssp-btn-danger" onclick="pgDeleteTemplate(' + t.id + ')" style="font-size:0.8rem;">حذف</button></div></div></div>';
-                            });
-                            list.innerHTML = html;
-                        } else {
-                            list.innerHTML = '<div class="ssp-empty"><p>هنوز قالبی ذخیره نشده.</p></div>';
-                        }
-                    });
-            };
-            window.pgLoadTemplate = function(id) {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_product_templates');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        if (res.success) {
-                            var t = res.data.templates.find(function(x) { return x.id === id; });
-                            if (t) {
-                                var d = t.data;
-                                pgContentTypeChanged();
-                                document.getElementById('pg_product_name').value = d.product_name || '';
-                                document.getElementById('pg_short_desc').value = d.short_description || '';
-                                document.getElementById('pg_description').value = d.description || '';
-                                document.getElementById('pg_regular_price').value = d.regular_price || '';
-                                document.getElementById('pg_sale_price').value = d.sale_price || '';
-                                document.getElementById('pg_sku').value = d.sku || '';
-                                document.getElementById('pg_weight').value = d.weight || '';
-                                document.getElementById('pg_length').value = d.length || '';
-                                document.getElementById('pg_width').value = d.width || '';
-                                document.getElementById('pg_height').value = d.height || '';
-                                document.getElementById('pg_stock_status').value = d.stock_status || 'instock';
-                                pgShowSection('single');
-                                showToast('قالب بارگذاری شد!', 'success');
-                            }
-                        }
-                    });
-            };
-            window.pgDeleteTemplate = function(id) {
-                if (!confirm('قالب حذف شود?')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_delete_product_template');
-                fd.append('security', nonce);
-                fd.append('template_id', id);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.data.message, 'success'); pgLoadTemplates(); });
-            };
-
-            // Bulk generation
-            var pgBulkItemCount = 0;
-            window.pgBulkAddItem = function(name) {
-                pgBulkItemCount++;
-                var id = pgBulkItemCount;
-                var html = '<div class="ssp-card" id="pg_bulk_item_' + id + '" style="margin-bottom:8px; padding:12px;">' +
-                    '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">' +
-                    '<span style="font-weight:600; font-size:0.85rem;">محصول #' + id + '</span>' +
-                    '<button class="ssp-btn-danger" onclick="pgBulkRemoveItem(' + id + ')" style="padding:4px 8px; font-size:0.75rem;">حذف</button>' +
-                    '</div>' +
-                    '<div class="ssp-grid-2">' +
-                    '<input type="text" class="ssp-input pg_bulk_name" data-id="' + id + '" placeholder="نام محصول" value="' + escapeHtml(name || '') + '">' +
-                    '<input type="number" class="ssp-input pg_bulk_price" data-id="' + id + '" placeholder="قیمت">' +
-                    '</div>' +
-                    '<textarea class="ssp-textarea pg_bulk_desc" data-id="' + id + '" rows="2" placeholder="توضیحات کوتاه" style="margin-top:8px; width:100%;"></textarea>' +
-                    '</div>';
-                document.getElementById('pg_bulk_items').insertAdjacentHTML('beforeend', html);
-            };
-            window.pgBulkRemoveItem = function(id) {
-                var el = document.getElementById('pg_bulk_item_' + id);
-                if (el) el.remove();
-            };
-            window.pgBulkGenerateFromAI = function() {
-                var items = document.querySelectorAll('.pg_bulk_name');
-                if (!items.length) { showToast('ابتدا ردیف اضافه کنید', 'warning'); return; }
-                var names = [];
-                items.forEach(function(el) { if (el.value.trim()) names.push(el.value.trim()); });
-                if (!names.length) { showToast('نام محصولات را وارد کنید', 'warning'); return; }
-                // Generate one by one (simplified)
-                showToast(names.length + ' محصول تولید خواهد شد...', 'info');
-            };
-            window.pgBulkPublish = function() {
-                var siteId = document.getElementById('pg_bulk_site').value;
-                var contentType = document.getElementById('pg_bulk_content_type').value;
-                var nameEls = document.querySelectorAll('.pg_bulk_name');
-                var priceEls = document.querySelectorAll('.pg_bulk_price');
-                var descEls = document.querySelectorAll('.pg_bulk_desc');
-                if (!nameEls.length) { showToast('آیتمی وجود ندارد', 'warning'); return; }
-                var items = [];
-                nameEls.forEach(function(el, i) {
-                    if (el.value.trim()) {
-                        var item = {product_name: el.value.trim(), regular_price: priceEls[i] ? priceEls[i].value : '', short_description: descEls[i] ? descEls[i].value : ''};
-                        if (contentType !== 'product') { item.post_title = item.product_name; item.post_content = item.short_description; delete item.product_name; delete item.regular_price; delete item.short_description; }
-                        items.push(item);
-                    }
-                });
-                if (!items.length) { showToast('نام محصولات را وارد کنید', 'warning'); return; }
-                var btn = document.getElementById('pg_bulk_publish_btn');
-                btn.classList.add('loading');
-                var fd = new FormData();
-                fd.append('action', 'ssp_bulk_generate_products');
-                fd.append('security', nonce);
-                fd.append('site_id', siteId);
-                fd.append('content_type', contentType);
-                fd.append('items', JSON.stringify(items));
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        btn.classList.remove('loading');
-                        var result = document.getElementById('pg_bulk_result');
-                        result.style.display = 'block';
-                        if (res.success) {
-                            result.style.background = 'var(--success-soft)'; result.style.border = '1px solid var(--success)'; result.style.color = 'var(--success)'; result.style.padding = '12px'; result.style.borderRadius = '8px';
-                            var html = '<strong>' + escapeHtml(res.data.message) + '</strong><br>';
-                            if (res.data.results) res.data.results.forEach(function(r) { html += (r.status === 'success' ? '&#10003; ' : '&#10007; ') + escapeHtml(r.name) + (r.url ? ' <a href="' + escapeHtml(r.url) + '" target="_blank">مشاهده</a>' : '') + '<br>'; });
-                            result.innerHTML = html;
-                        } else {
-                            result.style.background = 'var(--error-soft)'; result.style.border = '1px solid var(--error)'; result.style.color = 'var(--error)'; result.style.padding = '12px'; result.style.borderRadius = '8px';
-                            result.innerHTML = escapeHtml(res.data.message);
-                        }
-                    })
-                    .catch(function() { btn.classList.remove('loading'); showToast('خطا', 'error'); });
-            };
-
-            // History
-            window.pgLoadHistory = function() {
-                var fd = new FormData();
-                fd.append('action', 'ssp_get_publish_history');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) {
-                        var list = document.getElementById('pg_history_list');
-                        if (res.success && res.data.history && res.data.history.length) {
-                            var html = '';
-                            res.data.history.forEach(function(h) {
-                                var icon = h.status === 'success' ? '&#10003;' : '&#10007;';
-                                var color = h.status === 'success' ? 'var(--success)' : 'var(--error)';
-                                html += '<div class="ssp-item-card" style="margin-bottom:8px; padding:12px;"><div style="display:flex; justify-content:space-between; align-items:center;"><div><span style="color:' + color + '; font-weight:700;">' + icon + '</span> <strong>' + escapeHtml(h.name) + '</strong> <span class="ssp-badge info">' + escapeHtml(h.type) + '</span></div><span style="color:var(--text-subtle); font-size:0.75rem;">' + escapeHtml(h.site || '') + ' | ' + escapeHtml(formatJalaliDateTime(h.created_at || '')) + '</span></div>' + (h.result_url ? '<a href="' + escapeHtml(h.result_url) + '" target="_blank" style="font-size:0.8rem; color:var(--accent);">\u0645\u0634\u0627\u0647\u062F\u0647 \u062F\u0631 \u0633\u0627\u06CC\u062F &#8599;</a>' : '') + (h.error ? '<div style="color:var(--error); font-size:0.8rem; margin-top:4px;">' + escapeHtml(h.error) + '</div>' : '') + '</div>';
-                            });
-                            list.innerHTML = html;
-                        } else {
-                            list.innerHTML = '<div class="ssp-empty"><p>هنوز تاریخچه‌ای وجود ندارد.</p></div>';
-                        }
-                    });
-            };
-            window.pgClearHistory = function() {
-                if (!confirm('تاریخچه پاک شود?')) return;
-                var fd = new FormData();
-                fd.append('action', 'ssp_clear_publish_history');
-                fd.append('security', nonce);
-                fetch(ajaxurl, {method: 'POST', body: fd})
-                    .then(function(r) { return r.json(); })
-                    .then(function(res) { showToast(res.data.message, 'success'); pgLoadHistory(); });
-            };
-
         })();
+
+
+
+// ===== CALENDAR & DRAFTS DELEGATION & MANAGEMENT =====
+
+// Initialize and ensure Jalali calendar loads smoothly
+if (typeof loadCalendar === 'function') {
+    // portal-core.js provides rich Jalali loadCalendar, calendarPrevMonth, calendarNextMonth, calendarToday
+}
+
+window.loadDrafts = function() {
+    let listEl = document.getElementById('drafts_list');
+    if (!listEl) return;
+    let drafts = Array.isArray(window.draftsData) ? window.draftsData : [];
+    if (drafts.length === 0) {
+        listEl.innerHTML = `<div class="ssp-empty"><div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></div><p>هنوز پیش‌نویسی ندارید.</p></div>`;
+        return;
+    }
+    
+    let html = '';
+    drafts.forEach(d => {
+        let titleEsc = (typeof escapeHtml === 'function') ? escapeHtml(d.title || 'بدون عنوان') : (d.title || 'بدون عنوان');
+        let contentEsc = (typeof escapeHtml === 'function') ? escapeHtml(d.content || '') : (d.content || '');
+        let created = d.created_at ? `<span style="font-size:0.75rem; color:var(--text-muted);">&#128197; ${d.created_at.substring(0, 16)}</span>` : '';
+        html += `
+            <div class="ssp-card ssp-card-enter" style="margin-bottom:12px; padding:16px;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap;">
+                    <div style="flex:1; min-width:240px;">
+                        <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                            <h4 style="margin:0; font-size:0.95rem; font-weight:700;">${titleEsc}</h4>
+                            ${created}
+                        </div>
+                        <p style="margin:0; font-size:0.85rem; color:var(--text-muted); max-height:48px; overflow:hidden; text-overflow:ellipsis; line-height:1.5;">${contentEsc}</p>
+                    </div>
+                    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                        <button type="button" class="ssp-btn-primary" onclick="useDraft(${d.id})" style="font-size:0.8rem; padding:6px 12px;">🚀 استفاده</button>
+                        <button type="button" class="ssp-btn-secondary" onclick="openEditDraftModal(${d.id})" style="font-size:0.8rem; padding:6px 10px;">✏️ ویرایش</button>
+                        <button type="button" class="ssp-btn-secondary" onclick="openScheduleDraftModal(${d.id})" style="font-size:0.8rem; padding:6px 10px;">📅 زمان‌بندی</button>
+                        <button type="button" class="ssp-btn-danger" onclick="deleteDraft(${d.id})" style="font-size:0.8rem; padding:6px 10px;">🗑️ حذف</button>
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+    listEl.innerHTML = html;
+};
+
+window.useDraft = function(id) {
+    let drafts = Array.isArray(window.draftsData) ? window.draftsData : [];
+    let draft = drafts.find(d => d.id == id);
+    if(draft) {
+        let titleEl = document.getElementById('manual_title');
+        let msgEl = document.getElementById('manual_message');
+        let tagEl = document.getElementById('manual_hashtags');
+        if(titleEl) titleEl.value = draft.title || '';
+        if(msgEl) msgEl.value = draft.content || '';
+        if(tagEl && draft.hashtags) tagEl.value = draft.hashtags;
+        if (typeof updateManualCharCount === 'function') updateManualCharCount();
+        switchTab('manual', document.querySelector('.ssp-sidebar [data-tab="manual"]'));
+        showToast('پیش‌نویس بارگذاری شد', 'success');
+    }
+};
+
+window.deleteDraft = function(id) {
+    if(!confirm('آیا از حذف این پیش‌نویس مطمئن هستید؟')) return;
+    let fd = new FormData();
+    fd.append('action', 'ssp_delete_draft');
+    fd.append('security', window.nonce || (typeof nonce !== 'undefined' ? nonce : ''));
+    fd.append('draft_id', id);
+    fd.append('id', id);
+    fetch(ajaxurl, {method: 'POST', body: fd})
+        .then(r => r.json())
+        .then(res => {
+            if (res.success) {
+                if (Array.isArray(window.draftsData)) {
+                    window.draftsData = window.draftsData.filter(d => d.id != id);
+                }
+                loadDrafts();
+                showToast('پیش‌نویس با موفقیت حذف شد', 'success');
+            } else {
+                showToast(res.data ? res.data.message : 'خطا در حذف پیش‌نویس', 'error');
+            }
+        })
+        .catch(() => showToast('خطای ارتباط با سرور', 'error'));
+};
+
+window.saveDraft = function() {
+    let btn = document.getElementById('save_draft_btn');
+    if(!btn) return;
+    let title = document.getElementById('draft_title') ? document.getElementById('draft_title').value : '';
+    let content = document.getElementById('draft_content') ? document.getElementById('draft_content').value : '';
+    let hashtags = document.getElementById('draft_hashtags') ? document.getElementById('draft_hashtags').value : '';
+    if(!content) { showToast('متن پیش‌نویس الزامی است', 'error'); return; }
+    
+    setBtnLoading(btn, true);
+    let fd = new FormData();
+    fd.append('action', 'ssp_save_draft');
+    fd.append('security', window.nonce || (typeof nonce !== 'undefined' ? nonce : ''));
+    fd.append('title', title);
+    fd.append('content', content);
+    fd.append('hashtags', hashtags);
+    fetch(ajaxurl, {method: 'POST', body: fd})
+        .then(r => r.json())
+        .then(res => {
+            setBtnLoading(btn, false);
+            if (res.success) {
+                if (document.getElementById('draft_title')) document.getElementById('draft_title').value = '';
+                if (document.getElementById('draft_content')) document.getElementById('draft_content').value = '';
+                if (document.getElementById('draft_hashtags')) document.getElementById('draft_hashtags').value = '';
+                showSaved('draft_saved');
+                let newId = (res.data && res.data.id) ? res.data.id : Date.now();
+                if (!Array.isArray(window.draftsData)) window.draftsData = [];
+                window.draftsData.unshift({
+                    id: newId,
+                    title: title,
+                    content: content,
+                    hashtags: hashtags,
+                    created_at: new Date().toISOString().replace('T', ' ').substring(0, 19)
+                });
+                loadDrafts();
+            } else {
+                showToast(res.data ? res.data.message : 'خطا در ذخیره پیش‌نویس', 'error');
+            }
+        })
+        .catch(() => {
+            setBtnLoading(btn, false);
+            showToast('خطای شبکه در ذخیره پیش‌نویس', 'error');
+        });
+};
+
+// Templates Implementation
+window.loadTemplates = function() {
+    let listEl = document.getElementById('template_library_list');
+    if (!listEl) return;
+    if (!templatesData || templatesData.length === 0) {
+        listEl.innerHTML = `<div class="ssp-empty"><div class="ssp-empty-icon"><svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div><p>هنوز قالبی ذخیره نکرده‌اید.</p></div>`;
+        return;
+    }
+    renderTemplates(templatesData);
+};
+
+window.filterTemplates = function(cat, btn) {
+    document.querySelectorAll('.tpl-filter').forEach(b => b.classList.remove('active'));
+    if(btn) btn.classList.add('active');
+    
+    if(cat === 'all') renderTemplates(templatesData);
+    else renderTemplates(templatesData.filter(t => t.category === cat));
+};
+
+function renderTemplates(templates) {
+    let listEl = document.getElementById('template_library_list');
+    if(!templates || templates.length === 0) {
+        listEl.innerHTML = `<div class="ssp-empty"><p>قالبی در این دسته یافت نشد.</p></div>`;
+        return;
+    }
+    let html = '';
+    templates.forEach(t => {
+        html += `
+            <div class="ssp-card ssp-card-enter" style="margin-bottom:12px; padding:16px;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                    <div>
+                        <h4 style="margin:0 0 4px;">${escapeHtml(t.name || 'بدون نام')} <span class="ssp-badge">${escapeHtml(t.category)}</span></h4>
+                        <p style="margin:0; font-size:0.85rem; color:var(--text-muted); max-height:20px; overflow:hidden;">${escapeHtml(t.content)}</p>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button type="button" class="ssp-btn-danger" onclick="deleteTemplate(${t.id})">حذف</button>
+                    </div>
+                </div>
+            </div>
+        `;
+    });
+    listEl.innerHTML = html;
+}
+
+window.deleteTemplate = function(id) {
+    if(!confirm('آیا از حذف این قالب مطمئن هستید؟')) return;
+    let fd = new FormData();
+    fd.append('action', 'ssp_delete_template_item');
+    fd.append('security', nonce);
+    fd.append('template_id', id);
+    fetch(ajaxurl, {method: 'POST', body: fd})
+        .then(r => r.json())
+        .then(res => {
+            if (res.success) {
+                templatesData = templatesData.filter(t => t.id != id);
+                loadTemplates();
+                showToast('حذف شد', 'success');
+            } else {
+                showToast(res.data ? res.data.message : 'خطا', 'error');
+            }
+        });
+};
+
+window.openTemplateCreateModal = function() {
+    alert("This feature is best used by navigating to 'Create Template' section or configuring default message format.");
+};
+
+
+window.loadManualTemplateSelect = function() {
+    let sel = document.getElementById('manual_template_select');
+    let container = document.getElementById('manual_template_selector');
+    if (!sel || !container) return;
+    
+    if (templatesData && templatesData.length > 0) {
+        container.style.display = 'block';
+        let html = '<option value="">-- انتخاب قالب ذخیره شده --</option>';
+        templatesData.forEach(t => {
+            html += `<option value="${t.id}">${escapeHtml(t.name)}</option>`;
+        });
+        sel.innerHTML = html;
+        
+        if (window._defaultTemplateId) {
+            sel.value = window._defaultTemplateId;
+            onManualTemplateSelect();
+        }
+    } else {
+        container.style.display = 'none';
+    }
+};
+
+window.onManualTemplateSelect = function() {
+    let sel = document.getElementById('manual_template_select');
+    if (!sel || !sel.value) return;
+    
+    let t = templatesData.find(x => x.id == sel.value);
+    if (t) {
+        let msgEl = document.getElementById('manual_message');
+        if (msgEl) {
+            let content = t.content;
+            if (t.hashtags) content += '\n\n' + t.hashtags;
+            if (t.signature) content += '\n\n' + t.signature;
+            msgEl.value = content;
+        }
+    }
+};
+
+window.saveTemplate = function(e) {
+    e.preventDefault();
+    let btn = document.getElementById('save_template_btn');
+    let template = document.getElementById('msg_template').value;
+    let hashtags = document.getElementById('hashtags').value;
+    let signature = document.getElementById('signature').value;
+    
+    setBtnLoading(btn, true);
+    let fd = new FormData();
+    fd.append('action', 'ssp_save_template_item');
+    fd.append('security', nonce);
+    fd.append('name', 'قالب عمومی پیش‌فرض');
+    fd.append('category', 'general');
+    fd.append('content', template);
+    fd.append('hashtags', hashtags);
+    fd.append('signature', signature);
+    
+    fetch(ajaxurl, {method: 'POST', body: fd})
+        .then(r => r.json())
+        .then(res => {
+            setBtnLoading(btn, false);
+            if (res.success) {
+                showSaved('template_saved');
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showToast(res.data ? res.data.message : 'خطا', 'error');
+            }
+        });
+};
+
         </script>
+
+<script src="<?php echo plugins_url('assets/js/portal-core.js', dirname(__DIR__, 2) . '/main.php'); ?>?v=<?php echo SSP_VERSION; ?>"></script>
+<script src="<?php echo plugins_url('assets/js/portal-ai.js', dirname(__DIR__, 2) . '/main.php'); ?>?v=<?php echo SSP_VERSION; ?>"></script>

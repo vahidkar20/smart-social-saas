@@ -20,6 +20,7 @@ trait SSP_AjaxRss {
             'clean_urls' => intval($_POST['clean_urls'] ?? 1),
             'max_length' => intval($_POST['max_length'] ?? 500),
             'content_mode' => sanitize_text_field($_POST['content_mode'] ?? 'summary'),
+            'message_template' => sanitize_textarea_field($_POST['message_template'] ?? ''),
             'target_mode' => sanitize_text_field($_POST['target_mode'] ?? 'messengers'),
             'target_messengers' => sanitize_text_field($_POST['target_messengers'] ?? ''),
             'target_wp_site' => intval($_POST['target_wp_site'] ?? 0),
@@ -32,7 +33,7 @@ trait SSP_AjaxRss {
     public function handle_delete_rss_feed() {
         $user_id = $this->ajax_require_auth();
         $feeds = $this->get_user_rss_feeds($user_id);
-        $id = intval($_POST['feed_id']);
+        $id = intval($_POST['feed_id'] ?? $_POST['id'] ?? 0);
         $feeds = array_values(array_filter($feeds, function($f) use ($id) { return (int)$f['id'] !== $id; }));
         $this->set_user_items($user_id, 'rss_feeds', $feeds);
         wp_send_json_success(['message' => 'RSS Feed حذف شد']);
@@ -41,7 +42,7 @@ trait SSP_AjaxRss {
     public function handle_update_rss_feed() {
         $user_id = $this->ajax_require_auth();
         $feeds = $this->get_user_rss_feeds($user_id);
-        $id = intval($_POST['feed_id']);
+        $id = intval($_POST['feed_id'] ?? $_POST['id'] ?? 0);
         foreach ($feeds as &$f) {
             if ((int)$f['id'] === $id) {
                 $f['feed_name'] = sanitize_text_field($_POST['feed_name'] ?? '');
@@ -53,6 +54,7 @@ trait SSP_AjaxRss {
                 $f['clean_urls'] = intval($_POST['clean_urls'] ?? 1);
                 $f['max_length'] = intval($_POST['max_length'] ?? 500);
                 $f['content_mode'] = sanitize_text_field($_POST['content_mode'] ?? 'summary');
+                if (isset($_POST['message_template'])) $f['message_template'] = sanitize_textarea_field($_POST['message_template']);
                 $f['target_mode'] = sanitize_text_field($_POST['target_mode'] ?? 'messengers');
                 $f['target_messengers'] = sanitize_text_field($_POST['target_messengers'] ?? '');
                 $f['target_wp_site'] = intval($_POST['target_wp_site'] ?? 0);
@@ -203,11 +205,22 @@ trait SSP_AjaxRss {
             wp_send_json_error(['message' => 'AI فقط در پلن Pro']);
         }
 
-        $text = sanitize_textarea_field($_POST['text'] ?? '');
+        $items_json = stripslashes($_POST['items'] ?? '');
+        $items = json_decode($items_json, true);
         $mode = sanitize_text_field($_POST['ai_mode'] ?? 'summarize');
         $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
+        
+        $text = '';
+        if (is_array($items)) {
+            foreach ($items as $item) {
+                $text .= "عنوان: " . ($item['title'] ?? '') . "\n";
+                $text .= "محتوا: " . ($item['content'] ?? '') . "\n\n";
+            }
+        } else {
+            $text = sanitize_textarea_field($_POST['text'] ?? '');
+        }
 
-        if (empty($text)) wp_send_json_error(['message' => 'متنی برای پردازش وجود ندارد']);
+        if (empty(trim($text))) wp_send_json_error(['message' => 'متنی برای پردازش وجود ندارد']);
 
         $prompt = $this->build_rss_ai_prompt($text, $mode);
 
@@ -243,18 +256,23 @@ trait SSP_AjaxRss {
     private function build_rss_ai_prompt($text, $mode) {
         switch ($mode) {
             case 'summarize':
-                return "متن زیر را به صورت مختصر و مفید در ۳-۴ خط خلاصه کن. فقط خلاصه را برگردان.\n\n---\n$text";
+                return "متن زیر را به صورت فوق‌العاده جذاب، فشرده و کاربردی در ۳ الی ۴ خط خلاصه کن.\n" .
+                    "الزامات: فقط و فقط متن خلاصه شده نهایی را بدون هیچ کلمه، مقدمه، سلام یا پانویس برگردان:\n\n---\n$text";
             case 'translate':
             case 'translate_to_fa':
-                return "متن زیر را به فارسی روان ترجمه کن. فقط ترجمه را برگردان.\n\n---\n$text";
+                return "متن زیر را با دقت بالا و به فارسی روان، شیوا و کاملاً طبیعی ترجمه کن.\n" .
+                    "الزامات: ساختار پاراگراف‌ها را حفظ کن و فقط ترجمه نهایی را بدون هیچ کلمه اضافی برگردان:\n\n---\n$text";
             case 'rewrite':
-                return "متن زیر را بازنویسی کن به صورتی که برای انتشار در شبکه‌های اجتماعی مناسب باشد. لحن رسمی و حرفه‌ای. فقط متن بازنویسی‌شده را برگردان.\n\n---\n$text";
+                return "متن زیر را برای انتشار حرفه‌ای در شبکه‌های اجتماعی (تلگرام، بله، ایتا) بازنویسی کن.\n" .
+                    "الزامات: لحن پرکشش و صمیمی، رعایت دقیق فاصله‌گذاری خطوط و پاراگراف‌ها، استفاده بجا از ایموجی‌ها، و دعوت به اقدام (CTA). فقط متن بازنویسی‌شده را بدون هیچ توضیح اضافی برگردان:\n\n---\n$text";
             case 'hashtags':
-                return "برای متن زیر، ۵ تا ۱۰ هشتگ مرتبط و پرجستجو تولید کن. هشتگ‌ها به صورت فهرست و با # شروع شوند.\n\n---\n$text";
+                return "برای متن زیر، ۵ تا ۸ هشتگ به شدت پرمخاطب، هدفمند و مرتبط به زبان فارسی استخراج کن.\n" .
+                    "الزامات: هشتگ‌ها در یک خط با علامت # و فاصله از هم جدا شوند (مثال: #هشتگ۱ #هشتگ۲). فقط هشتگ‌ها را برگردان بدون هیچ متن اضافی:\n\n---\n$text";
             case 'extract_keywords':
-                return "از متن زیر، مهمترین کلمات کلیدی و عبارات را استخراج کن. به صورت فهرست خط‌به‌خط برگردان.\n\n---\n$text";
+                return "از متن زیر، مهمترین و پرجستجوترین کلمات کلیدی و عبارات کلیدی را استخراج کن.\n" .
+                    "الزامات: به صورت فهرست منظم خط‌به‌خط برگردان بدون هیچ متن یا توضیح اضافی:\n\n---\n$text";
             default:
-                return "متن زیر را پردازش کن و نتیجه را برگردان.\n\n---\n$text";
+                return "متن زیر را با دقت پردازش کن و فقط نتیجه نهایی را بدون هیچ مقدمه یا پانویسی برگردان:\n\n---\n$text";
         }
     }
 
@@ -477,6 +495,16 @@ trait SSP_AjaxRss {
     }
 
     private function build_rss_message($title, $content, $url, $feed) {
+        if (!empty($feed['message_template'])) {
+            $excerpt = wp_trim_words($content, 30, '...');
+            $tpl = $feed['message_template'];
+            $tpl = str_replace('{title}', $title, $tpl);
+            $tpl = str_replace('{content}', $content, $tpl);
+            $tpl = str_replace('{url}', $url, $tpl);
+            $tpl = str_replace('{excerpt}', $excerpt, $tpl);
+            return trim($tpl);
+        }
+        
         $mode = $feed['content_mode'] ?? 'summary';
 
         switch ($mode) {

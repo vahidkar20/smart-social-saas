@@ -144,7 +144,7 @@ trait SSP_ContentDistribution {
     public function process_distributions() {
         $user_ids = $this->get_users_with_active_distributions();
         foreach ($user_ids as $user_id) {
-            $profiles = get_user_meta($user_id, 'ssp_profiles', true) ?: [];
+            $profiles = is_array($__tmp = get_user_meta($user_id, 'ssp_profiles', true)) ? $__tmp : [];
             if (empty($profiles)) {
                 $distributions = $this->get_profile_items($user_id, 'distributions', 1);
                 foreach ($distributions as $dist) {
@@ -394,7 +394,7 @@ trait SSP_ContentDistribution {
     }
 
     private function get_distribution_history($user_id, $dist_id) {
-        $history = get_user_meta($user_id, 'ssp_dist_history_' . $dist_id, true) ?: [];
+        $history = is_array($__tmp = get_user_meta($user_id, 'ssp_dist_history_' . $dist_id, true)) ? $__tmp : [];
         $cutoff = strtotime('-90 days');
         return array_filter($history, function($h) use ($cutoff) {
             return strtotime($h['date'] ?? '') > $cutoff;
@@ -407,14 +407,14 @@ trait SSP_ContentDistribution {
 
     private function mark_item_distributed($user_id, $dist, $item) {
         $key = 'ssp_dist_history_' . $dist['id'];
-        $history = get_user_meta($user_id, $key, true) ?: [];
+        $history = is_array($__tmp = get_user_meta($user_id, $key, true)) ? $__tmp : [];
         $history[] = ['item_id' => $item['id'] ?? 0, 'date' => current_time('mysql')];
         if (count($history) > 2000) $history = array_slice($history, -2000);
         update_user_meta($user_id, $key, $history);
     }
 
     private function get_distribution_sent_count($user_id, $dist_id) {
-        $history = get_user_meta($user_id, 'ssp_dist_history_' . $dist_id, true) ?: [];
+        $history = is_array($__tmp = get_user_meta($user_id, 'ssp_dist_history_' . $dist_id, true)) ? $__tmp : [];
         $today = current_time('Y-m-d');
         return count(array_filter($history, function($h) use ($today) {
             return substr($h['date'] ?? '', 0, 10) === $today;

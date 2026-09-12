@@ -23,15 +23,20 @@ trait SSP_AjaxProduct {
         check_ajax_referer('ssp_secure_nonce', 'security');
         $user_id = $this->ajax_require_auth();
         if ($this->get_user_plan($user_id) !== 'pro') wp_send_json_error(['message' => 'تولید محصول با AI فقط در پلن Pro موجود است']);
-        $product_name = sanitize_text_field($_POST['product_name'] ?? '');
-        $product_brief = sanitize_textarea_field($_POST['product_brief'] ?? '');
+        $product_name = sanitize_text_field($_POST['product_name'] ?? $_POST['title'] ?? $_POST['topic'] ?? '');
+        $product_brief = sanitize_textarea_field($_POST['product_brief'] ?? $_POST['brief'] ?? '');
         $content_type = sanitize_text_field($_POST['content_type'] ?? 'product');
         $prompt_mode = sanitize_text_field($_POST['prompt_mode'] ?? 'default');
         $custom_prompt = sanitize_textarea_field($_POST['custom_prompt'] ?? '');
         $content_length = intval($_POST['content_length'] ?? 2000);
         if (empty($product_name)) wp_send_json_error(['message' => 'نام محصول الزامی است']);
+
+        $ai_mode = sanitize_text_field($_POST['force_mode'] ?? $_POST['mode'] ?? '');
+        if (empty($ai_mode)) {
+            $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
+        }
         $ai_api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
-        if (empty($ai_api_key)) wp_send_json_error(['message' => 'API Key هوش مصنوعی تنظیم نشده']);
+        if ($ai_mode !== 'browser' && empty($ai_api_key)) wp_send_json_error(['message' => 'API Key هوش مصنوعی تنظیم نشده']);
         $prompt = $this->get_product_ai_prompt($content_type, $product_name, $product_brief, $prompt_mode, $custom_prompt);
         if ($content_type === 'post') {
             $length_ranges = [
@@ -45,10 +50,91 @@ trait SSP_AjaxProduct {
             $desc = $length_ranges[$content_length] ?? 'حدود ' . $content_length . ' کاراکتر';
             $prompt .= "\n\nمهم: حجم محتوا باید {$desc} باشد. متن را کوتاه و مفید بنویس.";
         }
+
+        // For custom prompts or when prompt doesn't already contain JSON instructions, ensure strict JSON format is appended
+        if (strpos($prompt, 'JSON') === false && strpos($prompt, '{') === false) {
+            if ($content_type === 'product') {
+                $prompt .= "\n\n" . "دستورالعمل سیستمی: خروجی شما باید ۱۰۰٪ منحصراً یک شیء معتبر JSON خالص بدون هیچ متن توضیحی یا کاراکتر اضافی قبل یا بعد از آن باشد:\n" .
+                "{\n" .
+                "  \"name\": \"نام تجاری، دقیق و سئو شده محصول به فارسی (حداکثر ۶۰ کاراکتر)\",\n" .
+                "  \"sku\": \"کد انبار انگلیسی یکتا مانند PRD-8520\",\n" .
+                "  \"regular_price\": \"قیمت اصلی محصول به تومان به صورت عدد مثلا 450000\",\n" .
+                "  \"sale_price\": \"قیمت تخفیف‌خورده به تومان یا خالی\",\n" .
+                "  \"short_description\": \"۲ الی ۳ جمله جذاب، ترغیب‌کننده و دارای قلاب فروش برای خلاصه محصول\",\n" .
+                "  \"description\": \"توضیحات بسیار کامل محصول با ساختار شیک HTML شامل <h2>معرفی و بررسی تخصصی محصول</h2>، <p>متن کامل معرفی</p>، <h3>ویژگی‌ها و مزایای کلیدی</h3><ul><li>ویژگی ۱</li><li>ویژگی ۲</li><li>ویژگی ۳</li></ul>، <h3>مشخصات فنی و کاربردی</h3><p>جزئیات فنی</p>، <h3>راهنمای استفاده و شرایط گارانتی</h3><p>توضیحات تکمیلی</p>\",\n" .
+                "  \"weight\": \"0.5\",\n" .
+                "  \"categories\": [\"دسته‌بندی اصلی ۱\", \"دسته‌بندی فرعی ۲\"],\n" .
+                "  \"tags\": [\"برچسب ۱\", \"برچسب ۲\", \"برچسب ۳\"],\n" .
+                "  \"meta_title\": \"عنوان سئو حداکثر ۶۰ کاراکتر\",\n" .
+                "  \"meta_description\": \"توضیحات متا سئو جذاب حداکثر ۱۵۰ کاراکتر\"\n" .
+                "}";
+            } elseif ($content_type === 'post') {
+                $prompt .= "\n\n" . "دستورالعمل سیستمی: پاسخ شما باید ۱۰۰٪ منحصراً یک شیء معتبر JSON خالص بدون هیچ توضیح اضافی قبل یا بعد از آن با کلیدهای زیر باشد:\n" .
+                "{\n" .
+                "  \"title\": \"عنوان جذاب، قلاب ذهنی قوی و کنجکاوکننده برای پست شبکه‌های اجتماعی\",\n" .
+                "  \"message\": \"متن کامل و جذاب پست با رعایت دقیق پاراگراف‌بندی، لحن صمیمی و پرکشش، ایموجی‌های متناسب، فهرست‌بندی بولت‌وار با ایموجی، و دعوت به اقدام (CTA) بسیار شفاف و هدفمند در پایان متن\",\n" .
+                "  \"hashtags\": \"#هشتگ۱ #هشتگ۲ #هشتگ۳ #هشتگ۴ #هشتگ۵\"\n" .
+                "}";
+            } else {
+                $prompt .= "\n\n" . "دستورالعمل سیستمی: پاسخ شما باید ۱۰۰٪ منحصراً یک شیء معتبر JSON خالص برای مقاله وردپرس بدون هیچ متن توضیحی اضافه باشد با کلیدهای:\n" .
+                "{\n" .
+                "  \"title\": \"عنوان جذاب، گیرا و کاملاً سئو شده برای مقاله وبلاگ\",\n" .
+                "  \"content\": \"متن کامل، عمیق و سئو شده مقاله به زبان فارسی با تگ‌های ساختارمند HTML شامل <h2>مقدمه و طرح مسئله</h2><p>متن</p><h2>بررسی تخصصی و راهکارها</h2><p>متن</p><ul><li>نکته ۱</li><li>نکته ۲</li></ul><h2>جمع‌بندی و نتیجه‌گیری</h2><p>نتیجه و دعوت به اقدام</p>\",\n" .
+                "  \"excerpt\": \"خلاصه جذاب و ترغیب‌کننده مقاله در ۲ الی ۳ جمله\",\n" .
+                "  \"tags\": [\"برچسب ۱\", \"برچسب ۲\", \"برچسب ۳\", \"برچسب ۴\"],\n" .
+                "  \"meta_title\": \"تیتر سئو مقاله حداکثر ۶۰ کاراکتر\",\n" .
+                "  \"meta_description\": \"توضیحات متا سئو مقاله حداکثر ۱۶۰ کاراکتر\"\n" .
+                "}";
+            }
+        }
+
         try {
+            if ($ai_mode === 'browser') {
+                if (!method_exists($this, 'create_bridge_task')) {
+                    wp_send_json_error(['message' => 'افزونه مرورگر در دسترس نیست']);
+                }
+                
+                $task = $this->create_bridge_task($user_id, $prompt, [
+                    'action' => 'generate_product_ai',
+                    'content_type' => $content_type
+                ]);
+                wp_send_json_success([
+                    'mode' => 'browser',
+                    'task_id' => $task['task_id']
+                ]);
+                return;
+            }
+
             $result = $this->call_ai_api(get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai', $ai_api_key, get_user_meta($user_id, 'ssp_ai_model', true) ?: 'gpt-4o-mini', $prompt, true);
             $decoded = $this->parse_ai_json($result['content']);
-            if ($decoded) {
+
+            // Fallback for plain text response if JSON parsing was not possible
+            if ((!$decoded || !is_array($decoded)) && !empty($result['content'])) {
+                $raw = trim($result['content']);
+                $clean = $this->fix_ai_newlines($raw);
+                $lines = explode("\n", $clean);
+                $first_line = trim($lines[0] ?? '');
+                $first_line = preg_replace('/^[#\*\-]+\s*/', '', $first_line);
+                $fallback_title = !empty($product_name) ? $product_name : (!empty($first_line) ? mb_substr($first_line, 0, 60) : 'محتوای هوش مصنوعی');
+                $decoded = [
+                    'name' => $fallback_title,
+                    'title' => $fallback_title,
+                    'message' => $clean,
+                    'content' => $clean,
+                    'description' => $clean,
+                    'short_description' => mb_substr($clean, 0, 160),
+                ];
+            }
+            if ($decoded && is_array($decoded)) {
+                // Normalize field aliases
+                if (empty($decoded['name']) && !empty($decoded['title'])) $decoded['name'] = $decoded['title'];
+                if (empty($decoded['title']) && !empty($decoded['name'])) $decoded['title'] = $decoded['name'];
+                if (empty($decoded['short_description']) && !empty($decoded['short_desc'])) $decoded['short_description'] = $decoded['short_desc'];
+                if (empty($decoded['description']) && !empty($decoded['desc'])) $decoded['description'] = $decoded['desc'];
+                if (empty($decoded['regular_price']) && !empty($decoded['price'])) $decoded['regular_price'] = $decoded['price'];
+                if (empty($decoded['message']) && !empty($decoded['content'])) $decoded['message'] = $decoded['content'];
+                if (empty($decoded['content']) && !empty($decoded['message'])) $decoded['content'] = $decoded['message'];
+
                 foreach (['message', 'content'] as $key) {
                     if (!empty($decoded[$key])) {
                         $decoded[$key] = $this->fix_ai_newlines($decoded[$key]);
@@ -91,24 +177,119 @@ trait SSP_AjaxProduct {
         $user_id = $this->ajax_require_auth();
         if ($this->get_user_plan($user_id) !== 'pro') wp_send_json_error(['message' => 'ایده‌یابی فقط در پلن Pro موجود است']);
 
+        $topic = sanitize_text_field($_POST['topic'] ?? '');
+        $count = min(20, max(3, intval($_POST['count'] ?? 10)));
+        $content_type = sanitize_text_field($_POST['type'] ?? 'all');
+        $tone = sanitize_text_field($_POST['tone'] ?? 'engaging');
         $prompt = sanitize_textarea_field($_POST['prompt'] ?? '');
-        if (empty($prompt)) wp_send_json_error(['message' => 'موضوع را وارد کنید']);
 
+        if (empty($topic) && empty($prompt)) {
+            wp_send_json_error(['message' => 'لطفاً موضوع مورد نظر را وارد کنید']);
+        }
+
+        $type_desc = 'متنوع (ترکیبی از پست شبکه‌های اجتماعی، مقاله سئو شده و معرفی محصول)';
+        if ($content_type === 'post') $type_desc = 'پست‌های جذاب شبکه‌های اجتماعی (تلگرام، ایتا، بله، اینستاگرام)';
+        elseif ($content_type === 'article') $type_desc = 'مقاله‌های وبلاگی و تخصصی با ساختار سئو';
+        elseif ($content_type === 'product') $type_desc = 'محصولات فروشگاهی و معرفی کالا یا خدمات';
+
+        $prompt_built = "تو یک استراتژیست ارشد محتوا و ایده‌پرداز وایرال هستی.\n" .
+            "لطفاً دقیقا {$count} ایده خلاقانه، کاربردی، ترغیب‌کننده و پربازدید درباره «{$topic}» تولید کن.\n" .
+            "نوع محتوا: {$type_desc}\n" .
+            "لحن: روان، اثرگذار، کنجکاوکننده و واقع‌گرایانه\n\n" .
+            "دستور اکید: پاسخ را ۱۰۰٪ منحصراً به صورت یک شیء JSON با کلید ideas شامل آرایه ایده‌ها ارسال کن بدون هیچ کاراکتر، مقدمه یا پانویس اضافی:\n" .
+            "{\n" .
+            "  \"ideas\": [\n" .
+            "    {\n" .
+            "      \"title\": \"عنوان جذاب، کلیک‌خور و کنجکاوکننده فارسی\",\n" .
+            "      \"description\": \"توضیح کامل و شیوه اجرای ایده در ۲ تا ۳ جمله کوتاه\",\n" .
+            "      \"type\": \"post\",\n" .
+            "      \"angle\": \"آموزشی / مقایسه‌ای / نقد و بررسی / قلاب کنجکاوی / راهکار حل مشکل\",\n" .
+            "      \"keywords\": [\"کلمه ۱\", \"کلمه ۲\"]\n" .
+            "    }\n" .
+            "  ]\n" .
+            "}";
+
+        if (!empty($prompt)) {
+            $prompt_built .= "\n\nتوضیحات تکمیلی کاربر:\n" . $prompt;
+        }
+
+        $ai_mode = sanitize_text_field($_POST['force_mode'] ?? $_POST['mode'] ?? '');
+        if (empty($ai_mode)) {
+            $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
+        }
         $ai_api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
-        if (empty($ai_api_key)) wp_send_json_error(['message' => 'API Key هوش مصنوعی تنظیم نشده']);
+        if ($ai_mode !== 'browser' && empty($ai_api_key)) {
+            wp_send_json_error(['message' => 'API Key هوش مصنوعی در تنظیمات وارد نشده است']);
+        }
 
         try {
+            if ($ai_mode === 'browser') {
+                if (!method_exists($this, 'create_bridge_task')) {
+                    wp_send_json_error(['message' => 'افزونه مرورگر در دسترس نیست']);
+                }
+                $task = $this->create_bridge_task($user_id, $prompt_built, ['action' => 'brainstorm_ideas']);
+                wp_send_json_success([
+                    'mode' => 'browser',
+                    'task_id' => $task['task_id']
+                ]);
+                return;
+            }
+
             $result = $this->call_ai_api(
                 get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai',
                 $ai_api_key,
                 get_user_meta($user_id, 'ssp_ai_model', true) ?: 'gpt-4o-mini',
-                $prompt, true
+                $prompt_built, true
             );
-            $decoded = $this->parse_ai_json($result['content']);
+
+            $content = trim($result['content'] ?? '');
+            $decoded = $this->parse_ai_json($content);
+            if (isset($decoded['ideas']) && is_array($decoded['ideas'])) {
+                $decoded = $decoded['ideas'];
+            }
+
+            $ideas = [];
             if ($decoded && is_array($decoded)) {
-                wp_send_json_success(['ideas' => $decoded, 'tokens_used' => $result['tokens_used'] ?? 0]);
+                foreach ($decoded as $item) {
+                    if (is_array($item) && (!empty($item['title']) || !empty($item['name']))) {
+                        $ideas[] = [
+                            'title' => sanitize_text_field($item['title'] ?? $item['name'] ?? ''),
+                            'description' => sanitize_textarea_field($item['description'] ?? $item['brief'] ?? $item['summary'] ?? ''),
+                            'type' => sanitize_text_field($item['type'] ?? 'post'),
+                            'angle' => sanitize_text_field($item['angle'] ?? 'ایده محتوایی'),
+                            'keywords' => isset($item['keywords']) && is_array($item['keywords']) ? array_map('sanitize_text_field', $item['keywords']) : []
+                        ];
+                    }
+                }
+            }
+
+            // Robust fallback if JSON parsing missed items
+            if (empty($ideas) && !empty($content)) {
+                $lines = preg_split('/[\r\n]+/', $content);
+                foreach ($lines as $line) {
+                    $clean = trim(preg_replace('/^[\d+\.\-\*\#\s]+/', '', $line));
+                    if (mb_strlen($clean) >= 6) {
+                        $parts = explode(':', $clean, 2);
+                        $ideas[] = [
+                            'title' => sanitize_text_field(trim($parts[0])),
+                            'description' => sanitize_textarea_field(trim($parts[1] ?? 'ایده پیشنهادی هوش مصنوعی بر اساس موضوع')),
+                            'type' => 'post',
+                            'angle' => 'ایده جذاب',
+                            'keywords' => []
+                        ];
+                        if (count($ideas) >= $count) break;
+                    }
+                }
+            }
+
+            if (!empty($ideas)) {
+                wp_send_json_success([
+                    'ideas' => $ideas,
+                    'count' => count($ideas),
+                    'tokens_used' => $result['tokens_used'] ?? 0
+                ]);
             } else {
-                wp_send_json_error(['message' => 'پاسخ AI قابل تفسیر نیست']);
+                wp_send_json_error(['message' => 'پاسخ هوش مصنوعی دریافت شد اما استخراج ایده‌ها ممکن نشد. لطفاً مجدداً امتحان کنید.']);
             }
         } catch (Exception $e) {
             wp_send_json_error(['message' => $e->getMessage()]);
@@ -359,19 +540,42 @@ trait SSP_AjaxProduct {
         $names_str = implode('، ', $names);
 
         if ($content_type === 'product') {
-            $prompt = count($items) . " محصول فارسی تولید کن.\n" .
-                "نام‌ها: {$names_str}\n\n" .
-                "توضیحات هر محصول باید واقعی و تخصصی باشه، نه مصنوعی.\n" .
-                "فقط اطلاعات واقعی و تایید شده بنویس.\n" .
-                "برای هر محصول: name, short_description (2-3 جمله جذاب), description (HTML حرفه‌ای), regular_price (تومان منطقی), categories, tags.\n" .
-                "فقط JSON array: [{\"name\":\"\",\"short_description\":\"\",\"description\":\"\",\"regular_price\":\"\",\"categories\":[\"\"],\"tags\":[\"\"]}]";
+            $prompt = count($items) . " محصول فروشگاهی تخصصی و کامل ووکامرس به زبان فارسی تولید کن.\n" .
+                "نام‌های ورودی: {$names_str}\n\n" .
+                "الزامات محتوا:\n" .
+                "- اطلاعات واقعی، دقیق، کاربردی و ترغیب‌کننده برای خرید\n" .
+                "- توضیحات کامل و خوانا با ساختار HTML استاندارد\n" .
+                "- قیمت‌های منطقی به تومان متناسب با بازار ایران\n\n" .
+                "دستور اکید: پاسخ شما ۱۰۰٪ منحصراً یک آرایه معتبر JSON بدون هیچ متن توضیحی اضافه باشد با فیلدهای:\n" .
+                "[{\n" .
+                "  \"name\": \"نام دقیق تجاری محصول\",\n" .
+                "  \"sku\": \"PRD-1001\",\n" .
+                "  \"short_description\": \"خلاصه جذاب در ۲ تا ۳ جمله\",\n" .
+                "  \"description\": \"<h2>معرفی محصول</h2><p>متن کامل</p><h3>ویژگی‌ها</h3><ul><li>ویژگی ۱</li><li>ویژگی ۲</li></ul><h3>مشخصات فنی</h3><p>اطلاعات فنی</p>\",\n" .
+                "  \"regular_price\": \"450000\",\n" .
+                "  \"sale_price\": \"\",\n" .
+                "  \"categories\": [\"دسته‌بندی اصلی\"],\n" .
+                "  \"tags\": [\"برچسب ۱\", \"برچسب ۲\"],\n" .
+                "  \"meta_title\": \"عنوان سئو\",\n" .
+                "  \"meta_description\": \"متا سئو\"\n" .
+                "}]";
         } else {
-            $prompt = count($items) . " پست وردپرس فارسی تولید کن.\n" .
-                "موضوعات: {$names_str}\n\n" .
-                "محتوا باید آموزشی، کاربردی و واقعی باشه.\n" .
-                "فقط اطلاعات واقعی و تایید شده بنویس.\n" .
-                "برای هر پست: title (≤70 کاراکتر), content (HTML حرفه‌ای), excerpt (2-3 جمله), categories, tags.\n" .
-                "فقط JSON array: [{\"title\":\"\",\"content\":\"\",\"excerpt\":\"\",\"categories\":[\"\"],\"tags\":[\"\"]}]";
+            $prompt = count($items) . " پست و مقاله تخصصی وبلاگ وردپرس به زبان فارسی تولید کن.\n" .
+                "موضوعات ورودی: {$names_str}\n\n" .
+                "الزامات محتوا:\n" .
+                "- محتوای آموزشی، عمیق، جذاب و دارای بار اطلاعاتی بالا\n" .
+                "- ساختار استاندارد HTML با تگ‌های h2, h3, p, ul/li, strong\n" .
+                "- بهینه‌سازی کامل برای موتورهای جستجو (SEO)\n\n" .
+                "دستور اکید: پاسخ شما ۱۰۰٪ منحصراً یک آرایه معتبر JSON بدون هیچ متن توضیحی اضافه باشد با فیلدهای:\n" .
+                "[{\n" .
+                "  \"title\": \"عنوان سئو شده مقاله (حداکثر ۷۰ کاراکتر)\",\n" .
+                "  \"content\": \"<h2>مقدمه</h2><p>متن مقدمه</p><h2>بررسی تخصصی</h2><p>متن بررسی</p><ul><li>نکته ۱</li><li>نکته ۲</li></ul><h2>نتیجه‌گیری</h2><p>جمع‌بندی</p>\",\n" .
+                "  \"excerpt\": \"خلاصه مقاله در ۲ تا ۳ جمله\",\n" .
+                "  \"categories\": [\"دسته بندی\"],\n" .
+                "  \"tags\": [\"برچسب ۱\", \"برچسب ۲\", \"برچسب ۳\"],\n" .
+                "  \"meta_title\": \"تیتر سئو\",\n" .
+                "  \"meta_description\": \"توضیحات متا\"\n" .
+                "}]";
         }
 
         try {
@@ -534,26 +738,47 @@ trait SSP_AjaxProduct {
         $length = intval($_POST['length'] ?? 800);
         $tone = sanitize_text_field($_POST['tone'] ?? 'natural');
         $ai_api_key = get_user_meta($user_id, 'ssp_ai_api_key', true);
-        $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
+        $ai_mode = sanitize_text_field($_POST['force_mode'] ?? $_POST['mode'] ?? '');
+        if (empty($ai_mode)) {
+            $ai_mode = get_user_meta($user_id, 'ssp_ai_mode', true) ?: 'api';
+        }
         if ($ai_mode !== 'browser' && empty($ai_api_key)) wp_send_json_error(['message' => 'API Key تنظیم نشده']);
         $style_guides = ['general' => 'عمومی و متعادل', 'formal' => 'رسمی و حرفه‌ای', 'casual' => 'صمیمی و دوستانه', 'promotional' => 'تبلیغاتی با دعوت به اقدام', 'educational' => 'آموزشی با نکات عملی', 'news' => 'خبری و واقعی', 'story' => 'داستانی و روایتی', 'motivational' => 'انگیزشی و الهام‌بخش', 'humorous' => 'طنز و سرگرمی', 'technical' => 'فنی و تخصصی', 'review' => 'نقد و بررسی', 'comparison' => 'مقایسه‌ای', 'list' => 'لیستی و فهرستی', 'question' => 'سؤالی و تعاملی'];
         $tone_guides = ['natural' => 'طبیعی و روان', 'enthusiastic' => 'پرانرژی و هیجانی', 'calm' => 'آرام و خونسرد', 'authoritative' => 'موثق و مطمئن', 'friendly' => 'صمیمانه و صمیمی', 'persuasive' => 'قانع‌کننده', 'emotional' => 'احساسی و عاطفی', 'analytical' => 'تحلیلی و منطقی'];
         $style_desc = $style_guides[$style] ?? 'متعادل';
         $tone_desc = $tone_guides[$tone] ?? 'طبیعی';
-        $prompt = "{$count} پست شبکه اجتماعی فارسی درباره «{$topic}».\n" .
+        $prompt = "تولید {$count} پست جذاب و حرفه‌ای شبکه اجتماعی فارسی درباره «{$topic}».\n" .
             "سبک محتوا: {$style_desc}\n" .
-            "لحن نوشتار: {$tone_desc}\n" .
-            "هر پست باید:\n" .
-            "- عنوان جذاب ≤80 کاراکتر (شامل عدد یا سوال)\n" .
-            "- متن حدود {$length} کاراکتر با نکات عملی و واقعی\n" .
-            "- لحن طبیعی، مثل یک آدم واقعی\n" .
-            "- زاویه متفاوت نسبت به بقیه\n" .
-            "- متن باید کاملاً ساده باشه. هیچ تگ HTML مثل <p> <br> <b> <strong> استفاده نکن\n" .
-            "- بولد رو با ** بنویس\n" .
-            "- فقط اطلاعات واقعی و تایید شده بنویس. اگر از صحت چیزی مطمئن نیستی، اون رو حذف کن\n" .
-            "- هیچ هشتگی (#) در متن اضافه نکن\n" .
-            '[{"title":"","message":""}]';
+            "لحن نوشتار: {$tone_desc}\n\n" .
+            "الزامات هر پست:\n" .
+            "- عنوان جذاب و قلاب ذهنی قوی (حداکثر ۸۰ کاراکتر)\n" .
+            "- متن حدود {$length} کاراکتر با نکات کاربردی و پرمخاطب\n" .
+            "- لحن طبیعی، زنده و پرکشش با فاصله‌گذاری مناسب بین خطوط و پاراگراف‌ها\n" .
+            "- استفاده هدفمند از ایموجی‌ها برای ایجاد جذابیت بصری\n" .
+            "- دعوت به اقدام (CTA) مشخص در پایان متن\n" .
+            "- بدون تگ‌های HTML (از ** برای بولد استفاده کن)\n" .
+            "- هشتگ‌های اختصاصی و پرمخاطب\n\n" .
+            "دستور اکید: پاسخ شما ۱۰۰٪ منحصراً یک آرایه معتبر JSON بدون هیچ کلمه یا توضیحی قبل یا بعد از آن باشد با فرمت دقیق:\n" .
+            "[\n" .
+            "  {\n" .
+            "    \"title\": \"عنوان جذاب پست\",\n" .
+            "    \"message\": \"متن کامل و خوانای پست با ایموجی و پاراگراف‌بندی\",\n" .
+            "    \"hashtags\": \"#هشتگ۱ #هشتگ۲ #هشتگ۳ #هشتگ۴\"\n" .
+            "  }\n" .
+            "]";
         try {
+            if ($ai_mode === 'browser') {
+                if (!method_exists($this, 'create_bridge_task')) {
+                    wp_send_json_error(['message' => 'افزونه مرورگر در دسترس نیست']);
+                }
+                $task = $this->create_bridge_task($user_id, $prompt, ['action' => 'batch_content']);
+                wp_send_json_success([
+                    'mode' => 'browser',
+                    'task_id' => $task['task_id']
+                ]);
+                return;
+            }
+
             $result = $this->call_ai_api(get_user_meta($user_id, 'ssp_ai_provider', true) ?: 'openai', $ai_api_key, get_user_meta($user_id, 'ssp_ai_model', true) ?: 'gpt-4o-mini', $prompt, true);
             $decoded = $this->parse_ai_json($result['content']);
             if ($decoded && is_array($decoded)) {
@@ -624,7 +849,7 @@ trait SSP_AjaxProduct {
         $user_id = $this->ajax_require_auth();
         $code = sanitize_text_field($_POST['code'] ?? '');
         if (empty($code)) wp_send_json_error(['message' => 'کد لینک الزامی است']);
-        $short_links = get_option('ssp_short_links', []);
+        $short_links = is_array($__tmp = get_option('ssp_short_links', [])) ? $__tmp : [];
         if (isset($short_links[$code])) { unset($short_links[$code]); update_option('ssp_short_links', $short_links); wp_send_json_success(['message' => 'لینک حذف شد']); }
         else wp_send_json_error(['message' => 'لینک یافت نشد']);
     }
@@ -659,7 +884,7 @@ trait SSP_AjaxProduct {
 
     public function handle_test_proxy() {
         $this->ajax_require_admin();
-        $proxy_settings = get_option('ssp_proxy_settings', []);
+        $proxy_settings = is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : [];
         if (empty($proxy_settings['enabled']) || empty($proxy_settings['host']) || empty($proxy_settings['port'])) wp_send_json_error(['message' => 'تنظیمات پروکسی ناقص است']);
         $proxy_url = $proxy_settings['type'] . '://' . $proxy_settings['host'] . ':' . $proxy_settings['port'];
         $response = wp_remote_get('https://httpbin.org/ip', ['timeout' => 15, 'proxy' => $proxy_url, 'sslverify' => false]);
@@ -783,7 +1008,7 @@ trait SSP_AjaxProduct {
         if (empty($prompt)) wp_send_json_error(['message' => 'پرامپت الزامی است']);
         try {
             $result = $this->generate_ai_image($user_id, $prompt, $size, $quality);
-            $images = get_user_meta($user_id, 'ssp_generated_images', true) ?: [];
+            $images = is_array($__tmp = get_user_meta($user_id, 'ssp_generated_images', true)) ? $__tmp : [];
             array_unshift($images, ['url' => $result['url'], 'prompt' => $prompt, 'created_at' => current_time('mysql')]);
             $images = array_slice($images, 0, 20);
             update_user_meta($user_id, 'ssp_generated_images', $images);

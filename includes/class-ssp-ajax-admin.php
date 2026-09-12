@@ -77,9 +77,7 @@ trait SSP_AjaxAdmin {
     public function handle_clear_logs() {
         check_ajax_referer('ssp_secure_nonce', 'security');
         $user_id = get_current_user_id();
-        $logs = $this->get_global_items('logs');
-        $logs = array_values(array_filter($logs, function($l) use ($user_id) { return (int)$l['user_id'] !== (int)$user_id; }));
-        $this->set_global_items('logs', $logs);
+        SSP_DB::clear_user_logs($user_id);
         wp_send_json_success(['message' => 'همه لاگ‌ها پاک شدند']);
     }
 
@@ -183,10 +181,10 @@ trait SSP_AjaxAdmin {
         $result = [];
         foreach ($users as $user) {
             $plan = get_user_meta($user->ID, 'ssp_plan', true) ?: 'free';
-            $messengers = get_user_meta($user->ID, 'ssp_messengers', true) ?: [];
-            $bots = get_user_meta($user->ID, 'ssp_bot_configs', true) ?: [];
-            $wp_sites = get_user_meta($user->ID, 'ssp_wp_sites', true) ?: [];
-            $profiles = get_user_meta($user->ID, 'ssp_profiles', true) ?: [];
+            $messengers = is_array($__tmp = get_user_meta($user->ID, 'ssp_messengers', true)) ? $__tmp : [];
+            $bots = is_array($__tmp = get_user_meta($user->ID, 'ssp_bot_configs', true)) ? $__tmp : [];
+            $wp_sites = is_array($__tmp = get_user_meta($user->ID, 'ssp_wp_sites', true)) ? $__tmp : [];
+            $profiles = is_array($__tmp = get_user_meta($user->ID, 'ssp_profiles', true)) ? $__tmp : [];
 
             $result[] = [
                 'id' => $user->ID,
@@ -252,15 +250,10 @@ trait SSP_AjaxAdmin {
         if ($log_id <= 0) wp_send_json_error(['message' => 'شناسه پیام نامعتبر']);
 
         // Find the log entry
-        $logs = $this->get_global_items('logs');
-        $log_entry = null;
-        foreach ($logs as $log) {
-            if ((int)$log['id'] === $log_id && (int)$log['user_id'] === (int)$user_id) {
-                $log_entry = $log;
-                break;
-            }
-        }
-
+        global $wpdb;
+        $table = $wpdb->prefix . 'ssp_logs';
+        $log_entry = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d AND user_id = %d", $log_id, $user_id), ARRAY_A);
+        
         if (!$log_entry) wp_send_json_error(['message' => 'پیام یافت نشد']);
         if ($log_entry['status'] === 'success') wp_send_json_error(['message' => 'این پیام قبلاً با موفقیت ارسال شده']);
 
@@ -301,20 +294,10 @@ trait SSP_AjaxAdmin {
         $item_id = intval($_POST['item_id'] ?? 0);
         if ($item_id <= 0) wp_send_json_error(['message' => 'شناسه نامعتبر']);
 
-        $queue = $this->get_global_items('queue');
-        $found = false;
-        foreach ($queue as $key => $item) {
-            if ((int)$item['id'] === $item_id && (int)$item['user_id'] === (int)$user_id && $item['status'] === 'pending') {
-                unset($queue[$key]);
-                $found = true;
-                break;
-            }
-        }
-
-        if (!$found) wp_send_json_error(['message' => 'پیام یافت نشد یا قبلاً پردازش شده']);
-
-        $queue = array_values($queue);
-        $this->set_global_items('queue', $queue);
+        global $wpdb;
+        $table = $wpdb->prefix . 'ssp_queue';
+        $deleted = $wpdb->query($wpdb->prepare("DELETE FROM $table WHERE id = %d AND user_id = %d AND status = 'pending'", $item_id, $user_id));
+        if (!$deleted) wp_send_json_error(['message' => 'پیام یافت نشد یا قبلاً پردازش شده']);
 
         wp_send_json_success(['message' => 'پیام از صف حذف شد']);
     }
@@ -326,18 +309,9 @@ trait SSP_AjaxAdmin {
         check_ajax_referer('ssp_secure_nonce', 'security');
         $user_id = $this->ajax_require_auth();
 
-        $queue = $this->get_global_items('queue');
-        $count = 0;
-        $new_queue = [];
-        foreach ($queue as $item) {
-            if ((int)$item['user_id'] === (int)$user_id && $item['status'] === 'pending') {
-                $count++;
-            } else {
-                $new_queue[] = $item;
-            }
-        }
-
-        $this->set_global_items('queue', $new_queue);
+        global $wpdb;
+        $table = $wpdb->prefix . 'ssp_queue';
+        $count = $wpdb->query($wpdb->prepare("DELETE FROM $table WHERE user_id = %d AND status = 'pending'", $user_id));
 
         wp_send_json_success(['message' => "$count پیام از صف حذف شد"]);
     }
@@ -349,24 +323,34 @@ trait SSP_AjaxAdmin {
         check_ajax_referer('ssp_secure_nonce', 'security');
         $user_id = $this->ajax_require_auth();
 
-        $schedule_id = intval($_POST['schedule_id'] ?? 0);
+        $schedule_id = intval($_POST['schedule_id'] ?? $_POST['id'] ?? 0);
+        $permanent = !empty($_POST['permanent']);
         if ($schedule_id <= 0) wp_send_json_error(['message' => 'شناسه نامعتبر']);
 
         $schedules = $this->get_user_items($user_id, 'schedules');
         $found = false;
-        foreach ($schedules as $key => $sch) {
-            if ((int)$sch['id'] === $schedule_id && $sch['status'] === 'pending') {
-                unset($schedules[$key]);
+        foreach ($schedules as $key => &$sch) {
+            if ((int)$sch['id'] === $schedule_id) {
+                if ($permanent) {
+                    unset($schedules[$key]);
+                } else {
+                    $sch['status'] = 'cancelled';
+                    $sch['updated_at'] = current_time('mysql');
+                }
                 $found = true;
                 break;
             }
         }
+        unset($sch);
 
         if (!$found) wp_send_json_error(['message' => 'زمان‌بندی یافت نشد']);
 
         $schedules = array_values($schedules);
         $this->set_user_items($user_id, 'schedules', $schedules);
 
-        wp_send_json_success(['message' => 'زمان‌بندی لغو شد']);
+        wp_send_json_success([
+            'message' => $permanent ? 'زمان‌بندی حذف شد' : 'زمان‌بندی با موفقیت لغو شد',
+            'schedules' => $schedules
+        ]);
     }
 }

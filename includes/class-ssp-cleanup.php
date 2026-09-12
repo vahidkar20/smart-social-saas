@@ -80,7 +80,7 @@ trait SSP_Cleanup {
     private function cleanup_old_distribution_history() {
         $users = get_users(['fields' => 'ID', 'meta_key' => 'ssp_distributions', 'meta_compare' => 'EXISTS', 'number' => 200]);
         foreach ($users as $user_id) {
-            $dists = get_user_meta($user_id, 'ssp_distributions', true) ?: [];
+            $dists = is_array($__tmp = get_user_meta($user_id, 'ssp_distributions', true)) ? $__tmp : [];
             $active_ids = array_column($dists, 'id');
             // Check for orphaned history keys
             $all_meta = get_user_meta($user_id);
@@ -99,33 +99,14 @@ trait SSP_Cleanup {
      * Clean up old logs (keep last 200)
      */
     private function cleanup_old_logs() {
-        $last_cleanup = get_option('ssp_last_log_cleanup', 0);
-        if (time() - $last_cleanup < SSP_LOG_CLEANUP_INTERVAL) return;
-        $logs = $this->get_global_items('logs');
-        if (count($logs) > SSP_MAX_LOGS) {
-            $logs = array_slice($logs, 0, SSP_MAX_LOGS);
-            $this->set_global_items('logs', $logs);
-        }
-        update_option('ssp_last_log_cleanup', time(), false);
+        SSP_DB::cleanup_old_data();
     }
 
     /**
      * Clean up old queue items (completed/failed older than 24h)
      */
     private function cleanup_old_queue() {
-        $queue = $this->get_global_items('queue');
-        $changed = false;
-        $cutoff = time() - 86400;
-        foreach ($queue as $key => $item) {
-            if (in_array($item['status'], ['completed', 'failed'])) {
-                $item_time = strtotime($item['created_at'] ?? '');
-                if ($item_time && $item_time < $cutoff) { unset($queue[$key]); $changed = true; }
-            }
-        }
-        if ($changed) {
-            $queue = array_values($queue);
-            $this->set_global_items('queue', $queue);
-        }
+        // Handled by SSP_DB::cleanup_old_data() inside cleanup_old_logs
     }
 
     private function check_webhook_rate_limit($ip) {

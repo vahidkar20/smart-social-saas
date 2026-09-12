@@ -78,8 +78,8 @@ trait SSP_Helpers {
         self::$_settings_cache = [
             'doh_enabled'   => get_option('ssp_doh_enabled', 1),
             'doh_server'    => get_option('ssp_doh_server', 'cloudflare'),
-            'proxy_settings' => get_option('ssp_proxy_settings', []),
-            'telegram_relay' => get_option('ssp_telegram_relay', []),
+            'proxy_settings' => is_array($__tmp = get_option('ssp_proxy_settings', [])) ? $__tmp : [],
+            'telegram_relay' => is_array($__tmp = get_option('ssp_telegram_relay', [])) ? $__tmp : [],
             'encryption_key' => get_option('ssp_encryption_key', ''),
         ];
         return self::$_settings_cache;
@@ -132,7 +132,7 @@ trait SSP_Helpers {
 
     /* ============ Storage Helpers (wp_options + usermeta) ============ */
     private function get_user_items($user_id, $key) {
-        return get_user_meta($user_id, 'ssp_' . $key, true) ?: [];
+        {$data = get_user_meta($user_id, 'ssp_' . $key, true); return is_array($data) ? $data : [];}
     }
 
     private function set_user_items($user_id, $key, $items) {
@@ -147,7 +147,7 @@ trait SSP_Helpers {
         $cache_key = 'ssp_global_' . $key;
         $cached = wp_cache_get($cache_key, 'ssp');
         if ($cached !== false) return $cached;
-        $items = get_option('ssp_' . $key, []);
+        $items = get_option('ssp_' . $key, []); if (!is_array($items)) $items = [];
         wp_cache_set($cache_key, $items, 'ssp', 300);
         return $items;
     }
@@ -205,22 +205,15 @@ trait SSP_Helpers {
         $count = get_transient($cache_key);
         if ($count !== false) return (int)$count;
 
-        if ($logs === null) {
-            $logs = $this->get_global_items('logs');
-        }
-        $count = 0;
-        foreach ($logs as $log) {
-            if ((int)$log['user_id'] === (int)$user_id && substr($log['created_at'], 0, 10) === $today) {
-                $count++;
-            }
-        }
+        $count = SSP_DB::get_today_logs_count($user_id);
+
         set_transient($cache_key, $count, 300);
         return $count;
     }
 
     /* ============ Storage Helpers - Drafts ============ */
     private function get_user_drafts($user_id) {
-        return get_user_meta($user_id, 'ssp_drafts', true) ?: [];
+        {$data = get_user_meta($user_id, 'ssp_drafts', true); return is_array($data) ? $data : [];}
     }
 
     private function set_user_drafts($user_id, $drafts) {
@@ -229,7 +222,7 @@ trait SSP_Helpers {
 
     /* ============ Storage Helpers - Templates ============ */
     private function get_user_template_items($user_id) {
-        return get_user_meta($user_id, 'ssp_template_items', true) ?: [];
+        {$data = get_user_meta($user_id, 'ssp_template_items', true); return is_array($data) ? $data : [];}
     }
 
     private function set_user_template_items($user_id, $templates) {
@@ -903,10 +896,15 @@ trait SSP_Helpers {
     }
 
     /* ============ AI JSON Parser ============ */
-    private function parse_ai_json($content) {
-        $content = trim($content);
+    public function parse_ai_json($content) {
+        $content = trim((string)$content);
 
-        // 0. Pre-clean: replace smart quotes, remove BOM
+        // 0. Pre-clean: strip XML thought tags <think>...</think> or <thought>...</thought>
+        $content = preg_replace('/<think>[\s\S]*?<\/think>/i', '', $content);
+        $content = preg_replace('/<thought>[\s\S]*?<\/thought>/i', '', $content);
+        $content = preg_replace('/^(?:thinking|thought(?:\s+for\s+\d+\s+seconds)?|reasoning)\b[\s\S]*?\n\n/i', '', $content);
+
+        // Replace smart quotes, remove BOM
         $content = preg_replace('/[\x{201C}\x{201D}\x{2018}\x{2019}\x{00AB}\x{00BB}]/u', '"', $content);
         $content = str_replace("\xEF\xBB\xBF", '', $content);
         
@@ -1020,7 +1018,7 @@ trait SSP_Helpers {
 
     /* ============ UTM Helpers ============ */
     private function append_utm_params($url, $user_id, $platform = '') {
-        $settings = get_user_meta($user_id, 'ssp_utm_settings', true) ?: [];
+        $settings = is_array($__tmp = get_user_meta($user_id, 'ssp_utm_settings', true)) ? $__tmp : [];
         if (empty($settings['enabled'])) return $url;
 
         $parsed = wp_parse_url($url);
@@ -1042,33 +1040,22 @@ trait SSP_Helpers {
     }
 
     private function log_activity($user_id, $platform, $title, $message, $status, $response = '', $ai_provider = '', $ai_tokens = 0, $image_url = '', $tool_type = '') {
-        $logs = $this->get_global_items('logs');
-        $id = $this->next_id($logs);
-
         $truncated_message = mb_substr($message, 0, 500);
         $truncated_response = mb_substr($response, 0, 500);
 
-        array_unshift($logs, [
-            'id' => $id,
+        SSP_DB::insert_log([
             'user_id' => (int)$user_id,
             'platform' => $platform,
             'title' => mb_substr($title, 0, 100),
             'message' => $truncated_message,
             'status' => $status,
             'response' => $truncated_response,
-            'ai_processed' => !empty($ai_provider) ? 1 : 0,
             'ai_provider' => $ai_provider,
-            'ai_tokens_used' => (int)$ai_tokens,
+            'ai_tokens' => (int)$ai_tokens,
             'image_url' => $image_url,
             'tool_type' => $tool_type,
             'created_at' => current_time('mysql'),
         ]);
-
-        if (count($logs) > SSP_MAX_LOGS) {
-            $logs = array_slice($logs, 0, SSP_MAX_LOGS);
-        }
-
-        $this->set_global_items('logs', $logs);
 
         // Update daily count cache
         $today = current_time('Y-m-d');

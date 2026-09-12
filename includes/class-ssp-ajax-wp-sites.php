@@ -59,7 +59,7 @@ trait SSP_AjaxWpSites {
     public function handle_test_wp_site() {
         check_ajax_referer('ssp_secure_nonce', 'security');
         $user_id = get_current_user_id();
-        $site_id = intval($_POST['site_id'] ?? 0);
+        $site_id = intval($_POST['site_id'] ?? $_POST['id'] ?? 0);
         if ($site_id > 0) {
             $sites = $this->get_user_items($user_id, 'wp_sites');
             $site = null;

@@ -3,7 +3,7 @@
 trait SSP_BotBuilder {
 
     private function get_user_bot_configs($user_id) {
-        return get_user_meta($user_id, 'ssp_bot_configs', true) ?: [];
+        return is_array($__tmp = get_user_meta($user_id, 'ssp_bot_configs', true)) ? $__tmp : [];
     }
 
     private function set_user_bot_configs($user_id, $configs) {
@@ -24,6 +24,7 @@ trait SSP_BotBuilder {
         $endpoints = [
             'telegram' => "https://api.telegram.org/bot$token/$method",
             'bale' => "https://tapi.bale.ai/bot$token/$method",
+            'eitaa' => "https://eitaayar.ir/api/$token/$method",
             'rubika' => "https://botapi.rubika.ir/v3/$token/$method",
         ];
 
@@ -1062,9 +1063,7 @@ trait SSP_BotBuilder {
         $owner_id = (int) $wpdb->get_var($wpdb->prepare(
             "SELECT user_id FROM {$wpdb->usermeta} 
              WHERE meta_key = 'ssp_bot_configs' 
-             AND meta_value LIKE %s
-             LIMIT 1",
-            '%"i:' . intval($bot_id) . ';%'
+             AND meta_value LIKE %s LIMIT 1", '%"id";i:' . intval($bot_id) . ';%'
         ));
 
         if (!$owner_id) {
@@ -1473,7 +1472,7 @@ trait SSP_BotBuilder {
         $current_user_bots = [];
 
         foreach ($all_users as $uid) {
-            $user_configs = get_user_meta($uid, 'ssp_bot_configs', true) ?: [];
+            $user_configs = is_array($__tmp = get_user_meta($uid, 'ssp_bot_configs', true)) ? $__tmp : [];
             foreach ($user_configs as $config) {
                 $is_current = ((int)$uid === (int)$current_user_id);
                 $bot_info = [
@@ -1530,7 +1529,7 @@ trait SSP_BotBuilder {
         $cleaned = 0;
 
         foreach ($all_users as $uid) {
-            $user_configs = get_user_meta($uid, 'ssp_bot_configs', true) ?: [];
+            $user_configs = is_array($__tmp = get_user_meta($uid, 'ssp_bot_configs', true)) ? $__tmp : [];
             $needs_save = false;
 
             foreach ($user_configs as &$config) {
@@ -1737,18 +1736,12 @@ trait SSP_BotBuilder {
 
         // Stats
         if (strpos($text, '{posts_count}') !== false || strpos($text, '{pending_count}') !== false || strpos($text, '{last_activity}') !== false) {
-            $logs = $this->get_global_items('logs');
-            $user_logs = array_filter($logs, function($log) use ($user_id) {
-                return isset($log['user_id']) && (int)$log['user_id'] === (int)$user_id;
-            });
+            $user_logs = SSP_DB::get_logs($user_id, 200);
             $posts_count = count(array_filter($user_logs, function($log) {
                 return ($log['status'] ?? '') === 'success';
             }));
             // Count pending queue items for this user
-            $queue = $this->get_global_items('queue');
-            $pending_count = count(array_filter($queue, function($item) use ($user_id) {
-                return isset($item['user_id']) && (int)$item['user_id'] === (int)$user_id && ($item['status'] ?? '') === 'pending';
-            }));
+            $pending_count = count(SSP_DB::get_queue_items('pending', 0, $user_id));
             // Get most recent activity
             $last_activity = 'ندارد';
             if (!empty($user_logs)) {
@@ -1793,7 +1786,7 @@ trait SSP_BotBuilder {
      * Get user's current scenario step
      */
     private function get_user_scenario_step($user_id, $bot_id) {
-        $steps = get_user_meta($user_id, 'ssp_bot_scenario_steps', true) ?: [];
+        $steps = is_array($__tmp = get_user_meta($user_id, 'ssp_bot_scenario_steps', true)) ? $__tmp : [];
         return $steps[$bot_id] ?? null;
     }
 
@@ -1801,7 +1794,7 @@ trait SSP_BotBuilder {
      * Set user's current scenario step
      */
     private function set_user_scenario_step($user_id, $bot_id, $step_id) {
-        $steps = get_user_meta($user_id, 'ssp_bot_scenario_steps', true) ?: [];
+        $steps = is_array($__tmp = get_user_meta($user_id, 'ssp_bot_scenario_steps', true)) ? $__tmp : [];
         if ($step_id === null) {
             unset($steps[$bot_id]);
         } else {

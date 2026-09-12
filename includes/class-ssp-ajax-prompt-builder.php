@@ -102,50 +102,55 @@ trait SSP_AjaxPromptBuilder {
 
     private function build_prompt_from_template($template, $product_name, $product_brief = '') {
         $is_article = ($template['type'] ?? 'product') === 'article';
-        $parts = [$is_article ? "موضوع: {$product_name}" : "محصول: {$product_name}"];
-        if (!empty($product_brief)) $parts[] = "توضیح: {$product_brief}";
-        if (!empty($template['industry'])) $parts[] = "\nحوزه: {$template['industry']}";
-        if (!empty($template['tone'])) $parts[] = "لحن: {$template['tone']}";
-        if (!empty($template['general_rules'])) $parts[] = "\nقوانین کلی:\n{$template['general_rules']}";
+        $parts = [
+            "دستورالعمل سیستمی: تو یک متخصص و استراتژیست ارشد تولید محتوای وب و سئو هستی. محتوای خروجی باید کاملاً معتبر، واقعی، روان، غنی و بدون گزافه‌گویی باشد. هرگز هیچ مقدمه، احوالپرسی، توضیح اضافی، تگ تفکر، یا کاراکتر قبل/بعد از ساختار JSON تولید نکن.",
+            $is_article ? "موضوع مقاله: {$product_name}" : "نام محصول: {$product_name}"
+        ];
+        if (!empty($product_brief)) $parts[] = "توضیحات و نکات تکمیلی: {$product_brief}";
+        if (!empty($template['industry'])) $parts[] = "حوزه تخصصی / صنعت: {$template['industry']}";
+        if (!empty($template['tone'])) $parts[] = "لحن نوشتار: {$template['tone']}";
+        if (!empty($template['general_rules'])) $parts[] = "\nقوانین عمومی نگارش:\n{$template['general_rules']}";
         if ($is_article) {
-            if (!empty($template['short_rules'])) $parts[] = "\n--- ساختار مقاله ---\n{$template['short_rules']}";
-            if (!empty($template['long_rules'])) $parts[] = "\n--- قوانین محتوا ---\n{$template['long_rules']}";
-            if (!empty($template['seo_rules'])) $parts[] = "\n--- اطلاعات سئو ---\n{$template['seo_rules']}";
+            if (!empty($template['short_rules'])) $parts[] = "\n--- ساختار و بخش‌های مقاله ---\n{$template['short_rules']}";
+            if (!empty($template['long_rules'])) $parts[] = "\n--- الزامات محتوایی و نگارشی ---\n{$template['long_rules']}";
+            if (!empty($template['seo_rules'])) $parts[] = "\n--- تنظیمات و کلمات کلیدی سئو ---\n{$template['seo_rules']}";
             $json_format = <<<'JSON'
-فقط JSON معتبر با فیلدهای زیر تولید کن:
+دستور اکید: پاسخ شما باید ۱۰۰٪ منحصراً یک شیء معتبر JSON خالص بدون هیچ متن اضافی قبل یا بعد از آن با کلیدهای زیر باشد:
 {
-  "title": "عنوان ≤70 کاراکتر فارسی",
-  "content": "محتوای HTML کامل مقاله با h2,h3,p,ul/li,strong. حداقل 800 کلمه",
-  "excerpt": "خلاصه 2-3 جمله‌ای",
-  "categories": ["دسته مرتبط"],
-  "tags": ["تگ ۱", "تگ ۲"],
-  "meta_title": "تیتر سئو ≤60 کاراکتر",
-  "meta_description": "متا ≤170 کاراکتر"
+  "title": "عنوان جذاب، گیرا و سئو شده برای مقاله (حداکثر ۷۰ کاراکتر)",
+  "content": "محتوای کامل، عمیق و سئو شده مقاله با ساختار استاندارد HTML شامل h2, h3, p, ul/li, strong و جداول مرتبط (حداقل ۸۰۰ کلمه)",
+  "excerpt": "خلاصه جذاب و ترغیب‌کننده ۲ تا ۳ جمله‌ای برای پیش‌نمایش مقاله",
+  "categories": ["دسته‌بندی مرتبط ۱", "دسته‌بندی مرتبط ۲"],
+  "tags": ["برچسب ۱", "برچسب ۲", "برچسب ۳", "برچسب ۴"],
+  "meta_title": "تیتر سئو حداکثر ۶۰ کاراکتر",
+  "meta_description": "توضیحات متا سئو حداکثر ۱۶۰ کاراکتر"
 }
 JSON;
         } else {
             if (!empty($template['short_rules'])) $parts[] = "\n--- توضیحات کوتاه (short_description) ---\n{$template['short_rules']}";
             if (!empty($template['long_rules'])) $parts[] = "\n--- توضیحات بلند (description) ---\n{$template['long_rules']}";
-            if (!empty($template['seo_rules'])) $parts[] = "\n--- اطلاعات سئو ---\n{$template['seo_rules']}";
+            if (!empty($template['seo_rules'])) $parts[] = "\n--- تنظیمات و کلمات کلیدی سئو ---\n{$template['seo_rules']}";
             $json_format = <<<'JSON'
-فقط JSON معتبر با فیلدهای زیر تولید کن:
+دستور اکید: پاسخ شما باید ۱۰۰٪ منحصراً یک شیء معتبر JSON خالص بدون هیچ متن اضافی قبل یا بعد از آن با کلیدهای زیر باشد:
 {
-  "name": "نام محصول ≤60 کاراکتر فارسی",
-  "short_description": "توضیحات کوتاه HTML",
-  "description": "توضیحات بلند HTML با h2,h3,p,ul/li,strong",
-  "regular_price": "قیمت (خالی بگذار)",
-  "sale_price": "",
-  "categories": ["دسته مرتبط"],
-  "tags": ["تگ ۱", "تگ ۲"],
-  "meta_title": "تیتر سئو ≤60 کاراکتر",
-  "meta_description": "متا ≤170 کاراکتر",
-  "slug": "انگلیسی-خط-تیره"
+  "name": "نام دقیق، تجاری و سئو شده محصول به فارسی (حداکثر ۶۰ کاراکتر)",
+  "sku": "کد انبار انگلیسی یکتا مانند PRD-8520",
+  "short_description": "توضیحات کوتاه، جذاب و ترغیب‌کننده به صورت HTML تمیز در ۲ تا ۳ جمله",
+  "description": "توضیحات بسیار جامع با ساختار حرفه‌ای HTML شامل <h2>معرفی و بررسی تخصصی محصول</h2>، <p>متن کامل معرفی</p>، <h3>ویژگی‌ها و مزایای کلیدی</h3><ul><li>ویژگی ۱</li><li>ویژگی ۲</li><li>ویژگی ۳</li></ul>، <h3>مشخصات فنی و کاربردی</h3>، <h3>راهنمای استفاده و شرایط گارانتی</h3>",
+  "regular_price": "قیمت اصلی به عدد تومان مثلا 450000",
+  "sale_price": "قیمت تخفیف‌خورده به عدد تومان یا خالی",
+  "weight": "0.5",
+  "categories": ["دسته‌بندی اصلی ۱", "دسته‌بندی فرعی ۲"],
+  "tags": ["برچسب ۱", "برچسب ۲", "برچسب ۳"],
+  "meta_title": "تیتر سئو حداکثر ۶۰ کاراکتر",
+  "meta_description": "توضیحات متا سئو جذاب حداکثر ۱۵۰ کاراکتر",
+  "slug": "اسلاگ-انگلیسی-کوتاه"
 }
 JSON;
         }
-        if (!empty($template['focus'])) $parts[] = "\nتمرکز: {$template['focus']}";
+        if (!empty($template['focus'])) $parts[] = "\nتمرکز اصلی: {$template['focus']}";
         if (!empty($template['forbidden'])) $parts[] = "ممنوعیات: {$template['forbidden']}";
-        if (!empty($template['extra'])) $parts[] = "زمینه: {$template['extra']}";
+        if (!empty($template['extra'])) $parts[] = "زمینه و راهنمای تخصصی: {$template['extra']}";
         $parts[] = "\n{$json_format}";
         return implode("\n", $parts);
     }
